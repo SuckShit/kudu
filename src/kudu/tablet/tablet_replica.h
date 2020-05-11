@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 #pragma once
 
 #include <cstddef>
@@ -30,10 +29,7 @@
 #include "kudu/consensus/log.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/raft_consensus.h"
-#include "kudu/consensus/time_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/callback.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -54,11 +50,10 @@ class MaintenanceOp;
 class MonoDelta;
 class ThreadPool;
 class ThreadPoolToken;
-template <typename Sig>
-class Callback;
 
 namespace consensus {
 class ConsensusMetadataManager;
+class TimeManager;
 class TransactionStatusPB;
 }
 
@@ -93,20 +88,20 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
                 scoped_refptr<consensus::ConsensusMetadataManager> cmeta_manager,
                 consensus::RaftPeerPB local_peer_pb,
                 ThreadPool* apply_pool,
-                Callback<void(const std::string& reason)> mark_dirty_clbk);
+                consensus::MarkDirtyCallback cb);
 
   // Initializes RaftConsensus.
   // This must be called before publishing the instance to other threads.
   // If this fails, the TabletReplica instance remains in a NOT_INITIALIZED
   // state.
-  Status Init(ThreadPool* raft_pool);
+  Status Init(consensus::ServerContext server_ctx);
 
   // Starts the TabletReplica, making it available for Write()s. If this
   // TabletReplica is part of a consensus configuration this will connect it to other replicas
   // in the consensus configuration.
   Status Start(const consensus::ConsensusBootstrapInfo& bootstrap_info,
                std::shared_ptr<tablet::Tablet> tablet,
-               scoped_refptr<clock::Clock> clock,
+               clock::Clock* clock,
                std::shared_ptr<rpc::Messenger> messenger,
                scoped_refptr<rpc::ResultTracker> result_tracker,
                scoped_refptr<log::Log> log,
@@ -177,7 +172,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
     return tablet_.get();
   }
 
-  scoped_refptr<consensus::TimeManager> time_manager() const {
+  consensus::TimeManager* time_manager() const {
     return consensus_->time_manager();
   }
 
@@ -249,9 +244,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
     return log_.get();
   }
 
-  clock::Clock* clock() {
-    return clock_.get();
-  }
+  clock::Clock* clock() const { return clock_; }
 
   const scoped_refptr<log::LogAnchorRegistry>& log_anchor_registry() const {
     return log_anchor_registry_;
@@ -262,10 +255,10 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   // Convenience method to return the permanent_uuid of this peer.
   std::string permanent_uuid() const { return tablet_->metadata()->fs_manager()->uuid(); }
 
-  Status NewLeaderTransactionDriver(gscoped_ptr<Transaction> transaction,
+  Status NewLeaderTransactionDriver(std::unique_ptr<Transaction> transaction,
                                     scoped_refptr<TransactionDriver>* driver);
 
-  Status NewReplicaTransactionDriver(gscoped_ptr<Transaction> transaction,
+  Status NewReplicaTransactionDriver(std::unique_ptr<Transaction> transaction,
                                      scoped_refptr<TransactionDriver>* driver);
 
   // Tells the tablet's log to garbage collect.
@@ -294,7 +287,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
 
   // Marks the tablet as dirty so that it's included in the next heartbeat.
   void MarkTabletDirty(const std::string& reason) {
-    mark_dirty_clbk_.Run(reason);
+    mark_dirty_clbk_(reason);
   }
 
   // Return the total on-disk size of this tablet replica, in bytes.
@@ -351,7 +344,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   //
   // Must be called whenever cluster membership or leadership changes, or when
   // the tablet's schema changes.
-  const Callback<void(const std::string& reason)> mark_dirty_clbk_;
+  const consensus::MarkDirtyCallback mark_dirty_clbk_;
 
   TabletStatePB state_;
   Status error_;
@@ -382,7 +375,7 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   // Token for serial task submission to the server-wide transaction prepare pool.
   std::unique_ptr<ThreadPoolToken> prepare_pool_token_;
 
-  scoped_refptr<clock::Clock> clock_;
+  clock::Clock* clock_;
 
   // List of maintenance operations for the tablet that need information that only the peer
   // can provide.
@@ -391,10 +384,12 @@ class TabletReplica : public RefCountedThreadSafe<TabletReplica>,
   // The result tracker for writes.
   scoped_refptr<rpc::ResultTracker> result_tracker_;
 
-  FunctionGaugeDetacher metric_detacher_;
-
   // Cached stats for the tablet replica.
   ReportedTabletStatsPB stats_pb_;
+
+  // NOTE: it's important that this is the first member to be destructed. This
+  // ensures we do not attempt to collect metrics while calling the destructor.
+  FunctionGaugeDetacher metric_detacher_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletReplica);
 };

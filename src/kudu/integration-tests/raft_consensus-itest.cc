@@ -17,9 +17,11 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -30,7 +32,7 @@
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
@@ -45,10 +47,8 @@
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
@@ -83,11 +83,10 @@
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 DECLARE_bool(raft_prepare_replacement_before_eviction);
-DECLARE_int64(client_inserts_per_thread);
-DECLARE_int64(client_num_batches_per_thread);
+DECLARE_int32(client_inserts_per_thread);
+DECLARE_int32(client_num_batches_per_thread);
 DECLARE_int32(consensus_rpc_timeout_ms);
 DECLARE_int32(num_client_threads);
 DECLARE_int32(num_replicas);
@@ -147,6 +146,8 @@ using kudu::rpc::RpcController;
 using kudu::server::SetFlagRequestPB;
 using kudu::server::SetFlagResponsePB;
 using std::string;
+using std::thread;
+using std::unique_ptr;
 using std::unordered_map;
 using std::vector;
 using strings::Substitute;
@@ -229,7 +230,7 @@ class RaftConsensusITest : public RaftConsensusITestBase {
 
  protected:
   shared_ptr<KuduTable> table_;
-  vector<scoped_refptr<kudu::Thread> > threads_;
+  vector<thread> threads_;
 };
 
 int64_t RaftConsensusITest::GetTimestampOnServer(TServerDetails* tserver) const {
@@ -321,7 +322,7 @@ void RaftConsensusITest::InsertPayloadIgnoreErrors(int start_row,
   CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
   string payload(payload_size, 'x');
   for (int i = 0; i < num_rows; i++) {
-    gscoped_ptr<KuduInsert> insert(table->NewInsert());
+    unique_ptr<KuduInsert> insert(table->NewInsert());
     KuduPartialRow* row = insert->mutable_row();
     CHECK_OK(row->SetInt32(0, i + start_row));
     CHECK_OK(row->SetInt32(1, 0));
@@ -461,6 +462,7 @@ void RaftConsensusITest::Write128KOpsToLeader(int num_writes) {
 
 void RaftConsensusITest::AssertMajorityRequiredForElectionsAndWrites(
     const TabletServerMap& tablet_servers, const string& leader_uuid) {
+  static const auto kTimeout = MonoDelta::FromSeconds(20);
 
   TServerDetails* initial_leader = FindOrDie(tablet_servers, leader_uuid);
 
@@ -497,12 +499,13 @@ void RaftConsensusITest::AssertMajorityRequiredForElectionsAndWrites(
                                   MonoDelta::FromMilliseconds(100));
     ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
 
-    // Step down.
-    ASSERT_OK(LeaderStepDown(initial_leader, tablet_id_, MonoDelta::FromSeconds(10)));
+    // Step down. Scenarios which use this method turn off leader failure
+    // detection, so the leader role cannot fluctuate among tablet replicas.
+    ASSERT_OK(LeaderStepDown(initial_leader, tablet_id_, kTimeout));
 
     // Assert that elections time out without a live majority.
     // We specify a very short timeout here to keep the tests fast.
-    ASSERT_OK(StartElection(initial_leader, tablet_id_, MonoDelta::FromSeconds(10)));
+    ASSERT_OK(StartElection(initial_leader, tablet_id_, kTimeout));
     s = WaitUntilLeader(initial_leader, tablet_id_, MonoDelta::FromMilliseconds(100));
     ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
     LOG(INFO) << "Expected timeout encountered on election with weakened config: " << s.ToString();
@@ -515,17 +518,17 @@ void RaftConsensusITest::AssertMajorityRequiredForElectionsAndWrites(
     }
   }
 
-  ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(20), tablet_servers, tablet_id_, 1));
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers, tablet_id_, 1));
 
   // Now an election should succeed.
-  ASSERT_OK(StartElection(initial_leader, tablet_id_, MonoDelta::FromSeconds(10)));
-  ASSERT_OK(WaitUntilLeader(initial_leader, tablet_id_, MonoDelta::FromSeconds(10)));
+  ASSERT_OK(StartElection(initial_leader, tablet_id_, kTimeout));
+  ASSERT_OK(WaitUntilLeader(initial_leader, tablet_id_, kTimeout));
   LOG(INFO) << "Successful election with full config of size " << config_size;
 
   // And a write should also succeed.
   ASSERT_OK(WriteSimpleTestRow(initial_leader, tablet_id_, RowOperationsPB::UPDATE,
                                kTestRowKey, kTestRowIntVal, Substitute("qsz=$0", config_size),
-                               MonoDelta::FromSeconds(10)));
+                               kTimeout));
 }
 
 void RaftConsensusITest::CreateClusterForCrashyNodesTests(vector<string> extra_ts_flags) {
@@ -674,8 +677,7 @@ TEST_F(RaftConsensusITest, TestInsertAndMutateThroughConsensus) {
   for (int i = 0; i < num_iters; i++) {
     InsertTestRowsRemoteThread(i * FLAGS_client_inserts_per_thread,
                                FLAGS_client_inserts_per_thread,
-                               FLAGS_client_num_batches_per_thread,
-                               vector<CountDownLatch*>());
+                               FLAGS_client_num_batches_per_thread);
   }
   NO_FATALS(AssertAllReplicasAgree(FLAGS_client_inserts_per_thread * num_iters));
 }
@@ -736,27 +738,20 @@ TEST_F(RaftConsensusITest, MultiThreadedMutateAndInsertThroughConsensus) {
 
   int num_threads = FLAGS_num_client_threads;
   for (int i = 0; i < num_threads; i++) {
-    scoped_refptr<kudu::Thread> new_thread;
-    CHECK_OK(kudu::Thread::Create("test", Substitute("ts-test$0", i),
-                                  &RaftConsensusITest::InsertTestRowsRemoteThread,
-                                  this, i * FLAGS_client_inserts_per_thread,
-                                  FLAGS_client_inserts_per_thread,
-                                  FLAGS_client_num_batches_per_thread,
-                                  vector<CountDownLatch*>(),
-                                  &new_thread));
-    threads_.push_back(new_thread);
+    threads_.emplace_back([this, i]() {
+      this->InsertTestRowsRemoteThread(i * FLAGS_client_inserts_per_thread,
+                                       FLAGS_client_inserts_per_thread,
+                                       FLAGS_client_num_batches_per_thread);
+    });
   }
   for (int i = 0; i < FLAGS_num_replicas; i++) {
-    scoped_refptr<kudu::Thread> new_thread;
-    CHECK_OK(kudu::Thread::Create("test", Substitute("chaos-test$0", i),
-                                  &RaftConsensusITest::DelayInjectorThread,
-                                  this, cluster_->tablet_server(i),
-                                  kConsensusRpcTimeoutForTests,
-                                  &new_thread));
-    threads_.push_back(new_thread);
+    auto* ts = cluster_->tablet_server(i);
+    threads_.emplace_back([this, ts]() {
+      this->DelayInjectorThread(ts, kConsensusRpcTimeoutForTests);
+    });
   }
-  for (scoped_refptr<kudu::Thread> thr : threads_) {
-   CHECK_OK(ThreadJoiner(thr.get()).Join());
+  for (auto& t : threads_) {
+    t.join();
   }
 
   NO_FATALS(AssertAllReplicasAgree(FLAGS_client_inserts_per_thread * FLAGS_num_client_threads));
@@ -815,7 +810,7 @@ TEST_F(RaftConsensusITest, TestCatchupAfterOpsEvicted) {
     // We write 128KB cells in this test, so bump the limit.
     "--max_cell_size_bytes=1000000",
     // And disable WAL compression so the 128KB cells don't get compressed away.
-    "--log_compression_codec=none"
+    "--log_compression_codec=no_compression"
   };
 
   NO_FATALS(BuildAndStart(kTsFlags));
@@ -1008,39 +1003,35 @@ TEST_F(RaftConsensusITest, MultiThreadedInsertWithFailovers) {
       Substitute("$0", (FLAGS_client_num_batches_per_thread * 100)));
 
   int num_threads = FLAGS_num_client_threads;
-  int64_t total_num_rows = num_threads * FLAGS_client_inserts_per_thread;
+  int total_num_rows = num_threads * FLAGS_client_inserts_per_thread;
 
   // We create 2 * (kNumReplicas - 1) latches so that we kill the same node at least
   // twice.
-  vector<CountDownLatch*> latches;
+  vector<unique_ptr<CountDownLatch>> latches;
+  latches.reserve(kNumElections);
   for (int i = 1; i < kNumElections; i++) {
-    latches.push_back(new CountDownLatch((i * total_num_rows)  / kNumElections));
+    latches.emplace_back(new CountDownLatch((i * total_num_rows)  / kNumElections));
   }
 
   for (int i = 0; i < num_threads; i++) {
-    scoped_refptr<kudu::Thread> new_thread;
-    CHECK_OK(kudu::Thread::Create("test", Substitute("ts-test$0", i),
-                                  &RaftConsensusITest::InsertTestRowsRemoteThread,
-                                  this, i * FLAGS_client_inserts_per_thread,
-                                  FLAGS_client_inserts_per_thread,
-                                  FLAGS_client_num_batches_per_thread,
-                                  latches,
-                                  &new_thread));
-    threads_.push_back(new_thread);
+    threads_.emplace_back([this, i, &latches]() {
+      this->InsertTestRowsRemoteThread(i * FLAGS_client_inserts_per_thread,
+                                       FLAGS_client_inserts_per_thread,
+                                       FLAGS_client_num_batches_per_thread, latches);
+    });
   }
 
-  for (const auto* latch : latches) {
+  for (const auto& latch : latches) {
     NO_FATALS(cluster_->AssertNoCrashes());
     latch->Wait();
     StopOrKillLeaderAndElectNewOne();
   }
 
-  for (const auto& thr : threads_) {
-    CHECK_OK(ThreadJoiner(thr.get()).Join());
+  for (auto& t : threads_) {
+    t.join();
   }
 
   NO_FATALS(AssertAllReplicasAgree(FLAGS_client_inserts_per_thread * FLAGS_num_client_threads));
-  STLDeleteElements(&latches);
 }
 
 // Regression test for KUDU-597, an issue where we could mis-order operations on
@@ -1065,23 +1056,22 @@ TEST_F(RaftConsensusITest, TestKUDU_597) {
 
   AtomicBool finish(false);
   for (int i = 0; i < FLAGS_num_tablet_servers; i++) {
-    scoped_refptr<kudu::Thread> new_thread;
-    CHECK_OK(kudu::Thread::Create("test", Substitute("ts-test$0", i),
-                                  &RaftConsensusITest::StubbornlyWriteSameRowThread,
-                                  this, i, &finish, &new_thread));
-    threads_.push_back(new_thread);
+    threads_.emplace_back([this, i, &finish]() {
+      this->StubbornlyWriteSameRowThread(i, &finish);
+    });
   }
+  SCOPED_CLEANUP({
+    finish.Store(true);
+    for (auto& t : threads_) {
+      t.join();
+    }
+  });
 
   const int num_loops = AllowSlowTests() ? 10 : 1;
   for (int i = 0; i < num_loops; i++) {
     StopOrKillLeaderAndElectNewOne();
     SleepFor(MonoDelta::FromSeconds(1));
     ASSERT_OK(CheckTabletServersAreAlive(FLAGS_num_tablet_servers));
-  }
-
-  finish.Store(true);
-  for (scoped_refptr<kudu::Thread> thr : threads_) {
-    CHECK_OK(ThreadJoiner(thr.get()).Join());
   }
 }
 
@@ -1549,7 +1539,7 @@ TEST_F(RaftConsensusITest, TestReplaceChangeConfigOperation) {
   ASSERT_OK(cluster_->tablet_server_by_uuid(tservers[0]->uuid())->Resume());
 
   // Insert some data and verify that it propagates to all servers.
-  NO_FATALS(InsertTestRowsRemoteThread(0, 10, 1, vector<CountDownLatch*>()));
+  NO_FATALS(InsertTestRowsRemoteThread(0, 10, 1));
   NO_FATALS(AssertAllReplicasAgree(10));
 
   // Try another config change.
@@ -1557,7 +1547,7 @@ TEST_F(RaftConsensusITest, TestReplaceChangeConfigOperation) {
   // config change didn't properly unset the 'pending' configuration.
   ASSERT_OK(RemoveServer(leader_tserver, tablet_id_, tservers[2],
                          MonoDelta::FromSeconds(5), -1));
-  NO_FATALS(InsertTestRowsRemoteThread(10, 10, 1, vector<CountDownLatch*>()));
+  NO_FATALS(InsertTestRowsRemoteThread(10, 10, 1));
 }
 
 // Test the atomic CAS arguments to ChangeConfig() add server and remove server.
@@ -1673,30 +1663,19 @@ TEST_F(RaftConsensusITest, TestConfigChangeUnderLoad) {
 
   // Start a write workload.
   LOG(INFO) << "Starting write workload...";
-  vector<scoped_refptr<Thread>> threads;
+  vector<thread> threads;
+  threads.reserve(FLAGS_num_client_threads);
   AtomicInt<int32_t> rows_inserted(0);
   AtomicBool finish(false);
-  const auto num_threads = FLAGS_num_client_threads;
-  for (auto i = 0; i < num_threads; i++) {
-    scoped_refptr<Thread> thread;
-    ASSERT_OK(Thread::Create(CURRENT_TEST_NAME(), Substitute("row-writer-$0", i),
-                             &DoWriteTestRows,
-                             leader_tserver, tablet_id_, kTimeout,
-                             &rows_inserted, &finish,
-                             &thread));
-    threads.push_back(thread);
+  for (auto i = 0; i < FLAGS_num_client_threads; i++) {
+    threads.emplace_back([this, leader_tserver, kTimeout, &rows_inserted, &finish]() {
+      DoWriteTestRows(leader_tserver, this->tablet_id_, kTimeout, &rows_inserted, &finish);
+    });
   }
   auto thread_join_func = [&]() {
-    Status ret;
-    for (const auto& thread : threads) {
-      Status s = ThreadJoiner(thread.get()).Join();
-      if (!s.ok()) {
-        LOG(WARNING) << "failed to join thread " << thread->name()
-                     << " : " << s.ToString();
-        ret = ret.ok() ? s : ret.CloneAndAppend(s.ToString());
-      }
+    for (auto& t : threads) {
+      t.join();
     }
-    return ret;
   };
   auto thread_joiner = MakeScopedCleanup(thread_join_func);
 
@@ -1745,7 +1724,7 @@ TEST_F(RaftConsensusITest, TestConfigChangeUnderLoad) {
 
   LOG(INFO) << "Joining writer threads...";
   finish.Store(true);
-  ASSERT_OK(thread_join_func());
+  thread_join_func();
   thread_joiner.cancel();
 
   LOG(INFO) << "Waiting for replicas to agree...";
@@ -2042,9 +2021,13 @@ TEST_F(RaftConsensusITest, TestMemoryRemainsConstantDespiteTwoDeadFollowers) {
   const int64_t kMinRejections = 100;
   const MonoDelta kMaxWaitTime = MonoDelta::FromSeconds(60);
 
-  // Start the cluster with a low per-tablet transaction memory limit, so that
-  // the test can complete faster.
-  NO_FATALS(BuildAndStart({ "--tablet_transaction_memory_limit_mb=2" }));
+  NO_FATALS(BuildAndStart({
+      // Start the cluster with a low per-tablet transaction memory limit,
+      // so that the test can complete faster.
+      "--tablet_transaction_memory_limit_mb=2",
+      // Make the validator of 'RPC vs transactional memory size' happy.
+      "--rpc_max_message_size=2097152",
+  }));
 
   // Kill both followers.
   TServerDetails* details;
@@ -2136,7 +2119,7 @@ TEST_F(RaftConsensusITest, TestLargeBatches) {
     // We write 128KB cells in this test, so bump the limit, and disable compression.
     "--max_cell_size_bytes=1000000",
     "--log_segment_size_mb=1",
-    "--log_compression_codec=none",
+    "--log_compression_codec=no_compression",
     "--log_min_segments_to_retain=100", // disable GC of logs.
   };
 
@@ -3090,7 +3073,7 @@ TEST_F(RaftConsensusITest, TestLeaderTransferWhenFollowerFallsBehindLeaderGC) {
     LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
     return;
   }
-
+  const auto kTimeout = MonoDelta::FromSeconds(30);
   vector<string> ts_flags = {
     // Disable follower eviction.
     "--evict_failed_followers=false",
@@ -3113,38 +3096,45 @@ TEST_F(RaftConsensusITest, TestLeaderTransferWhenFollowerFallsBehindLeaderGC) {
   TabletServerMap active_tablet_servers = tablet_servers_;
   ASSERT_EQ(3, active_tablet_servers.size());
   ASSERT_EQ(1, active_tablet_servers.erase(follower_uuid));
-  ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(30), active_tablet_servers,
-                                  tablet_id_, 1));
+  ASSERT_OK(WaitForServersToAgree(kTimeout, active_tablet_servers, tablet_id_, 1));
 
   // Try to transfer leadership to the follower that has fallen behind log GC.
-  auto* leader_ts = FindOrDie(tablet_servers_, leader_uuid);
-  ConsensusServiceProxy* c_proxy = CHECK_NOTNULL(leader_ts->consensus_proxy.get());
-  LeaderStepDownRequestPB req;
-  LeaderStepDownResponsePB resp;
-  RpcController rpc;
+  // The leader role might fluctuate among tablet replicas: LeaderStepDown()
+  // request will be retried in such rare cases because of ASSERT_EVENTUALLY().
+  ASSERT_EVENTUALLY([&] {
+    TServerDetails* leader_ts;
+    ASSERT_OK(FindTabletLeader(
+        tablet_servers_, tablet_id_, kTimeout, &leader_ts));
+    LeaderStepDownRequestPB req;
+    req.set_dest_uuid(leader_ts->uuid());
+    req.set_tablet_id(tablet_id_);
+    req.set_mode(consensus::LeaderStepDownMode::GRACEFUL);
+    req.set_new_leader_uuid(follower_uuid);
 
-  req.set_dest_uuid(leader_uuid);
-  req.set_tablet_id(tablet_id_);
-  req.set_mode(consensus::LeaderStepDownMode::GRACEFUL);
-  req.set_new_leader_uuid(follower_uuid);
-
-  // The request should succeed.
-  ASSERT_OK(c_proxy->LeaderStepDown(req, &resp, &rpc));
-  ASSERT_FALSE(resp.has_error()) << SecureDebugString(resp);
+    // The request should succeed.
+    ConsensusServiceProxy* c_proxy = CHECK_NOTNULL(leader_ts->consensus_proxy.get());
+    RpcController ctl;
+    LeaderStepDownResponsePB resp;
+    ASSERT_OK(c_proxy->LeaderStepDown(req, &resp, &ctl));
+    ASSERT_FALSE(resp.has_error()) << SecureDebugString(resp);
+  });
 
   // However, the leader will not be able to transfer leadership to the lagging
   // follower, and eventually will resume normal operation. We check this by
   // waiting for a write to succeed.
   ASSERT_EVENTUALLY([&] {
     WriteRequestPB w_req;
-    WriteResponsePB w_resp;
-    rpc.Reset();
-    rpc.set_timeout(MonoDelta::FromSeconds(30));
     w_req.set_tablet_id(tablet_id_);
     ASSERT_OK(SchemaToPB(schema_, w_req.mutable_schema()));
     AddTestRowToPB(RowOperationsPB::INSERT, schema_, kTestRowKey, kTestRowIntVal,
                    "hello world", w_req.mutable_row_operations());
-    ASSERT_OK(leader_ts->tserver_proxy->Write(w_req, &w_resp, &rpc));
+    TServerDetails* leader_ts;
+    ASSERT_OK(FindTabletLeader(
+        tablet_servers_, tablet_id_, kTimeout, &leader_ts));
+    RpcController ctl;
+    ctl.set_timeout(kTimeout);
+    WriteResponsePB w_resp;
+    ASSERT_OK(leader_ts->tserver_proxy->Write(w_req, &w_resp, &ctl));
   });
 }
 

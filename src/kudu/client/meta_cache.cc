@@ -18,6 +18,8 @@
 #include "kudu/client/meta_cache.h"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <ostream>
 #include <set>
@@ -25,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp> // IWYU pragma: keep
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/repeated_field.h> // IWYU pragma: keep
 
@@ -37,10 +39,6 @@
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/callback.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
@@ -51,34 +49,43 @@
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/scoped_cleanup.h"
 
-using std::map;
+using kudu::consensus::RaftPeerPB;
+using kudu::master::ANY_REPLICA;
+using kudu::master::GetTableLocationsRequestPB;
+using kudu::master::GetTableLocationsResponsePB;
+using kudu::master::MasterServiceProxy;
+using kudu::master::TabletLocationsPB;
+using kudu::master::TSInfoPB;
+using kudu::rpc::BackoffType;
+using kudu::rpc::CredentialsPolicy;
+using kudu::tserver::TabletServerServiceProxy;
 using std::set;
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
+// TODO(todd) before enabling by default, need to think about how this works with
+// docker/k8s -- I think the abstract namespace is scoped to a given k8s pod. We
+// probably need to have the client blacklist the socket if it attempts to use it
+// and can't connect.
+DEFINE_bool(client_use_unix_domain_sockets, false,
+            "Whether to try to connect to tablet servers using unix domain sockets. "
+            "This will only be attempted if the server has indicated that it is listening "
+            "on such a socket and the client is running on the same host.");
+TAG_FLAG(client_use_unix_domain_sockets, experimental);
+
 namespace kudu {
-
-using consensus::RaftPeerPB;
-using master::ANY_REPLICA;
-using master::GetTableLocationsRequestPB;
-using master::GetTableLocationsResponsePB;
-using master::MasterServiceProxy;
-using master::TabletLocationsPB;
-using master::TSInfoPB;
-using rpc::BackoffType;
-using rpc::CredentialsPolicy;
-using tserver::TabletServerServiceProxy;
-
 namespace client {
-
 namespace internal {
 
 RemoteTabletServer::RemoteTabletServer(const master::TSInfoPB& pb)
@@ -91,8 +98,7 @@ void RemoteTabletServer::DnsResolutionFinished(const HostPort& hp,
                                                KuduClient* client,
                                                const StatusCallback& user_callback,
                                                const Status &result_status) {
-  gscoped_ptr<vector<Sockaddr> > scoped_addrs(addrs);
-
+  SCOPED_CLEANUP({ delete addrs; });
   Status s = result_status;
 
   if (s.ok() && addrs->empty()) {
@@ -101,7 +107,7 @@ void RemoteTabletServer::DnsResolutionFinished(const HostPort& hp,
 
   if (!s.ok()) {
     s = s.CloneAndPrepend("Failed to resolve address for TS " + uuid_);
-    user_callback.Run(s);
+    user_callback(s);
     return;
   }
 
@@ -113,7 +119,7 @@ void RemoteTabletServer::DnsResolutionFinished(const HostPort& hp,
     proxy_.reset(new TabletServerServiceProxy(client->data_->messenger_, (*addrs)[0], hp.host()));
     proxy_->set_user_credentials(client->data_->user_credentials_);
   }
-  user_callback.Run(s);
+  user_callback(s);
 }
 
 void RemoteTabletServer::InitProxy(KuduClient* client, const StatusCallback& cb) {
@@ -124,7 +130,7 @@ void RemoteTabletServer::InitProxy(KuduClient* client, const StatusCallback& cb)
     if (proxy_) {
       // Already have a proxy created.
       l.unlock();
-      cb.Run(Status::OK());
+      cb(Status::OK());
       return;
     }
 
@@ -135,9 +141,29 @@ void RemoteTabletServer::InitProxy(KuduClient* client, const StatusCallback& cb)
   }
 
   auto addrs = new vector<Sockaddr>();
+
+  if (FLAGS_client_use_unix_domain_sockets && unix_domain_socket_path_ &&
+      client->data_->IsLocalHostPort(hp)) {
+    Sockaddr unix_socket;
+    Status parse_status = unix_socket.ParseUnixDomainPath(*unix_domain_socket_path_);
+    if (!parse_status.ok()) {
+      KLOG_EVERY_N_SECS(WARNING, 60)
+          << Substitute("Tablet server $0 ($1) reported an invalid UNIX domain socket path '$2'",
+                        hp.ToString(), uuid_, *unix_domain_socket_path_);
+      // Fall through to normal TCP path.
+    } else {
+      VLOG(1) << Substitute("Will try to connect to UNIX socket $0 for local tablet server $1 ($2)",
+                            unix_socket.ToString(), hp.ToString(), uuid_);
+      addrs->emplace_back(unix_socket);
+      this->DnsResolutionFinished(hp, addrs, client, cb, Status::OK());
+      return;
+    }
+  }
+
   client->data_->dns_resolver_->ResolveAddressesAsync(
-      hp, addrs, Bind(&RemoteTabletServer::DnsResolutionFinished,
-                      Unretained(this), hp, addrs, client, cb));
+      hp, addrs, [=](const Status& s) {
+        this->DnsResolutionFinished(hp, addrs, client, cb, s);
+      });
 }
 
 void RemoteTabletServer::Update(const master::TSInfoPB& pb) {
@@ -150,6 +176,11 @@ void RemoteTabletServer::Update(const master::TSInfoPB& pb) {
     rpc_hostports_.emplace_back(hostport_pb.host(), hostport_pb.port());
   }
   location_ = pb.location();
+  if (pb.has_unix_domain_socket_path()) {
+    unix_domain_socket_path_ = pb.unix_domain_socket_path();
+  } else {
+    unix_domain_socket_path_ = boost::none;
+  }
 }
 
 const string& RemoteTabletServer::permanent_uuid() const {
@@ -459,17 +490,17 @@ void MetaCacheServerPicker::PickLeader(const ServerPickedCallback& callback,
         deadline,
         MetaCache::LookupType::kPoint,
         nullptr,
-        Bind(&MetaCacheServerPicker::LookUpTabletCb, Unretained(this), callback, deadline));
+        [this, callback, deadline](const Status& s) {
+          this->LookUpTabletCb(callback, deadline, s);
+        });
     return;
   }
 
   // If we have a current TS initialize the proxy.
   // Make sure we have a working proxy before sending out the RPC.
-  leader->InitProxy(client_,
-                    Bind(&MetaCacheServerPicker::InitProxyCb,
-                         Unretained(this),
-                         callback,
-                         leader));
+  leader->InitProxy(client_, [this, callback, leader](const Status& s) {
+    this->InitProxyCb(callback, leader, s);
+  });
 }
 
 void MetaCacheServerPicker::MarkServerFailed(RemoteTabletServer* replica, const Status& status) {
@@ -499,7 +530,7 @@ void MetaCacheServerPicker::LookUpTabletCb(const ServerPickedCallback& callback,
 
   // If we couldn't lookup the tablet call the user callback immediately.
   if (!status.ok()) {
-    callback.Run(status, nullptr);
+    callback(status, nullptr);
     return;
   }
 
@@ -513,7 +544,7 @@ void MetaCacheServerPicker::LookUpTabletCb(const ServerPickedCallback& callback,
 void MetaCacheServerPicker::InitProxyCb(const ServerPickedCallback& callback,
                                         RemoteTabletServer* replica,
                                         const Status& status) {
-  callback.Run(status, replica);
+  callback(status, replica);
 }
 
 
@@ -674,7 +705,7 @@ void LookupRpc::SendRpc() {
   Status fastpath_status = meta_cache_->DoFastPathLookup(
       table_, &partition_key_, lookup_type_, remote_tablet_);
   if (!fastpath_status.IsIncomplete()) {
-    user_cb_.Run(fastpath_status);
+    user_cb_(fastpath_status);
     delete this;
     return;
   }
@@ -722,14 +753,14 @@ void LookupRpc::ResetMasterLeaderAndRetry(CredentialsPolicy creds_policy) {
   table_->client()->data_->ConnectToClusterAsync(
       table_->client(),
       retrier().deadline(),
-      Bind(&LookupRpc::NewLeaderMasterDeterminedCb, Unretained(this), creds_policy),
+      [=](const Status& s) { this->NewLeaderMasterDeterminedCb(creds_policy, s); },
       creds_policy);
 }
 
 void LookupRpc::SendRpcCb(const Status& status) {
   // If we exit and haven't scheduled a retry, this object should delete
   // itself.
-  gscoped_ptr<LookupRpc> delete_me(this);
+  unique_ptr<LookupRpc> delete_me(this);
 
   // Check for generic errors.
   Status new_status = status;
@@ -766,7 +797,7 @@ void LookupRpc::SendRpcCb(const Status& status) {
     new_status = new_status.CloneAndPrepend(Substitute("$0 failed", ToString()));
     KLOG_EVERY_N_SECS(WARNING, 1) << new_status.ToString();
   }
-  user_cb_.Run(new_status);
+  user_cb_(new_status);
 }
 
 Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
@@ -1018,7 +1049,7 @@ void MetaCache::LookupTabletByKey(const KuduTable* table,
   Status fastpath_status = DoFastPathLookup(
       table, &partition_key, lookup_type, remote_tablet);
   if (!fastpath_status.IsIncomplete()) {
-    callback.Run(fastpath_status);
+    callback(fastpath_status);
     return;
   }
 

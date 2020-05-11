@@ -17,9 +17,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Support the print function in Python 2.
+from __future__ import print_function
+
 import argparse
 import collections
-import compile_flags
 import json
 import logging
 import multiprocessing
@@ -35,6 +37,8 @@ from kudu_util import init_logging
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+BUILD_PATH = os.path.join(ROOT, "build", "latest")
+
 CLANG_TIDY_DIFF = os.path.join(
     ROOT, "thirdparty/installed/uninstrumented/share/clang/clang-tidy-diff.py")
 CLANG_TIDY = os.path.join(
@@ -45,31 +49,6 @@ GERRIT_PASSWORD = os.getenv('TIDYBOT_PASSWORD')
 
 GERRIT_URL = "https://gerrit.cloudera.org"
 
-DISABLED_TIDY_CHECKS=[
-    # Although useful in production code, we use magic numbers liberally in
-    # tests, and many would be net less clear as named constants.
-    'readability-magic-numbers',
-
-    # IWYU has specific rules for ordering '-inl.h' include files, i.e.
-    # 'header.h' and its 'header-inl.h' counterpart. It seems in some cases
-    # including 'header-inl.h' before 'header.h' might even lead to compilation
-    # failures. So, IWYU intentionally re-orders them even if 'header-inl.h'
-    # comes before 'header.h' lexicographically in default C locale:
-    #   https://github.com/apache/kudu/blob/ \
-    #     89ce529e945731c48445db4a6f8af11f9f905aab/build-support/iwyu/ \
-    #     fix_includes.py#L1786-L1787
-    #
-    # That ordering contradicts with what clang-tidy recommends when using the
-    # 'llvm-include-order' check. To avoid confusion, let's disable the
-    # 'llvm-include-order'.
-    #
-    # TODO(aserbin): clarify whether it's possible to customize clang-tidy
-    #                behavior w.r.t. the sorting of such header files using
-    #                the format style options described at
-    #                https://clang.llvm.org/docs/ClangFormatStyleOptions.html
-    'llvm-include-order',
-]
-
 def run_tidy(sha="HEAD", is_rev_range=False):
     diff_cmdline = ["git", "diff" if is_rev_range else "show", sha]
 
@@ -79,6 +58,8 @@ def run_tidy(sha="HEAD", is_rev_range=False):
 
     # Produce a separate diff for each file and run clang-tidy-diff on it
     # in parallel.
+    #
+    # Note: this will incorporate any configuration from .clang-tidy.
     def tidy_on_path(path):
         patch_file = tempfile.NamedTemporaryFile()
         cmd = diff_cmdline + [
@@ -87,13 +68,11 @@ def run_tidy(sha="HEAD", is_rev_range=False):
             "--",
             path]
         subprocess.check_call(cmd, stdout=patch_file, cwd=ROOT)
-        checks_arg_value = ",".join([ "-" + c for c in DISABLED_TIDY_CHECKS ])
         cmdline = [CLANG_TIDY_DIFF,
                    "-clang-tidy-binary", CLANG_TIDY,
                    "-p0",
-                   "-checks=" + checks_arg_value,
-                   "--",
-                   "-DCLANG_TIDY"] + compile_flags.get_flags()
+                   "-path", BUILD_PATH,
+                   "-extra-arg=-DCLANG_TIDY"]
         return subprocess.check_output(
             cmdline,
             stdin=file(patch_file.name),
@@ -167,10 +146,10 @@ def post_comments(revision_url_base, gerrit_json_obj):
                       auth=(GERRIT_USER, GERRIT_PASSWORD),
                       data=json.dumps(gerrit_json_obj),
                       headers={'Content-Type': 'application/json'})
-    print "Response:"
-    print r.headers
-    print r.status_code
-    print r.text
+    print("Response:")
+    print(r.headers)
+    print(r.status_code)
+    print(r.text)
 
 
 class TestClangTidyGerrit(unittest.TestCase):
@@ -206,7 +185,6 @@ No relevant changes found.
         self.assertEqual("src/kudu/blah.cc", parsed[1]['path'])
 
 
-
 if __name__ == "__main__":
     # Basic setup and argument parsing.
     init_logging()
@@ -221,31 +199,31 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.rev_range and not args.no_gerrit:
-        print >>sys.stderr, "--rev-range works only with --no-gerrit"
+        print("--rev-range works only with --no-gerrit", file=sys.stderr)
         sys.exit(1)
 
     # Find the gerrit revision URL, if applicable.
     if not args.no_gerrit:
         revision_url = get_gerrit_revision_url(args.rev)
-        print revision_url
+        print(revision_url)
 
     # Run clang-tidy and parse the output.
     clang_output = run_tidy(args.rev, args.rev_range)
     logging.info("Clang output")
     logging.info(clang_output)
     if args.no_gerrit:
-        print >>sys.stderr, "Skipping gerrit"
+        print("Skipping gerrit", file=sys.stderr)
         sys.exit(0)
     logging.info("=" * 80)
     parsed = parse_clang_output(clang_output)
     if not parsed:
-        print >>sys.stderr, "No warnings"
+        print("No warnings", file=sys.stderr)
         sys.exit(0)
-    print "Parsed clang warnings:"
-    print json.dumps(parsed, indent=4)
+    print("Parsed clang warnings:")
+    print(json.dumps(parsed, indent=4))
 
     # Post the output as comments to the gerrit URL.
     gerrit_json_obj = create_gerrit_json_obj(parsed)
-    print "Will post to gerrit:"
-    print json.dumps(gerrit_json_obj, indent=4)
+    print("Will post to gerrit:")
+    print(json.dumps(gerrit_json_obj, indent=4))
     post_comments(revision_url, gerrit_json_obj)

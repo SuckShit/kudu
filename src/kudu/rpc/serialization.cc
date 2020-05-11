@@ -19,12 +19,11 @@
 
 #include <limits>
 #include <ostream>
-#include <string>
 
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
-#include <google/protobuf/message_lite.h>
 #include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/message_lite.h>
 
 #include "kudu/gutil/endian.h"
 #include "kudu/gutil/port.h"
@@ -69,7 +68,7 @@ void SerializeMessage(const MessageLite& message, faststring* param_buf,
   // this is a safe limitation.
   CHECK_LE(total_size, std::numeric_limits<uint32_t>::max());
 
-  if (total_size > FLAGS_rpc_max_message_size) {
+  if (PREDICT_FALSE(total_size > FLAGS_rpc_max_message_size)) {
     LOG(WARNING) << Substitute("Serialized $0 ($1 bytes) is larger than the maximum configured "
                                "RPC message size ($2 bytes). "
                                "Sending anyway, but peer may reject the data.",

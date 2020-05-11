@@ -17,7 +17,6 @@
 
 #include "kudu/mini-cluster/mini_cluster.h"
 
-#include <ostream>
 #include <string>
 #include <utility>
 
@@ -67,7 +66,7 @@ Status MiniCluster::ReserveDaemonSocket(DaemonType type,
   RETURN_NOT_OK(sock_addr.ParseString(ip, 0));
 
   unique_ptr<Socket> sock(new Socket());
-  RETURN_NOT_OK(sock->Init(0));
+  RETURN_NOT_OK(sock->Init(sock_addr.family(), 0));
   RETURN_NOT_OK(sock->SetReuseAddr(true));
   RETURN_NOT_OK(sock->SetReusePort(true));
   RETURN_NOT_OK(sock->Bind(sock_addr));

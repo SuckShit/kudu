@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_CLIENT_SCAN_PREDICATE_INTERNAL_H
-#define KUDU_CLIENT_SCAN_PREDICATE_INTERNAL_H
+#pragma once
 
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -88,7 +88,72 @@ class ComparisonPredicateData : public KuduPredicate::Data {
 
   ColumnSchema col_;
   KuduPredicate::ComparisonOp op_;
-  gscoped_ptr<KuduValue> val_;
+  std::unique_ptr<KuduValue> val_;
+};
+
+// An InBloomFilter predicate for selecting values present in the vector of Bloom filters.
+class InBloomFilterPredicateData : public KuduPredicate::Data {
+ public:
+  InBloomFilterPredicateData(ColumnSchema col,
+                             std::vector<std::unique_ptr<KuduBloomFilter>> bloom_filters)
+      : col_(std::move(col)),
+        bloom_filters_(std::move(bloom_filters)) {
+  }
+
+  Status AddToScanSpec(ScanSpec* spec, Arena* arena) override;
+
+  InBloomFilterPredicateData* Clone() const override;
+
+ private:
+  ColumnSchema col_;
+  std::vector<std::unique_ptr<KuduBloomFilter>> bloom_filters_;
+};
+
+// Custom deleter to be used with smart pointers in InDirectBloomFilterPredicateData.
+// Allows use of smart pointers when the underlying raw pointer may or may not be
+// owned by the user. See comment in InDirectBloomFilterPredicateData for more context.
+template<typename T>
+struct DirectBloomFilterDataDeleter {
+  explicit DirectBloomFilterDataDeleter(bool owned) : owned_(owned) {
+  }
+
+  void operator()(T* ptr) {
+    if (owned_) {
+      delete ptr;
+    }
+  }
+ private:
+  bool owned_;
+};
+
+typedef std::unique_ptr<BlockBloomFilter, DirectBloomFilterDataDeleter<BlockBloomFilter>>
+    DirectBlockBloomFilterUniqPtr;
+
+class InDirectBloomFilterPredicateData : public KuduPredicate::Data {
+ public:
+  InDirectBloomFilterPredicateData(
+      ColumnSchema col,
+      std::shared_ptr<BlockBloomFilterBufferAllocatorIf> allocator,
+      std::vector<DirectBlockBloomFilterUniqPtr> bloom_filters)
+      : col_(std::move(col)),
+        allocator_(std::move(allocator)),
+        bloom_filters_(std::move(bloom_filters)) {
+  }
+
+  Status AddToScanSpec(ScanSpec* spec, Arena* arena) override;
+
+  InDirectBloomFilterPredicateData* Clone() const override;
+
+ private:
+  ColumnSchema col_;
+  // This class is designed to accept BlockBloomFilter directly as raw pointer
+  // from consumers like Impala. In such a case, the data is owned by the caller and not
+  // by the instance of this class. So storing raw pointers and not destructing the pointers would
+  // have worked fine. However for the case when predicate data is Clone()'d the internal data
+  // is owned by the instance of this class. Hence using smart pointers with custom deleter
+  // DirectBloomFilterDataDeleter to keep track of ownership.
+  std::shared_ptr<BlockBloomFilterBufferAllocatorIf> allocator_;
+  std::vector<DirectBlockBloomFilterUniqPtr> bloom_filters_;
 };
 
 // A list predicate for a column and a list of constant values.
@@ -161,6 +226,35 @@ class IsNullPredicateData : public KuduPredicate::Data {
   ColumnSchema col_;
 };
 
+class KuduBloomFilterBuilder::Data {
+ public:
+  Data();
+  ~Data() = default;
+
+  size_t num_keys_;
+  double false_positive_probability_;
+  HashAlgorithm hash_algorithm_;
+  uint32_t hash_seed_;
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(Data);
+};
+
+class KuduBloomFilter::Data {
+ public:
+  Data() = default;
+  ~Data() = default;
+  std::unique_ptr<Data> Clone() const;
+
+  std::shared_ptr<BlockBloomFilterBufferAllocatorIf> allocator_;
+  std::unique_ptr<BlockBloomFilter> bloom_filter_;
+
+ private:
+  Data(std::shared_ptr<BlockBloomFilterBufferAllocatorIf> allocator,
+       std::unique_ptr<BlockBloomFilter> bloom_filter);
+
+  DISALLOW_COPY_AND_ASSIGN(Data);
+};
+
 } // namespace client
 } // namespace kudu
-#endif /* KUDU_CLIENT_SCAN_PREDICATE_INTERNAL_H */

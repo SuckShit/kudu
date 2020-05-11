@@ -24,6 +24,7 @@
 ##########################################################
 
 set -xe
+set -o pipefail
 
 # Install the required runtime packages, if they are not installed.
 # CentOS/RHEL
@@ -37,8 +38,15 @@ if [[ -f "/usr/bin/yum" ]]; then
     cyrus-sasl-plain \
     krb5-server \
     krb5-workstation \
-    nscd \
     openssl
+
+  # Install exta impala runtime packages used by the impala-runtime image. They are nominal in size.
+  # --no-install-recommends keeps the install smaller
+  yum install -y \
+    cyrus-sasl-devel \
+    lzo-devel \
+    tzdata \
+    which
 
   # Reduce the image size by cleaning up after the install.
   yum clean all
@@ -60,8 +68,14 @@ elif [[ -f "/usr/bin/apt-get" ]]; then
     libsasl2-2 \
     libsasl2-modules \
     libsasl2-modules-gssapi-mit \
-    nscd \
     openssl
+
+  # Install exta impala runtime packages used by the impala-runtime image. They are nominal in size.
+  # --no-install-recommends keeps the install smaller
+  apt-get install -y --no-install-recommends \
+    liblzo2-2 \
+    libsasl2-dev \
+    tzdata
 
   # Reduce the image size by cleaning up after the install.
   apt-get clean

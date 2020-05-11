@@ -16,15 +16,12 @@
 // under the License.
 #pragma once
 
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -33,12 +30,8 @@
 #include "kudu/client/client.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/master/master.pb.h"
-#include "kudu/rpc/response_callback.h"
-#include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/user_credentials.h"
-#include "kudu/security/token.pb.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
@@ -46,16 +39,15 @@
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
 
-namespace boost {
-template <typename Signature>
-class function;
-} // namespace boost
-
 namespace kudu {
 
 class DnsResolver;
 class PartitionSchema;
 class Sockaddr;
+
+namespace security {
+class SignedTokenPB;
+}  // namespace security
 
 namespace master {
 class AlterTableRequestPB;
@@ -63,7 +55,6 @@ class AlterTableResponsePB;
 class ConnectToMasterResponsePB;
 class CreateTableRequestPB;
 class CreateTableResponsePB;
-class GetTableSchemaResponsePB;
 class ListTabletServersRequestPB;
 class ListTabletServersResponsePB;
 class MasterServiceProxy;
@@ -80,7 +71,6 @@ namespace client {
 class KuduSchema;
 
 namespace internal {
-class AuthzTokenCache;
 class ConnectToClusterRpc;
 class MetaCache;
 class RemoteTablet;
@@ -107,40 +97,40 @@ class KuduClient::Data {
                          std::vector<internal::RemoteTabletServer*>* candidates,
                          internal::RemoteTabletServer** ts);
 
-  Status CreateTable(KuduClient* client,
-                     const master::CreateTableRequestPB& req,
-                     master::CreateTableResponsePB* resp,
-                     const MonoTime& deadline,
-                     bool has_range_partition_bounds);
+  static Status CreateTable(KuduClient* client,
+                            const master::CreateTableRequestPB& req,
+                            master::CreateTableResponsePB* resp,
+                            const MonoTime& deadline,
+                            bool has_range_partition_bounds);
 
-  Status IsCreateTableInProgress(KuduClient* client,
-                                 master::TableIdentifierPB table,
-                                 const MonoTime& deadline,
-                                 bool* create_in_progress);
+  static Status IsCreateTableInProgress(KuduClient* client,
+                                        master::TableIdentifierPB table,
+                                        const MonoTime& deadline,
+                                        bool* create_in_progress);
 
-  Status WaitForCreateTableToFinish(KuduClient* client,
-                                    master::TableIdentifierPB table,
-                                    const MonoTime& deadline);
+  static Status WaitForCreateTableToFinish(KuduClient* client,
+                                           master::TableIdentifierPB table,
+                                           const MonoTime& deadline);
 
-  Status DeleteTable(KuduClient* client,
-                     const std::string& table_name,
-                     const MonoTime& deadline,
-                     bool modify_external_catalogs = true);
+  static Status DeleteTable(KuduClient* client,
+                            const std::string& table_name,
+                            const MonoTime& deadline,
+                            bool modify_external_catalogs = true);
 
-  Status AlterTable(KuduClient* client,
-                    const master::AlterTableRequestPB& req,
-                    master::AlterTableResponsePB* resp,
-                    const MonoTime& deadline,
-                    bool has_add_drop_partition);
+  static Status AlterTable(KuduClient* client,
+                           const master::AlterTableRequestPB& req,
+                           master::AlterTableResponsePB* resp,
+                           const MonoTime& deadline,
+                           bool has_add_drop_partition);
 
-  Status IsAlterTableInProgress(KuduClient* client,
-                                master::TableIdentifierPB table,
-                                const MonoTime& deadline,
-                                bool* alter_in_progress);
+  static Status IsAlterTableInProgress(KuduClient* client,
+                                       master::TableIdentifierPB table,
+                                       const MonoTime& deadline,
+                                       bool* alter_in_progress);
 
-  Status WaitForAlterTableToFinish(KuduClient* client,
-                                   master::TableIdentifierPB table,
-                                   const MonoTime& deadline);
+  static Status WaitForAlterTableToFinish(KuduClient* client,
+                                          master::TableIdentifierPB table,
+                                          const MonoTime& deadline);
 
   // Open the table identified by 'table_identifier'.
   Status OpenTable(KuduClient* client,
@@ -331,7 +321,7 @@ class KuduClient::Data {
 Status RetryFunc(const MonoTime& deadline,
                  const std::string& retry_msg,
                  const std::string& timeout_msg,
-                 const boost::function<Status(const MonoTime&, bool*)>& func);
+                 const std::function<Status(const MonoTime&, bool*)>& func);
 
 // Set logging verbose level through environment variable.
 void SetVerboseLevelFromEnvVar();

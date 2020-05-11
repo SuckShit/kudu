@@ -23,12 +23,9 @@
 #include <map>
 #include <mutex>
 #include <ostream>
-#include <unordered_map>
 
-#include <boost/bind.hpp> // IWYU pragma: keep
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/client/client-internal.h"
@@ -43,7 +40,6 @@
 #include "kudu/consensus/consensus.proxy.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -63,6 +59,8 @@
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.pb.h"
+#include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/tserver/tserver_service.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/locks.h"
@@ -75,7 +73,11 @@
 DECLARE_int64(timeout_ms); // defined in tool_action_common
 DECLARE_int32(fetch_info_concurrency);
 
-DEFINE_bool(checksum_cache_blocks, false, "Should the checksum scanners cache the read blocks");
+DEFINE_bool(checksum_cache_blocks, false, "Should the checksum scanners cache the read blocks.");
+DEFINE_bool(quiescing_info, true,
+            "Whether to display the quiescing-related information of each tablet server, "
+            "e.g. number of tablet leaders per server, the number of active scanners "
+            "per server.");
 
 using kudu::client::KuduClientBuilder;
 using kudu::client::KuduScanToken;
@@ -90,8 +92,12 @@ using kudu::master::TServerStatePB;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
+using kudu::server::GenericServiceProxy;
+using kudu::server::GetFlagsRequestPB;
+using kudu::server::GetFlagsResponsePB;
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
@@ -105,17 +111,24 @@ MonoDelta GetDefaultTimeout() {
   return MonoDelta::FromMilliseconds(FLAGS_timeout_ms);
 }
 
-// Common flag-fetching routine for masters and tablet servers.
-Status FetchUnusualFlagsCommon(const shared_ptr<server::GenericServiceProxy>& proxy,
-                               server::GetFlagsResponsePB* resp) {
-  server::GetFlagsRequestPB req;
-  RpcController rpc;
-  rpc.set_timeout(GetDefaultTimeout());
-  for (const string& tag : { "experimental", "hidden", "unsafe" }) {
+// Common flag-fetching routine. Fetches flags for the specified category,
+// given service proxy object.
+Status FetchCategoryFlags(FlagsCategory category,
+                          const shared_ptr<GenericServiceProxy>& proxy,
+                          GetFlagsResponsePB* resp) {
+  const auto& filter = GetFlagsCategoryFilter(category);
+  GetFlagsRequestPB req;
+  for (const auto& flag : filter.flags) {
+    req.add_flags(flag);
+  }
+  for (const auto& tag : filter.tags) {
     req.add_tags(tag);
   }
-  return proxy->GetFlags(req, resp, &rpc);
+  RpcController ctl;
+  ctl.set_timeout(GetDefaultTimeout());
+  return proxy->GetFlags(req, resp, &ctl);
 }
+
 } // anonymous namespace
 
 Status RemoteKsckMaster::Init() {
@@ -168,16 +181,20 @@ Status RemoteKsckMaster::FetchConsensusState() {
   return Status::OK();
 }
 
-Status RemoteKsckMaster::FetchUnusualFlags() {
-  server::GetFlagsResponsePB resp;
-  Status s = FetchUnusualFlagsCommon(generic_proxy_, &resp);
-  if (!s.ok()) {
-    flags_state_ = KsckFetchState::FETCH_FAILED;
-  } else {
-    flags_state_ = KsckFetchState::FETCHED;
-    flags_ = resp;
+Status RemoteKsckMaster::FetchFlags(const vector<FlagsCategory>& categories) {
+  Status result;
+  for (auto cat : categories) {
+    GetFlagsResponsePB resp;
+    const auto s = FetchCategoryFlags(cat, generic_proxy_, &resp);
+    if (!s.ok()) {
+      flags_by_category_[cat].state = KsckFetchState::FETCH_FAILED;
+      result = result.ok() ? s : result.CloneAndAppend(s.message());
+    } else {
+      flags_by_category_[cat].state = KsckFetchState::FETCHED;
+      flags_by_category_[cat].flags = std::move(resp);
+    }
   }
-  return s;
+  return result;
 }
 
 Status RemoteKsckTabletServer::Init() {
@@ -189,6 +206,7 @@ Status RemoteKsckTabletServer::Init() {
   const auto& host = host_port_.host();
   generic_proxy_.reset(new server::GenericServiceProxy(messenger_, addr, host));
   ts_proxy_.reset(new tserver::TabletServerServiceProxy(messenger_, addr, host));
+  ts_admin_proxy_.reset(new tserver::TabletServerAdminServiceProxy(messenger_, addr, host));
   consensus_proxy_.reset(new consensus::ConsensusServiceProxy(messenger_, addr, host));
   return Status::OK();
 }
@@ -232,6 +250,9 @@ Status RemoteKsckTabletServer::FetchInfo(ServerHealth* health) {
   }
 
   RETURN_NOT_OK(FetchCurrentTimestamp());
+  if (FLAGS_quiescing_info) {
+    FetchQuiescingInfo();
+  }
 
   state_ = KsckFetchState::FETCHED;
   *health = ServerHealth::HEALTHY;
@@ -255,7 +276,7 @@ void RemoteKsckTabletServer::FetchCurrentTimestampAsync() {
   generic_proxy_->ServerClockAsync(cb->req,
                                    &cb->resp,
                                    &cb->rpc,
-                                   boost::bind(&ServerClockResponseCallback::Run, cb));
+                                   [cb]() { cb->Run(); });
 }
 
 Status RemoteKsckTabletServer::FetchCurrentTimestamp() {
@@ -266,6 +287,26 @@ Status RemoteKsckTabletServer::FetchCurrentTimestamp() {
   RETURN_NOT_OK(generic_proxy_->ServerClock(req, &resp, &rpc));
   timestamp_ = resp.timestamp();
   return Status::OK();
+}
+
+void RemoteKsckTabletServer::FetchQuiescingInfo() {
+  tserver::QuiesceTabletServerRequestPB req;
+  tserver::QuiesceTabletServerResponsePB resp;
+  req.set_return_stats(true);
+  RpcController rpc;
+  rpc.set_timeout(GetDefaultTimeout());
+  rpc.RequireServerFeature(tserver::TabletServerFeatures::QUIESCING);
+  Status s = ts_admin_proxy_->Quiesce(req, &resp, &rpc);
+  if (!s.ok()) {
+    LOG(WARNING) << Substitute("Couldn't fetch quiescing info from tablet server $0 ($1): $2",
+                               uuid_, address(), s.ToString());
+    return;
+  }
+  cluster_summary::QuiescingInfo qinfo;
+  qinfo.is_quiescing = resp.is_quiescing();
+  qinfo.num_leaders = resp.num_leaders();
+  qinfo.num_active_scanners = resp.num_active_scanners();
+  quiescing_info_ = qinfo;
 }
 
 Status RemoteKsckTabletServer::FetchConsensusState(ServerHealth* health) {
@@ -293,16 +334,20 @@ Status RemoteKsckTabletServer::FetchConsensusState(ServerHealth* health) {
   return Status::OK();
 }
 
-Status RemoteKsckTabletServer::FetchUnusualFlags() {
-  server::GetFlagsResponsePB resp;
-  Status s = FetchUnusualFlagsCommon(generic_proxy_, &resp);
-  if (!s.ok()) {
-    flags_state_ = KsckFetchState::FETCH_FAILED;
-  } else {
-    flags_state_ = KsckFetchState::FETCHED;
-    flags_ = resp;
+Status RemoteKsckTabletServer::FetchFlags(const vector<FlagsCategory>& categories) {
+  Status result;
+  for (auto cat : categories) {
+    GetFlagsResponsePB resp;
+    const auto s = FetchCategoryFlags(cat, generic_proxy_, &resp);
+    if (!s.ok()) {
+      flags_by_category_[cat].state = KsckFetchState::FETCH_FAILED;
+      result = result.ok() ? s : result.CloneAndAppend(s.message());
+    } else {
+      flags_by_category_[cat].state = KsckFetchState::FETCHED;
+      flags_by_category_[cat].flags = std::move(resp);
+    }
   }
-  return s;
+  return result;
 }
 
 class ChecksumStepper;
@@ -357,7 +402,7 @@ class ChecksumStepper {
   }
 
   void HandleResponse() {
-    gscoped_ptr<ChecksumStepper> deleter(this);
+    unique_ptr<ChecksumStepper> deleter(this);
     Status s = rpc_.status();
     if (s.ok() && resp_.has_error()) {
       s = StatusFromPB(resp_.error().status());
@@ -423,10 +468,11 @@ class ChecksumStepper {
         LOG(FATAL) << "Unknown type";
         break;
     }
-    gscoped_ptr<ChecksumCallbackHandler> handler(new ChecksumCallbackHandler(this));
-    rpc::ResponseCallback cb = boost::bind(&ChecksumCallbackHandler::Run, handler.get());
+
+    // 'handler' deletes itself when complete.
+    auto* handler = new ChecksumCallbackHandler(this);
+    rpc::ResponseCallback cb = [handler]() { handler->Run(); };
     proxy_->ChecksumAsync(req_, &resp_, &rpc_, cb);
-    ignore_result(handler.release());
   }
 
   const Schema schema_;
@@ -456,7 +502,7 @@ void RemoteKsckTabletServer::RunTabletChecksumScanAsync(
         const Schema& schema,
         const KsckChecksumOptions& options,
         shared_ptr<KsckChecksumManager> manager) {
-  gscoped_ptr<ChecksumStepper> stepper(
+  unique_ptr<ChecksumStepper> stepper(
       new ChecksumStepper(tablet_id, schema, uuid(), options, manager, ts_proxy_));
   stepper->Start();
   ignore_result(stepper.release()); // Deletes self on callback.
@@ -523,8 +569,7 @@ Status RemoteKsckCluster::RetrieveTabletServers() {
     if (!ts_pb.has_registration()) {
       continue;
     }
-    HostPort hp;
-    RETURN_NOT_OK(HostPortFromPB(ts_pb.registration().rpc_addresses(0), &hp));
+    HostPort hp = HostPortFromPB(ts_pb.registration().rpc_addresses(0));
     auto ts = std::make_shared<RemoteKsckTabletServer>(uuid, hp, messenger_, ts_pb.location());
     RETURN_NOT_OK(ts->Init());
     EmplaceOrUpdate(&tablet_servers, uuid, std::move(ts));
@@ -556,7 +601,7 @@ Status RemoteKsckCluster::RetrieveTablesList() {
       continue;
     }
     tables_count++;
-    RETURN_NOT_OK(pool_->SubmitFunc([&]() {
+    RETURN_NOT_OK(pool_->Submit([&]() {
       client::sp::shared_ptr<KuduTable> t;
       Status s = client_->OpenTable(table_name, &t);
       if (!s.ok()) {
@@ -593,8 +638,8 @@ Status RemoteKsckCluster::RetrieveAllTablets() {
   }
 
   for (const auto& table : tables_) {
-    RETURN_NOT_OK(pool_->SubmitFunc(
-        std::bind(&KsckCluster::RetrieveTabletsList, this, table)));
+    RETURN_NOT_OK(pool_->Submit(
+        [this, table]() { this->RetrieveTabletsList(table); }));
   }
   pool_->Wait();
 

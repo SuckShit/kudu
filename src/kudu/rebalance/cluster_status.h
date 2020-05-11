@@ -56,7 +56,7 @@ enum class HealthCheckResult {
   CONSENSUS_MISMATCH,
 };
 
-const char* const HealthCheckResultToString(HealthCheckResult cr);
+const char* HealthCheckResultToString(HealthCheckResult cr);
 
 // Possible types of consensus configs.
 enum class ConsensusConfigType {
@@ -127,7 +127,14 @@ enum class ServerHealth {
 };
 
 // Return a string representation of 'sh'.
-const char* const ServerHealthToString(ServerHealth sh);
+const char* ServerHealthToString(ServerHealth sh);
+
+// Quiescing-related info.
+struct QuiescingInfo {
+  bool is_quiescing;
+  int num_leaders;
+  int num_active_scanners;
+};
 
 // A summary of a server health check.
 struct ServerHealthSummary {
@@ -135,6 +142,7 @@ struct ServerHealthSummary {
   std::string address;
   std::string ts_location;
   boost::optional<std::string> version;
+  boost::optional<QuiescingInfo> quiescing_info;
   ServerHealth health = ServerHealth::HEALTHY;
   Status status = Status::OK();
 };
@@ -185,7 +193,7 @@ enum class ServerType {
 };
 
 // Return a string representation of 'type'.
-const char* const ServerTypeToString(ServerType type);
+const char* ServerTypeToString(ServerType type);
 
 // A summary of the state of a tablet replica.
 struct ReplicaSummary {

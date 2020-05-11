@@ -95,6 +95,12 @@ class RowCell {
   const int col_idx_;
 };
 
+Status BadTypeStatus(const char* provided_type_name, const ColumnSchema& col) {
+  return Status::InvalidArgument(
+      Substitute("invalid type $0 provided for column '$1' (expected $2)",
+                 provided_type_name, col.name(), col.type_info()->name()));
+}
+
 } // anonymous namespace
 
 bool KuduScanBatch::RowPtr::IsNull(int col_idx) const {
@@ -142,6 +148,10 @@ Status KuduScanBatch::RowPtr::GetInt64(const Slice& col_name, int64_t* val) cons
 
 Status KuduScanBatch::RowPtr::GetUnixTimeMicros(const Slice& col_name, int64_t* val) const {
   return Get<TypeTraits<UNIXTIME_MICROS> >(col_name, val);
+}
+
+Status KuduScanBatch::RowPtr::GetDate(const Slice& col_name, int32_t* days_since_unix_epoch) const {
+  return Get<TypeTraits<DATE> >(col_name, days_since_unix_epoch);
 }
 
 Status KuduScanBatch::RowPtr::GetFloat(const Slice& col_name, float* val) const {
@@ -194,6 +204,10 @@ Status KuduScanBatch::RowPtr::GetUnixTimeMicros(int col_idx, int64_t* val) const
   return Get<TypeTraits<UNIXTIME_MICROS> >(col_idx, val);
 }
 
+Status KuduScanBatch::RowPtr::GetDate(int col_idx, int32_t* days_since_unix_epoch) const {
+  return Get<TypeTraits<DATE> >(col_idx, days_since_unix_epoch);
+}
+
 Status KuduScanBatch::RowPtr::GetFloat(int col_idx, float* val) const {
   return Get<TypeTraits<FLOAT> >(col_idx, val);
 }
@@ -225,14 +239,13 @@ template<typename T>
 Status KuduScanBatch::RowPtr::Get(int col_idx, typename T::cpp_type* val) const {
   const ColumnSchema& col = schema_->column(col_idx);
   if (PREDICT_FALSE(col.type_info()->type() != T::type)) {
-    // TODO: at some point we could allow type coercion here.
-    return Status::InvalidArgument(
-        Substitute("invalid type $0 provided for column '$1' (expected $2)",
-                   T::name(),
-                   col.name(), col.type_info()->name()));
+    // TODO(todd): at some point we could allow type coercion here.
+    // Explicitly out-of-line the construction of this Status in order to
+    // keep the getter code footprint as small as possible.
+    return BadTypeStatus(T::name(), col);
   }
 
-  if (col.is_nullable() && IsNull(col_idx)) {
+  if (PREDICT_FALSE(col.is_nullable() && IsNull(col_idx))) {
     return Status::NotFound("column is NULL");
   }
 
@@ -273,6 +286,9 @@ Status KuduScanBatch::RowPtr::Get<TypeTraits<UNIXTIME_MICROS> >(
     const Slice& col_name, int64_t* val) const;
 
 template
+Status KuduScanBatch::RowPtr::Get<TypeTraits<DATE> >(const Slice& col_name, int32_t* val) const;
+
+template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<FLOAT> >(const Slice& col_name, float* val) const;
 
 template
@@ -307,6 +323,9 @@ Status KuduScanBatch::RowPtr::Get<TypeTraits<INT128> >(int col_idx, int128_t* va
 
 template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<UNIXTIME_MICROS> >(int col_idx, int64_t* val) const;
+
+template
+Status KuduScanBatch::RowPtr::Get<TypeTraits<DATE> >(int col_idx, int32_t* val) const;
 
 template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<FLOAT> >(int col_idx, float* val) const;

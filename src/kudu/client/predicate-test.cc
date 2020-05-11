@@ -16,11 +16,18 @@
 // under the License.
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <type_traits>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <glog/logging.h>
@@ -30,16 +37,21 @@
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_predicate.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/value.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
+#include "kudu/util/block_bloom_filter.h"
 #include "kudu/util/decimal_util.h"
+#include "kudu/util/hash.pb.h"
 #include "kudu/util/int128.h"
+#include "kudu/util/random.h"
+#include "kudu/util/random_util.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -48,6 +60,7 @@ using std::count_if;
 using std::numeric_limits;
 using std::string;
 using std::unique_ptr;
+using std::unordered_set;
 using std::vector;
 
 namespace kudu {
@@ -60,6 +73,7 @@ using sp::shared_ptr;
 class PredicateTest : public KuduTest {
 
  protected:
+  static constexpr float kBloomFilterFalsePositiveProb = 0.01;
 
   void SetUp() override {
     // Set up the mini cluster
@@ -135,6 +149,7 @@ class PredicateTest : public KuduTest {
                 const vector<KuduPredicate*>& predicates) {
 
     vector<KuduPredicate*> cloned_predicates;
+    cloned_predicates.reserve(predicates.size());
     for (KuduPredicate* pred : predicates) {
       cloned_predicates.push_back(pred->Clone());
     }
@@ -152,11 +167,28 @@ class PredicateTest : public KuduTest {
     for (const T& v : values) {
       if (std::any_of(test_values.begin(), test_values.end(),
                       [&] (const T& t) { return t == v; })) {
-        count += 1;
+        count++;
       }
     }
     return count;
   }
+
+  // This function helps distinguish floating point values like -0.0 against 0.0.
+  template<typename F>
+  int CountMatchedFloatingPointRowsWithSignBit(const vector<F>& values,
+                                               const vector<F>& test_values) {
+    static_assert(std::is_floating_point<F>::value,
+                  "This function must only be used with floating point data types");
+    int count = 0;
+    for (const F& v : values) {
+      if (std::any_of(test_values.begin(), test_values.end(),
+                      [&] (const F& f) { return f == v && std::signbit(f) == std::signbit(v); })) {
+        count++;
+      }
+    }
+    return count;
+  }
+
 
   // Returns a vector of ints from -50 (inclusive) to 50 (exclusive), and
   // boundary values.
@@ -287,6 +319,35 @@ class PredicateTest : public KuduTest {
     };
   }
 
+  static KuduBloomFilter* CreateBloomFilter(
+      int nkeys,
+      float false_positive_prob = kBloomFilterFalsePositiveProb) {
+    KuduBloomFilterBuilder builder(nkeys);
+    builder.false_positive_probability(false_positive_prob);
+    KuduBloomFilter* bf;
+    CHECK_OK(builder.Build(&bf));
+    return bf;
+  }
+
+  static unique_ptr<BlockBloomFilter> CreateDirectBloomFilter(
+      int nkeys,
+      float false_positive_prob = kBloomFilterFalsePositiveProb) {
+    unique_ptr<BlockBloomFilter> bf(
+        new BlockBloomFilter(DefaultBlockBloomFilterBufferAllocator::GetSingleton()));
+    CHECK_OK(bf->Init(BlockBloomFilter::MinLogSpace(nkeys, false_positive_prob),
+                      kudu::FAST_HASH, 0));
+    return bf;
+  }
+
+  void CheckInBloomFilterPredicate(const shared_ptr<KuduTable>& table,
+                                   KuduBloomFilter* in_bloom_filter,
+                                   int expected_count) {
+    vector<KuduBloomFilter*> bf_vec = { in_bloom_filter };
+    auto* bf_predicate = table->NewInBloomFilterPredicate("value", &bf_vec);
+    ASSERT_TRUE(bf_vec.empty());
+    ASSERT_EQ(expected_count, CountRows(table, { bf_predicate }));
+  }
+
   // Check integer predicates against the specified table. The table must have
   // key/value rows with values from CreateIntValues, plus one null value.
   template <typename T>
@@ -377,18 +438,22 @@ class PredicateTest : public KuduTest {
       }
     }
 
-    // IN list predicates
+    // IN list and IN Bloom filter predicates
     std::random_shuffle(test_values.begin(), test_values.end());
 
     for (auto end = test_values.begin(); end <= test_values.end(); end++) {
       vector<KuduValue*> vals;
+      auto* bloom_filter = CreateBloomFilter(std::distance(test_values.begin(), end));
 
       for (auto itr = test_values.begin(); itr != end; itr++) {
         vals.push_back(KuduValue::FromInt(*itr));
+        auto key = *itr;
+        bloom_filter->Insert(Slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key)));
       }
 
       int count = CountMatchedRows<T>(values, vector<T>(test_values.begin(), end));
       ASSERT_EQ(count, CountRows(table, { table->NewInListPredicate("value", &vals) }));
+      CheckInBloomFilterPredicate(table, bloom_filter, count);
     }
 
     // IS NOT NULL predicate
@@ -400,7 +465,7 @@ class PredicateTest : public KuduTest {
   }
 
   // Check string predicates against the specified table.
-  void CheckStringPredicates(const shared_ptr<KuduTable>& table, vector<string> values) {
+  void CheckStringPredicates(const shared_ptr<KuduTable>& table, const vector<string>& values) {
 
     ASSERT_EQ(values.size() + 1, CountRows(table, {}));
 
@@ -492,18 +557,21 @@ class PredicateTest : public KuduTest {
       }
     }
 
-    // IN list predicates
+    // IN list and IN Bloom filter predicates
     std::random_shuffle(test_values.begin(), test_values.end());
 
     for (auto end = test_values.begin(); end <= test_values.end(); end++) {
       vector<KuduValue*> vals;
+      auto* bloom_filter = CreateBloomFilter(std::distance(test_values.begin(), end));
 
       for (auto itr = test_values.begin(); itr != end; itr++) {
         vals.push_back(KuduValue::CopyString(*itr));
+        bloom_filter->Insert(*itr);
       }
 
       int count = CountMatchedRows<string>(values, vector<string>(test_values.begin(), end));
       ASSERT_EQ(count, CountRows(table, { table->NewInListPredicate("value", &vals) }));
+      CheckInBloomFilterPredicate(table, bloom_filter, count);
     }
 
     // IS NOT NULL predicate
@@ -515,7 +583,7 @@ class PredicateTest : public KuduTest {
   }
 
   shared_ptr<KuduClient> client_;
-  gscoped_ptr<InternalMiniCluster> cluster_;
+  unique_ptr<InternalMiniCluster> cluster_;
 };
 
 TEST_F(PredicateTest, TestBoolPredicates) {
@@ -632,6 +700,44 @@ TEST_F(PredicateTest, TestBoolPredicates) {
     ASSERT_EQ(2, CountRows(table, { pred }));
   }
 
+  { // empty BloomFilter
+    auto* bloom_filter = CreateBloomFilter(0);
+    CheckInBloomFilterPredicate(table, bloom_filter, 0);
+  }
+
+  { // vector with no BloomFilters
+    vector<KuduBloomFilter*> no_bloom_filters = {};
+    auto* bf_predicate = table->NewInBloomFilterPredicate("value", &no_bloom_filters);
+    ASSERT_TRUE(no_bloom_filters.empty());
+    KuduScanner scanner(table.get());
+    Status s = scanner.AddConjunctPredicate(bf_predicate);
+    ASSERT_TRUE(s.IsInvalidArgument());
+    ASSERT_STR_CONTAINS(s.ToString(), "No Bloom filters supplied");
+  }
+
+  { // BloomFilter with (true)
+    auto* bloom_filter = CreateBloomFilter(1);
+    bool key = true;
+    bloom_filter->Insert(Slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key)));
+    CheckInBloomFilterPredicate(table, bloom_filter, 1);
+  }
+
+  { // BloomFilter with (false)
+    auto* bloom_filter = CreateBloomFilter(1);
+    bool key = false;
+    bloom_filter->Insert(Slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key)));
+    CheckInBloomFilterPredicate(table, bloom_filter, 1);
+  }
+
+  { // BloomFilter with (true, false)
+    auto* bloom_filter = CreateBloomFilter(2);
+    bool key = true;
+    bloom_filter->Insert(Slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key)));
+    key = false;
+    bloom_filter->Insert(Slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key)));
+    CheckInBloomFilterPredicate(table, bloom_filter, 2);
+  }
+
   // IS NOT NULL predicate
   ASSERT_EQ(CountRows(table, {}) - 1,
             CountRows(table, { table->NewIsNotNullPredicate("value") }));
@@ -740,6 +846,26 @@ TEST_F(PredicateTest, TestTimestampPredicates) {
   CheckIntPredicates<int64_t>(table);
 }
 
+TEST_F(PredicateTest, TestDatePredicates) {
+  shared_ptr<KuduTable> table = CreateAndOpenTable(KuduColumnSchema::DATE);
+  shared_ptr<KuduSession> session = CreateSession();
+
+  int i = 0;
+  for (int32_t value : CreateIntValues<int32_t>()) {
+      unique_ptr<KuduInsert> insert(table->NewInsert());
+      ASSERT_OK(insert->mutable_row()->SetInt64("key", i++));
+      ASSERT_OK(insert->mutable_row()->SetDate("value", value));
+      ASSERT_OK(session->Apply(insert.release()));
+  }
+  unique_ptr<KuduInsert> null_insert(table->NewInsert());
+  ASSERT_OK(null_insert->mutable_row()->SetInt64("key", i++));
+  ASSERT_OK(null_insert->mutable_row()->SetNull("value"));
+  ASSERT_OK(session->Apply(null_insert.release()));
+  ASSERT_OK(session->Flush());
+
+  CheckIntPredicates<int32_t>(table);
+}
+
 TEST_F(PredicateTest, TestFloatPredicates) {
   shared_ptr<KuduTable> table = CreateAndOpenTable(KuduColumnSchema::FLOAT);
   shared_ptr<KuduSession> session = CreateSession();
@@ -842,18 +968,24 @@ TEST_F(PredicateTest, TestFloatPredicates) {
     }
   }
 
-  // IN list predicates
+  // IN list and IN Bloom filter predicates
   std::random_shuffle(test_values.begin(), test_values.end());
 
   for (auto end = test_values.begin(); end <= test_values.end(); end++) {
     vector<KuduValue*> vals;
+    auto* bloom_filter = CreateBloomFilter(std::distance(test_values.begin(), end));
 
     for (auto itr = test_values.begin(); itr != end; itr++) {
       vals.push_back(KuduValue::FromFloat(*itr));
+      auto key = *itr;
+      bloom_filter->Insert(Slice(reinterpret_cast<const uint8*>(&key), sizeof(key)));
     }
 
-    int count = CountMatchedRows<float>(values, vector<float>(test_values.begin(), end));
+    int count = CountMatchedRows(values, vector<float>(test_values.begin(), end));
     ASSERT_EQ(count, CountRows(table, { table->NewInListPredicate("value", &vals) }));
+    int count_with_sign_bit = CountMatchedFloatingPointRowsWithSignBit(
+        values, vector<float>(test_values.begin(), end));
+    CheckInBloomFilterPredicate(table, bloom_filter, count_with_sign_bit);
   }
 
   // IS NOT NULL predicate
@@ -966,18 +1098,24 @@ TEST_F(PredicateTest, TestDoublePredicates) {
     }
   }
 
-  // IN list predicates
+  // IN list and IN Bloom filter predicates
   std::random_shuffle(test_values.begin(), test_values.end());
 
   for (auto end = test_values.begin(); end <= test_values.end(); end++) {
     vector<KuduValue*> vals;
+    auto* bloom_filter = CreateBloomFilter(std::distance(test_values.begin(), end));
 
     for (auto itr = test_values.begin(); itr != end; itr++) {
       vals.push_back(KuduValue::FromDouble(*itr));
+      auto key = *itr;
+      bloom_filter->Insert(Slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key)));
     }
 
-    int count = CountMatchedRows<double>(values, vector<double>(test_values.begin(), end));
+    int count = CountMatchedRows(values, vector<double>(test_values.begin(), end));
     ASSERT_EQ(count, CountRows(table, { table->NewInListPredicate("value", &vals) }));
+    int count_with_sign_bit = CountMatchedFloatingPointRowsWithSignBit(
+        values, vector<double>(test_values.begin(), end));
+    CheckInBloomFilterPredicate(table, bloom_filter, count_with_sign_bit);
   }
 
   // IS NOT NULL predicate
@@ -1108,18 +1246,22 @@ TEST_F(PredicateTest, TestDecimalPredicates) {
     }
   }
 
-  // IN list predicates
+  // IN list and IN Bloom filter predicates
   std::random_shuffle(test_values.begin(), test_values.end());
 
   for (auto end = test_values.begin(); end <= test_values.end(); end++) {
     vector<KuduValue*> vals;
+    auto* bloom_filter = CreateBloomFilter(std::distance(test_values.begin(), end));
 
     for (auto itr = test_values.begin(); itr != end; itr++) {
       vals.push_back(KuduValue::FromDecimal(*itr, 2));
+      auto key = *itr;
+      bloom_filter->Insert(Slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key)));
     }
 
     int count = CountMatchedRows<int128_t>(values, vector<int128_t>(test_values.begin(), end));
     ASSERT_EQ(count, CountRows(table, { table->NewInListPredicate("value", &vals) }));
+    CheckInBloomFilterPredicate(table, bloom_filter, count);
   }
 
   // IS NOT NULL predicate
@@ -1128,6 +1270,171 @@ TEST_F(PredicateTest, TestDecimalPredicates) {
 
   // IS NULL predicate
   ASSERT_EQ(1, CountRows(table, { table->NewIsNullPredicate("value") }));
+}
+
+class BloomFilterPredicateTest : public PredicateTest {
+ public:
+  BloomFilterPredicateTest() : rand_(Random(SeedRandom())) {}
+ protected:
+  // Number of values to be written to the table.
+  static constexpr int kNumAllValues = 100000;
+  // Subset of values from the table that'll be inserted in BloomFilter and searched against
+  // all values in the table.
+  static constexpr int kNumInclusiveValues = 10000;
+  // Values that are not present in the table.
+  static constexpr int kNumExclusiveValues = 10000;
+  // Number of false positives based on the number of values that'll be searched against.
+  static constexpr int kFalsePositives = kNumAllValues * kBloomFilterFalsePositiveProb;
+
+  shared_ptr<KuduTable> table_;
+  shared_ptr<KuduSession> session_;
+  Random rand_;
+  unordered_set<int32_t> all_values_;
+  int32_t min_value_, max_value_;
+  // Subset of "all_values_".
+  vector<int32_t> inclusive_values_;
+  // Values that are not contained in "all_values_".
+  unordered_set<int32_t> exclusive_values_;
+
+  void SetUp() override {
+    PredicateTest::SetUp();
+
+    table_ = CreateAndOpenTable(KuduColumnSchema::INT32);
+    session_ = CreateSession();
+
+    const unordered_set<int32_t> empty_set;
+    all_values_ = CreateRandomUniqueIntegers<int32_t>(kNumAllValues, empty_set, &rand_);
+    auto min_max_pair = std::minmax_element(all_values_.begin(), all_values_.end());
+    min_value_ = *min_max_pair.first;
+    max_value_ = *min_max_pair.second;
+    ReservoirSample(all_values_, kNumInclusiveValues, empty_set, &rand_, &inclusive_values_);
+    exclusive_values_ = CreateRandomUniqueIntegers<int32_t>(kNumExclusiveValues, all_values_,
+                                                            &rand_);
+  }
+
+  template<typename BloomFilterType, typename Collection>
+  static void InsertValues(BloomFilterType* bloom_filter, const Collection& values) {
+    for (const auto& v : values) {
+      bloom_filter->Insert(Slice(reinterpret_cast<const uint8_t*>(&v), sizeof(v)));
+    }
+  }
+
+  template<class Collection>
+  static KuduBloomFilter* CreateBloomFilterWithValues(const Collection& values) {
+    KuduBloomFilter* bloom_filter = CreateBloomFilter(values.size());
+    InsertValues(bloom_filter, values);
+    return bloom_filter;
+  }
+
+  template<class Collection>
+  static unique_ptr<BlockBloomFilter> CreateDirectBloomFilterWithValues(const Collection& values) {
+    unique_ptr<BlockBloomFilter> bloom_filter = CreateDirectBloomFilter(values.size());
+    InsertValues(bloom_filter.get(), values);
+    return bloom_filter;
+  }
+
+  void InsertAllValuesInTable() {
+    int i = 0;
+    for (auto value : all_values_) {
+      unique_ptr<KuduInsert> insert(table_->NewInsert());
+      ASSERT_OK(insert->mutable_row()->SetInt64("key", i++));
+      ASSERT_OK(insert->mutable_row()->SetInt32("value", value));
+      ASSERT_OK(session_->Apply(insert.release()));
+    }
+    ASSERT_OK(session_->Flush());
+  }
+
+  // Combine supplied Bloom filter predicates that contains inclusive values
+  // with Range predicate.
+  void TestWithRangePredicate(KuduPredicate* inclusive_predicate1,
+                              KuduPredicate* inclusive_predicate2) {
+    auto* less_predicate = table_->NewComparisonPredicate("value", KuduPredicate::LESS,
+                                                          KuduValue::FromInt(min_value_));
+    int actual_count_less = CountRows(table_, {inclusive_predicate1, less_predicate });
+    EXPECT_EQ(0, actual_count_less);
+
+    auto* ge_predicate = table_->NewComparisonPredicate("value", KuduPredicate::GREATER_EQUAL,
+                                                        KuduValue::FromInt(min_value_));
+    auto* le_predicate = table_->NewComparisonPredicate("value", KuduPredicate::LESS_EQUAL,
+                                                        KuduValue::FromInt(max_value_));
+    int actual_count_range = CountRows(table_,
+                                       { inclusive_predicate2, ge_predicate, le_predicate });
+    EXPECT_LE(inclusive_values_.size(), actual_count_range);
+    EXPECT_GE(inclusive_values_.size() + kFalsePositives, actual_count_range);
+  }
+};
+
+// Though this static constexpr expression is initialized in the class declaration, it needs to be
+// defined because it involves some computation.
+constexpr int BloomFilterPredicateTest::kFalsePositives;
+
+TEST_F(BloomFilterPredicateTest, TestKuduBloomFilterPredicate) {
+  KuduBloomFilter* inclusive_bf = CreateBloomFilterWithValues(inclusive_values_);
+  KuduBloomFilter* exclusive_bf = CreateBloomFilterWithValues(exclusive_values_);
+
+  InsertAllValuesInTable();
+
+  vector<KuduBloomFilter*> inclusive_bf_vec = { inclusive_bf };
+  auto* inclusive_predicate =
+      table_->NewInBloomFilterPredicate("value", &inclusive_bf_vec);
+  auto* inclusive_predicate_clone1 = inclusive_predicate->Clone();
+  auto* inclusive_predicate_clone2 = inclusive_predicate->Clone();
+
+  ASSERT_TRUE(inclusive_bf_vec.empty());
+  int actual_count_inclusive = CountRows(table_, { inclusive_predicate });
+  EXPECT_LE(inclusive_values_.size(), actual_count_inclusive);
+  EXPECT_GE(inclusive_values_.size() + kFalsePositives, actual_count_inclusive);
+
+  vector<KuduBloomFilter*> exclusive_bf_vec = { exclusive_bf };
+  auto* exclusive_predicate =
+      table_->NewInBloomFilterPredicate("value", &exclusive_bf_vec);
+  ASSERT_TRUE(exclusive_bf_vec.empty());
+  int actual_count_exclusive = CountRows(table_, { exclusive_predicate });
+  EXPECT_LE(0, actual_count_exclusive);
+  EXPECT_GE(kFalsePositives, actual_count_exclusive);
+
+  // Combine Range predicate with Bloom filter predicate.
+  TestWithRangePredicate(inclusive_predicate_clone1, inclusive_predicate_clone2);
+}
+
+// Same as TestKuduBloomFilterPredicate above but using the overloaded NewInBloomFilterPredicate()
+// client API with direct BlockBloomFilter pointer.
+TEST_F(BloomFilterPredicateTest, TestDirectBlockBloomFilterPredicate) {
+  unique_ptr<BlockBloomFilter> inclusive_bf = CreateDirectBloomFilterWithValues(inclusive_values_);
+  unique_ptr<BlockBloomFilter> exclusive_bf = CreateDirectBloomFilterWithValues(exclusive_values_);
+
+  InsertAllValuesInTable();
+
+  auto* allocator = DefaultBlockBloomFilterBufferAllocator::GetSingleton();
+  Slice allocator_slice(reinterpret_cast<const uint8_t*>(allocator), sizeof(*allocator));
+
+  vector<Slice> inclusive_bf_vec =
+      { Slice(reinterpret_cast<const uint8_t*>(inclusive_bf.get()), sizeof(*inclusive_bf)) };
+  const size_t inclusive_bf_vec_size = inclusive_bf_vec.size();
+
+  auto* inclusive_predicate =
+      table_->NewInBloomFilterPredicate("value", allocator_slice, inclusive_bf_vec);
+  auto* inclusive_predicate_clone1 = inclusive_predicate->Clone();
+  auto* inclusive_predicate_clone2 = inclusive_predicate->Clone();
+
+  ASSERT_EQ(inclusive_bf_vec_size, inclusive_bf_vec.size());
+  int actual_count_inclusive = CountRows(table_, { inclusive_predicate });
+  EXPECT_LE(inclusive_values_.size(), actual_count_inclusive);
+  EXPECT_GE(inclusive_values_.size() + kFalsePositives, actual_count_inclusive);
+
+  vector<Slice> exclusive_bf_vec =
+      { Slice(reinterpret_cast<const uint8_t*>(exclusive_bf.get()), sizeof(*exclusive_bf)) };
+  const size_t exclusive_bf_vec_size = exclusive_bf_vec.size();
+  auto* exclusive_predicate =
+      table_->NewInBloomFilterPredicate("value", allocator_slice, exclusive_bf_vec);
+  ASSERT_EQ(exclusive_bf_vec_size, exclusive_bf_vec.size());
+
+  int actual_count_exclusive = CountRows(table_, { exclusive_predicate });
+  EXPECT_LE(0, actual_count_exclusive);
+  EXPECT_GE(kFalsePositives, actual_count_exclusive);
+
+  // Combine Range predicate with Bloom filter predicate.
+  TestWithRangePredicate(inclusive_predicate_clone1, inclusive_predicate_clone2);
 }
 
 class ParameterizedPredicateTest : public PredicateTest,

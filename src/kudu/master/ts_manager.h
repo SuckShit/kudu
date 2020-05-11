@@ -106,6 +106,9 @@ class TSManager {
   // Get the TS count.
   int GetCount() const;
 
+  // Get the live TS count.
+  int GetLiveCount() const;
+
   // Sets the tserver state for the given tserver, persisting it to disk.
   //
   // If removing a tserver from maintenance mode, this also sets that all
@@ -140,8 +143,6 @@ class TSManager {
   // to recheck any ignored failures.
   void SetAllTServersNeedFullTabletReports();
 
-  FunctionGaugeDetacher metric_detacher_;
-
   // Protects 'servers_by_id_'.
   mutable rw_spinlock lock_;
 
@@ -162,6 +163,10 @@ class TSManager {
   TServerStateMap ts_state_by_uuid_;
 
   LocationCache* location_cache_;
+
+  // NOTE: it's important that this is the first member to be destructed. This
+  // ensures we do not attempt to collect metrics while calling the destructor.
+  FunctionGaugeDetacher metric_detacher_;
 
   DISALLOW_COPY_AND_ASSIGN(TSManager);
 };

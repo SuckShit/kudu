@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -24,25 +25,36 @@
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/tserver/tablet_server.h"
+#include "kudu/tserver/tablet_server_runner.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.pb.h"
+#include "kudu/tserver/tserver_admin.proxy.h"
+#include "kudu/util/init.h"
 #include "kudu/util/status.h"
 
 DEFINE_bool(allow_missing_tserver, false, "If true, performs the action on the "
     "tserver even if it has not been registered with the master and has no "
     "existing tserver state records associated with it.");
+
+DEFINE_bool(error_if_not_fully_quiesced, false, "If true, the command to start "
+    "quiescing will return an error if the tserver is not fully quiesced, i.e. "
+    "there are still tablet leaders or active scanners on it.");
 
 DECLARE_string(columns);
 
@@ -50,6 +62,7 @@ using std::cout;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 
@@ -59,6 +72,11 @@ using master::ListTabletServersRequestPB;
 using master::ListTabletServersResponsePB;
 using master::MasterServiceProxy;
 using master::TServerStateChangePB;
+using rpc::RpcController;
+using tserver::QuiesceTabletServerRequestPB;
+using tserver::QuiesceTabletServerResponsePB;
+using tserver::TabletServer;
+using tserver::TabletServerAdminServiceProxy;
 
 namespace tools {
 namespace {
@@ -75,6 +93,18 @@ const char* const kValueArg = "value";
 Status TServerGetFlags(const RunnerContext& context) {
   const string& address = FindOrDie(context.required_args, kTServerAddressArg);
   return PrintServerFlags(address, tserver::TabletServer::kDefaultPort);
+}
+
+Status TServerRun(const RunnerContext& context) {
+  RETURN_NOT_OK(InitKudu());
+
+  // Enable redaction by default. Unlike most tools, we don't want user data
+  // printed to the console/log to be shown by default.
+  CHECK_NE("", google::SetCommandLineOptionWithMode("redact",
+      "all", google::FlagSettingMode::SET_FLAGS_DEFAULT));
+
+  tserver::SetTabletServerFlagDefaults();
+  return tserver::RunTabletServer();
 }
 
 Status TServerSetFlag(const RunnerContext& context) {
@@ -119,7 +149,7 @@ Status ListTServers(const RunnerContext& context) {
   const auto& servers = resp.servers();
 
   auto hostport_to_string = [](const HostPortPB& hostport) {
-    return strings::Substitute("$0:$1", hostport.host(), hostport.port());
+    return Substitute("$0:$1", hostport.host(), hostport.port());
   };
 
   for (const auto& column : cols) {
@@ -150,7 +180,7 @@ Status ListTServers(const RunnerContext& context) {
       }
     } else if (boost::iequals(column, "heartbeat")) {
       for (const auto& server : servers) {
-        values.emplace_back(strings::Substitute("$0ms", server.millis_since_heartbeat()));
+        values.emplace_back(Substitute("$0ms", server.millis_since_heartbeat()));
       }
     } else if (boost::iequals(column, "location")) {
       for (const auto& server : servers) {
@@ -208,6 +238,67 @@ Status ExitMaintenance(const RunnerContext& context) {
   return TServerSetState(context, TServerStateChangePB::EXIT_MAINTENANCE_MODE);
 }
 
+Status StartQuiescingTServer(const RunnerContext& context) {
+  const auto& address = FindOrDie(context.required_args, kTServerAddressArg);
+  unique_ptr<TabletServerAdminServiceProxy> proxy;
+  RETURN_NOT_OK(BuildProxy(address, tserver::TabletServer::kDefaultPort, &proxy));
+
+  QuiesceTabletServerRequestPB req;
+  req.set_quiesce(true);
+  req.set_return_stats(FLAGS_error_if_not_fully_quiesced);
+  RpcController rpc;
+  QuiesceTabletServerResponsePB resp;
+  RETURN_NOT_OK(proxy->Quiesce(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  if (FLAGS_error_if_not_fully_quiesced &&
+      (resp.num_leaders() != 0 || resp.num_active_scanners() != 0)) {
+    return Status::Incomplete(
+        Substitute("Tablet server not fully quiesced: $0 tablet leaders and $1 active "
+                   "scanners remain", resp.num_leaders(), resp.num_active_scanners()));
+  }
+  return Status::OK();
+}
+
+Status StopQuiescingTServer(const RunnerContext& context) {
+  const auto& address = FindOrDie(context.required_args, kTServerAddressArg);
+  unique_ptr<TabletServerAdminServiceProxy> proxy;
+  RETURN_NOT_OK(BuildProxy(address, tserver::TabletServer::kDefaultPort, &proxy));
+
+  QuiesceTabletServerRequestPB req;
+  req.set_quiesce(false);
+  req.set_return_stats(false);
+  QuiesceTabletServerResponsePB resp;
+  RpcController rpc;
+  RETURN_NOT_OK(proxy->Quiesce(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  return Status::OK();
+}
+
+Status QuiescingStatus(const RunnerContext& context) {
+  const auto& address = FindOrDie(context.required_args, kTServerAddressArg);
+  unique_ptr<TabletServerAdminServiceProxy> proxy;
+  RETURN_NOT_OK(BuildProxy(address, tserver::TabletServer::kDefaultPort, &proxy));
+
+  QuiesceTabletServerRequestPB req;
+  req.set_return_stats(true);
+  QuiesceTabletServerResponsePB resp;
+  RpcController rpc;
+  rpc.RequireServerFeature(tserver::TabletServerFeatures::QUIESCING);
+  RETURN_NOT_OK(proxy->Quiesce(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+  DataTable table({});
+  table.AddColumn("Quiescing", { resp.is_quiescing() ? "true" : "false" });
+  table.AddColumn("Tablet Leaders", { IntToString(resp.num_leaders()) });
+  table.AddColumn("Active Scanners", { IntToString(resp.num_active_scanners()) });
+  return table.PrintTo(cout);
+}
+
 } // anonymous namespace
 
 unique_ptr<Mode> BuildTServerMode() {
@@ -227,6 +318,29 @@ unique_ptr<Mode> BuildTServerMode() {
       .AddOptionalParameter("all_flags")
       .AddOptionalParameter("flags")
       .AddOptionalParameter("flag_tags")
+      .Build();
+
+  unique_ptr<Action> run =
+      ActionBuilder("run", &TServerRun)
+      .ProgramName("kudu-tserver")
+      .Description("Runs a Kudu Tablet Server")
+      .ExtraDescription("Note: The tablet server is started in this process and "
+                        "runs until interrupted.\n\n"
+                        "The most common configuration flags are described below. "
+                        "For all the configuration options pass --helpfull or see "
+                        "https://kudu.apache.org/docs/configuration_reference.html"
+                        "#kudu-tserver_supported")
+      .AddOptionalParameter("tserver_master_addrs")
+      // Even though fs_wal_dir is required, we don't want it to be positional argument.
+      .AddOptionalParameter("fs_wal_dir")
+      .AddOptionalParameter("fs_data_dirs")
+      .AddOptionalParameter("fs_metadata_dir")
+      .AddOptionalParameter("block_cache_capacity_mb")
+      .AddOptionalParameter("memory_limit_hard_bytes")
+      .AddOptionalParameter("log_dir")
+      // Unlike most tools we don't log to stderr by default to match the
+      // kudu-tserver binary as closely as possible.
+      .AddOptionalParameter("logtostderr", string("false"))
       .Build();
 
   unique_ptr<Action> set_flag =
@@ -263,6 +377,33 @@ unique_ptr<Mode> BuildTServerMode() {
       .AddOptionalParameter("timeout_ms")
       .Build();
 
+  unique_ptr<Action> quiescing_status =
+      ActionBuilder("status", &QuiescingStatus)
+      .Description("Output information about the quiescing state of a Tablet "
+                   "Server.")
+      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
+      .Build();
+  unique_ptr<Action> start_quiescing =
+      ActionBuilder("start", &StartQuiescingTServer)
+      .Description("Start quiescing the given Tablet Server. While a Tablet "
+                   "Server is quiescing, Tablet replicas on it will no longer "
+                   "attempt to become leader, and new scan requests will be "
+                   "retried at other servers.")
+      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
+      .AddOptionalParameter("error_if_not_fully_quiesced")
+      .Build();
+  unique_ptr<Action> stop_quiescing =
+      ActionBuilder("stop", &StopQuiescingTServer)
+      .Description("Stop quiescing a Tablet Server.")
+      .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
+      .Build();
+  unique_ptr<Mode> quiesce = ModeBuilder("quiesce")
+      .Description("Operate on the quiescing state of a Kudu Tablet Server.")
+      .AddAction(std::move(quiescing_status))
+      .AddAction(std::move(start_quiescing))
+      .AddAction(std::move(stop_quiescing))
+      .Build();
+
   unique_ptr<Action> enter_maintenance =
       ActionBuilder("enter_maintenance", &EnterMaintenance)
       .Description("Begin maintenance on the Tablet Server. While under "
@@ -291,10 +432,12 @@ unique_ptr<Mode> BuildTServerMode() {
       .Description("Operate on a Kudu Tablet Server")
       .AddAction(std::move(dump_memtrackers))
       .AddAction(std::move(get_flags))
+      .AddAction(std::move(run))
       .AddAction(std::move(set_flag))
       .AddAction(std::move(status))
       .AddAction(std::move(timestamp))
       .AddAction(std::move(list_tservers))
+      .AddMode(std::move(quiesce))
       .AddMode(std::move(state))
       .Build();
 }

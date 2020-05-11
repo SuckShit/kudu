@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <list>
 #include <map>
@@ -36,8 +37,6 @@
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/ref_counted_replicate.h"
-#include "kudu/gutil/callback.h"  // IWYU pragma: keep
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/util/blocking_queue.h"
@@ -54,8 +53,9 @@
 namespace kudu {
 
 class CompressionCodec;
+class FileCache;
 class FsManager;
-class WritableFile;
+class RWFile;
 
 namespace log {
 
@@ -74,6 +74,7 @@ struct LogContext {
   scoped_refptr<MetricEntity> metric_entity;
   std::unique_ptr<LogMetrics> metrics;
   FsManager* fs_manager;
+  FileCache* file_cache;
 
   std::string LogPrefix() const;
 };
@@ -120,12 +121,12 @@ class SegmentAllocator {
   // 'write_size_bytes' is the expected size of the next write; if the active
   // segment would go above the max segment size, a new segment is allocated.
   //
-  // In the event of a roll over, 'closed_segment' contains a new segment reader
-  // for the just-closed segment (if there was one), and 'new_readable_segment'
-  // contains the newly active segment, reopened for reading.
+  // In the event of a roll over, 'finished_segment' contains a new segment
+  // reader for the just-finished segment (if there was one), and
+  // 'new_readable_segment' contains the newly active segment, reopened for reading.
   Status AllocateOrRollOverIfNecessary(
       uint32_t write_size_bytes,
-      scoped_refptr<ReadableLogSegment>* closed_segment,
+      scoped_refptr<ReadableLogSegment>* finished_segment,
       scoped_refptr<ReadableLogSegment>* new_readable_segment);
 
 
@@ -134,9 +135,9 @@ class SegmentAllocator {
 
   // Syncs the current segment and writes out the footer.
   //
-  // If 'closed_segment' is not null, it will contain a new ReadableLogSegment
-  // corresponding to the segment that was just closed.
-  Status CloseCurrentSegment(scoped_refptr<ReadableLogSegment>* closed_segment);
+  // If 'finished_segment' is not null, it will contain a new ReadableLogSegment
+  // corresponding to the segment that was just finished.
+  Status FinishCurrentSegment(scoped_refptr<ReadableLogSegment>* finished_segment);
 
   // Update the footer based on the written 'batch', e.g. to track the
   // last-written OpId.
@@ -165,16 +166,13 @@ class SegmentAllocator {
   // This is not thread-safe. It is up to the caller to ensure this does not
   // interfere with the append thread's attempts to switch log segments.
   //
-  // If there was a previous active segment, 'closed_segment' contains a new
+  // If there was a previous active segment, 'finished_segment' contains a new
   // segment reader built for that segment.
   //
   // 'new_readable_segment' contains the newly active segment, reopened for reading.
   Status AllocateSegmentAndRollOver(
-      scoped_refptr<ReadableLogSegment>* closed_segment,
+      scoped_refptr<ReadableLogSegment>* finished_segment,
       scoped_refptr<ReadableLogSegment>* new_readable_segment);
-
-  // Returns a readable segment pointing at the most recently closed segment.
-  Status GetClosedSegment(scoped_refptr<ReadableLogSegment>* readable_segment);
 
   // Sets the schema and version to be used for the next allocated segment.
   void SetSchemaForNextSegment(Schema schema, uint32_t version);
@@ -200,11 +198,11 @@ class SegmentAllocator {
   // Waits for any on-going allocation to complete and rolls over onto the
   // allocated segment, swapping out the previous active segment if it existed.
   //
-  // If there was a previous active segment, 'closed_segment' contains a new
+  // If there was a previous active segment, 'finished_segment' contains a new
   // segment reader built for that segment.
   //
   // 'new_readable_segment' contains the newly active segment, reopened for reading.
-  Status RollOver(scoped_refptr<ReadableLogSegment>* closed_segment,
+  Status RollOver(scoped_refptr<ReadableLogSegment>* finished_segment,
                   scoped_refptr<ReadableLogSegment>* new_readable_segment);
 
   // Hooks used to inject faults into the allocator.
@@ -212,7 +210,7 @@ class SegmentAllocator {
 
   // Descriptors for the segment file that should be used as the next active
   // segment.
-  std::shared_ptr<WritableFile> next_segment_file_;
+  std::shared_ptr<RWFile> next_segment_file_;
   std::string next_segment_path_;
 
   // Contains state shared by various Log-related classs.
@@ -235,7 +233,7 @@ class SegmentAllocator {
   bool sync_disabled_;
 
   // A footer being prepared for the current segment.
-  // When the segment is closed, it will be written.
+  // When the segment is finished, it will be written.
   LogSegmentFooterPB footer_;
 
   // The currently active segment being written.
@@ -280,7 +278,8 @@ class Log : public RefCountedThreadSafe<Log> {
   // Opens or continues a log and sets 'log' to the newly built Log.
   // After a successful Open() the Log is ready to receive entries.
   static Status Open(LogOptions options,
-                     FsManager *fs_manager,
+                     FsManager* fs_manager,
+                     FileCache* file_cache,
                      const std::string& tablet_id,
                      Schema schema,
                      uint32_t schema_version,
@@ -297,14 +296,13 @@ class Log : public RefCountedThreadSafe<Log> {
   // Append the given set of replicate messages, asynchronously.
   // This requires that the replicates have already been assigned OpIds.
   Status AsyncAppendReplicates(const std::vector<consensus::ReplicateRefPtr>& replicates,
-                               const StatusCallback& callback);
+                               StatusCallback callback);
 
   // Append the given commit message, asynchronously.
   //
   // Returns a bad status if the log is already shut down.
-  Status AsyncAppendCommit(gscoped_ptr<consensus::CommitMsg> commit_msg,
-                           const StatusCallback& callback);
-
+  Status AsyncAppendCommit(std::unique_ptr<consensus::CommitMsg> commit_msg,
+                           StatusCallback callback);
 
   // Blocks the current thread until all the entries in the log queue
   // are flushed and fsynced (if fsync of log entries is enabled).
@@ -443,14 +441,17 @@ class Log : public RefCountedThreadSafe<Log> {
   // Sets that the current active segment is idle.
   void SetActiveSegmentIdle();
 
-  static Status CreateBatchFromPB(LogEntryTypePB type,
-                                  std::unique_ptr<LogEntryBatchPB> entry_batch_pb,
-                                  std::unique_ptr<LogEntryBatch>* entry_batch);
+  // Creates a new LogEntryBatch from 'entry_batch_pb'; all entries must be of
+  // type 'type'.
+  //
+  // After the batch is appended to the log, 'cb' will be invoked with the
+  // result status of the append.
+  static std::unique_ptr<LogEntryBatch> CreateBatchFromPB(
+      LogEntryTypePB type, std::unique_ptr<LogEntryBatchPB> entry_batch_pb,
+      StatusCallback cb);
 
-  // Asynchronously appends 'entry_batch' to the log. Once the append
-  // completes and is synced, 'callback' will be invoked.
-  Status AsyncAppend(std::unique_ptr<LogEntryBatch> entry_batch,
-                     const StatusCallback& callback);
+  // Asynchronously appends 'entry_batch' to the log.
+  Status AsyncAppend(std::unique_ptr<LogEntryBatch> entry_batch);
 
   // Writes serialized contents of 'entry' to the log. This is not thread-safe.
   Status WriteBatch(LogEntryBatch* entry_batch);
@@ -563,23 +564,11 @@ class LogEntryBatch {
 
   LogEntryBatch(LogEntryTypePB type,
                 std::unique_ptr<LogEntryBatchPB> entry_batch_pb,
-                size_t count);
+                size_t count,
+                StatusCallback cb);
 
   // Serializes contents of the entry to an internal buffer.
   void Serialize();
-
-  // Sets the callback that will be invoked after the entry is
-  // appended and synced to disk
-  void set_callback(const StatusCallback& cb) {
-    callback_ = cb;
-  }
-
-  // Returns the callback that will be invoked after the entry is
-  // appended and synced to disk.
-  const StatusCallback& callback() {
-    return callback_;
-  }
-
 
   // Returns a Slice representing the serialized contents of the
   // entry.
@@ -607,6 +596,17 @@ class LogEntryBatch {
     replicates_ = replicates;
   }
 
+  void SetAppendError(const Status& s) {
+    DCHECK(!s.ok());
+    if (append_status_.ok()) {
+      append_status_ = s;
+    }
+  }
+
+  void RunCallback() {
+    callback_(append_status_);
+  }
+
   // The type of entries in this batch.
   const LogEntryTypePB type_;
 
@@ -632,6 +632,9 @@ class LogEntryBatch {
   // Buffer to which 'phys_entries_' are serialized by call to
   // 'Serialize()'
   faststring buffer_;
+
+  // Tracks whether this batch was successfully append to the log.
+  Status append_status_;
 
   DISALLOW_COPY_AND_ASSIGN(LogEntryBatch);
 };

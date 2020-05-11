@@ -40,10 +40,10 @@
 namespace kudu {
 
 class ColumnSchema;
-struct ColumnSchemaDelta;
 class KuduPartialRow;
 class Schema;
 class Slice;
+struct ColumnSchemaDelta;
 
 namespace tools {
 class RemoteKsckCluster;
@@ -60,8 +60,6 @@ class MetaCacheEntry;
 class WriteRpc;
 } // namespace internal
 
-class KuduColumnSchema;
-class KuduColumnSpec;
 class KuduSchema;
 class KuduValue;
 
@@ -119,6 +117,7 @@ class KUDU_EXPORT KuduColumnTypeAttributes {
   KuduColumnTypeAttributes(int8_t precision, int8_t scale, uint16_t length);
 
   class KUDU_NO_EXPORT Data;
+
   // Owned.
   Data* data_;
 };
@@ -225,7 +224,8 @@ class KUDU_EXPORT KuduColumnSchema {
     UNIXTIME_MICROS = 9,
     DECIMAL = 10,
     VARCHAR = 11,
-    TIMESTAMP = UNIXTIME_MICROS //!< deprecated, use UNIXTIME_MICROS
+    TIMESTAMP = UNIXTIME_MICROS, //!< deprecated, use UNIXTIME_MICROS
+    DATE = 12
   };
 
   /// @param [in] type
@@ -509,6 +509,7 @@ class KUDU_EXPORT KuduColumnSpec {
 
  private:
   class KUDU_NO_EXPORT Data;
+
   friend class KuduSchemaBuilder;
   friend class KuduTableAlterer;
 
@@ -584,6 +585,7 @@ class KUDU_EXPORT KuduSchemaBuilder {
 
  private:
   class KUDU_NO_EXPORT Data;
+
   // Owned.
   Data* data_;
 };
@@ -713,6 +715,9 @@ class KUDU_EXPORT KuduSchema {
 
   // For use by KuduSchema::FromSchema.
   explicit KuduSchema(const Schema& schema);
+#if __cplusplus >= 201103
+  explicit KuduSchema(Schema&& schema);
+#endif
 
   // Private since we don't want users to rely on the first N columns
   // being the keys.

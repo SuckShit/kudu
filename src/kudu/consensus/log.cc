@@ -19,6 +19,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <ostream>
@@ -34,20 +35,18 @@
 #include "kudu/consensus/log_util.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/atomicops.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/util/async_util.h"
-#include "kudu/util/compression/compression.pb.h"
 #include "kudu/util/compression/compression_codec.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/fault_injection.h"
+#include "kudu/util/file_cache.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/kernel_stack_watchdog.h"
 #include "kudu/util/logging.h"
@@ -147,6 +146,8 @@ DEFINE_double(log_inject_io_error_on_preallocate_fraction, 0.0,
 TAG_FLAG(log_inject_io_error_on_preallocate_fraction, unsafe);
 TAG_FLAG(log_inject_io_error_on_preallocate_fraction, runtime);
 
+// Other flags.
+// -----------------------------
 DEFINE_int64(fs_wal_dir_reserved_bytes, -1,
              "Number of bytes to reserve on the log directory filesystem for "
              "non-Kudu usage. The default, which is represented by -1, is that "
@@ -156,7 +157,12 @@ DEFINE_int64(fs_wal_dir_reserved_bytes, -1,
              "are not currently supported");
 DEFINE_validator(fs_wal_dir_reserved_bytes, [](const char* /*n*/, int64_t v) { return v >= -1; });
 TAG_FLAG(fs_wal_dir_reserved_bytes, runtime);
-TAG_FLAG(fs_wal_dir_reserved_bytes, evolving);
+
+DEFINE_bool(fs_wal_use_file_cache, true,
+            "Whether to use the server-wide file cache for WAL segments and "
+            "WAL index chunks.");
+TAG_FLAG(fs_wal_use_file_cache, runtime);
+TAG_FLAG(fs_wal_use_file_cache, advanced);
 
 // Validate that log_min_segments_to_retain >= 1
 static bool ValidateLogsToRetain(const char* flagname, int value) {
@@ -167,15 +173,13 @@ static bool ValidateLogsToRetain(const char* flagname, int value) {
                                     flagname, value);
   return false;
 }
-static bool dummy = google::RegisterFlagValidator(
-    &FLAGS_log_min_segments_to_retain, &ValidateLogsToRetain);
+DEFINE_validator(log_min_segments_to_retain, &ValidateLogsToRetain);
 
 namespace kudu {
 namespace log {
 
 using consensus::CommitMsg;
 using consensus::ReplicateRefPtr;
-using env_util::OpenFileForRandom;
 using std::shared_ptr;
 using std::string;
 using std::vector;
@@ -291,7 +295,7 @@ void Log::AppendThread::Wake() {
   auto old_status = base::subtle::NoBarrier_CompareAndSwap(
       &thread_state_, IDLE, ACTIVE);
   if (old_status == IDLE) {
-    CHECK_OK(append_pool_->SubmitClosure(Bind(&Log::AppendThread::ProcessQueue, Unretained(this))));
+    CHECK_OK(append_pool_->Submit([this]() { this->ProcessQueue(); }));
   }
 }
 
@@ -369,7 +373,7 @@ void Log::AppendThread::HandleBatches(vector<LogEntryBatch*> entry_batches) {
   SCOPED_LATENCY_METRIC(log_->ctx_.metrics, group_commit_latency);
 
   bool is_all_commits = true;
-  for (LogEntryBatch* entry_batch : entry_batches) {
+  for (auto* entry_batch : entry_batches) {
     TRACE_EVENT_FLOW_END0("log", "Batch", entry_batch);
     Status s = log_->WriteBatch(entry_batch);
     if (PREDICT_FALSE(!s.ok())) {
@@ -378,10 +382,7 @@ void Log::AppendThread::HandleBatches(vector<LogEntryBatch*> entry_batches) {
       // abort all subsequent transactions in this batch or allow
       // them to be appended? What about transactions in future
       // batches?
-      if (!entry_batch->callback().is_null()) {
-        entry_batch->callback().Run(s);
-        entry_batch->callback_.Reset();
-      }
+      entry_batch->SetAppendError(s);
     }
     if (is_all_commits && entry_batch->type_ != COMMIT) {
       is_all_commits = false;
@@ -394,25 +395,21 @@ void Log::AppendThread::HandleBatches(vector<LogEntryBatch*> entry_batches) {
   }
   if (PREDICT_FALSE(!s.ok())) {
     LOG_WITH_PREFIX(ERROR) << "Error syncing log: " << s.ToString();
-    for (LogEntryBatch* entry_batch : entry_batches) {
-      if (!entry_batch->callback().is_null()) {
-        entry_batch->callback().Run(s);
-      }
-      delete entry_batch;
+    for (auto* entry_batch : entry_batches) {
+      entry_batch->SetAppendError(s);
     }
   } else {
-    TRACE_EVENT0("log", "Callbacks");
     VLOG_WITH_PREFIX(2) << "Synchronized " << entry_batches.size() << " entry batches";
-    SCOPED_WATCH_STACK(100);
-    for (LogEntryBatch* entry_batch : entry_batches) {
-      if (PREDICT_TRUE(!entry_batch->callback().is_null())) {
-        entry_batch->callback().Run(Status::OK());
-      }
-      // It's important to delete each batch as we see it, because
-      // deleting it may free up memory from memory trackers, and the
-      // callback of a later batch may want to use that memory.
-      delete entry_batch;
-    }
+  }
+  TRACE_EVENT0("log", "Callbacks");
+  SCOPED_WATCH_STACK(100);
+  for (auto* entry_batch : entry_batches) {
+    entry_batch->RunCallback();
+
+    // It's important to delete each batch as we see it, because
+    // deleting it may free up memory from memory trackers, and the
+    // callback of a later batch may want to use that memory.
+    delete entry_batch;
   }
 }
 
@@ -449,34 +446,30 @@ Status SegmentAllocator::Init(
     uint64_t sequence_number,
     scoped_refptr<ReadableLogSegment>* new_readable_segment) {
   // Init the compression codec.
-  if (!FLAGS_log_compression_codec.empty()) {
-    auto codec_type = GetCompressionCodecType(FLAGS_log_compression_codec);
-    if (codec_type != NO_COMPRESSION) {
-      RETURN_NOT_OK_PREPEND(GetCompressionCodec(codec_type, &codec_),
-                            "could not instantiate compression codec");
-    }
-  }
+  RETURN_NOT_OK_PREPEND(GetCompressionCodec(
+      GetCompressionCodecType(FLAGS_log_compression_codec), &codec_),
+                        "could not instantiate compression codec");
   active_segment_sequence_number_ = sequence_number;
   RETURN_NOT_OK(ThreadPoolBuilder("log-alloc")
       .set_max_threads(1)
       .Build(&allocation_pool_));
 
-  scoped_refptr<ReadableLogSegment> closed_segment;
-  RETURN_NOT_OK(AllocateSegmentAndRollOver(&closed_segment, new_readable_segment));
-  DCHECK(!closed_segment); // There was no previously active segment.
+  scoped_refptr<ReadableLogSegment> finished_segment;
+  RETURN_NOT_OK(AllocateSegmentAndRollOver(&finished_segment, new_readable_segment));
+  DCHECK(!finished_segment); // There was no previously active segment.
   return Status::OK();
 }
 
 Status SegmentAllocator::AllocateOrRollOverIfNecessary(
     uint32_t write_size_bytes,
-    scoped_refptr<ReadableLogSegment>* closed_segment,
+    scoped_refptr<ReadableLogSegment>* finished_segment,
     scoped_refptr<ReadableLogSegment>* new_readable_segment) {
   bool should_rollover = false;
   // if the size of this entry overflows the current segment, get a new one
   {
     std::lock_guard<RWMutex> l(allocation_lock_);
     if (allocation_state_ == kAllocationNotStarted) {
-      if ((active_segment_->Size() + write_size_bytes + 4) > max_segment_size_) {
+      if ((active_segment_->written_offset() + write_size_bytes + 4) > max_segment_size_) {
         VLOG_WITH_PREFIX(1) << "Max segment size reached. Starting new segment allocation";
         RETURN_NOT_OK(AsyncAllocateSegmentUnlocked());
         if (!opts_->async_preallocate_segments) {
@@ -493,7 +486,7 @@ Status SegmentAllocator::AllocateOrRollOverIfNecessary(
   if (should_rollover) {
     TRACE_COUNTER_SCOPE_LATENCY_US("log_roll");
     LOG_SLOW_EXECUTION(WARNING, 50, Substitute("$0Log roll took a long time", LogPrefix())) {
-      RETURN_NOT_OK(RollOver(closed_segment, new_readable_segment));
+      RETURN_NOT_OK(RollOver(finished_segment, new_readable_segment));
     }
   }
   return Status::OK();
@@ -531,12 +524,11 @@ Status SegmentAllocator::Sync() {
   return Status::OK();
 }
 
-Status SegmentAllocator::CloseCurrentSegment(
-    scoped_refptr<ReadableLogSegment>* closed_segment) {
+Status SegmentAllocator::FinishCurrentSegment(
+    scoped_refptr<ReadableLogSegment>* finished_segment) {
   if (hooks_) {
     RETURN_NOT_OK_PREPEND(hooks_->PreClose(), "PreClose hook failed");
   }
-  RETURN_NOT_OK(Sync());
   if (!footer_.has_min_replicate_index()) {
     VLOG_WITH_PREFIX(1) << "Writing a segment without any REPLICATE message. Segment: "
                         << active_segment_->path();
@@ -545,13 +537,35 @@ Status SegmentAllocator::CloseCurrentSegment(
                       << ": " << pb_util::SecureShortDebugString(footer_);
 
   footer_.set_close_timestamp_micros(GetCurrentTimeMicros());
-  RETURN_NOT_OK(active_segment_->WriteFooterAndClose(footer_));
+  RETURN_NOT_OK(active_segment_->WriteFooter(footer_));
+
+  // max_segment_size_ defines the (soft) limit of a segment. When preallocation
+  // is enabled, max_segment_size also defines the amount of space that is
+  // preallocated at segment creation time.
+  //
+  // We finish a segment when the next write would exceed max_segment_size_, at
+  // which point all of the segment's preallocated space has been consumed. In
+  // some cases (e.g. Log::Close), a segment may be finished prematurely. If we
+  // detect that, let's return any excess preallocated space back to the
+  // filesystem by truncating off the end of the segment.
+  if (opts_->preallocate_segments &&
+      active_segment_->written_offset() < max_segment_size_) {
+    RETURN_NOT_OK(active_segment_->file()->Truncate(
+        active_segment_->written_offset()));
+  }
+  RETURN_NOT_OK(Sync());
+
   if (hooks_) {
     RETURN_NOT_OK_PREPEND(hooks_->PostClose(), "PostClose hook failed");
   }
 
-  if (closed_segment) {
-    RETURN_NOT_OK(GetClosedSegment(closed_segment));
+  if (finished_segment) {
+    scoped_refptr<ReadableLogSegment> segment(
+        new ReadableLogSegment(active_segment_->path(), active_segment_->file()));
+    RETURN_NOT_OK(segment->Init(active_segment_->header(),
+                                active_segment_->footer(),
+                                active_segment_->first_entry_offset()));
+    *finished_segment = std::move(segment);
   }
 
   return Status::OK();
@@ -578,29 +592,13 @@ void SegmentAllocator::StopAllocationThread() {
 }
 
 Status SegmentAllocator::AllocateSegmentAndRollOver(
-    scoped_refptr<ReadableLogSegment>* closed_segment,
+    scoped_refptr<ReadableLogSegment>* finished_segment,
     scoped_refptr<ReadableLogSegment>* new_readable_segment) {
   {
     std::lock_guard<RWMutex> l(allocation_lock_);
     RETURN_NOT_OK(AsyncAllocateSegmentUnlocked());
   }
-  return RollOver(closed_segment, new_readable_segment);
-}
-
-Status SegmentAllocator::GetClosedSegment(scoped_refptr<ReadableLogSegment>* readable_segment) {
-  CHECK(active_segment_->IsClosed());
-  shared_ptr<RandomAccessFile> readable_file;
-  RETURN_NOT_OK(
-      OpenFileForRandom(ctx_->fs_manager->env(), active_segment_->path(), &readable_file));
-  scoped_refptr<ReadableLogSegment> segment(
-      new ReadableLogSegment(active_segment_->path(), readable_file));
-  // Note: segment->header() will only contain an initialized PB if we
-  // wrote the header out.
-  RETURN_NOT_OK(segment->Init(active_segment_->header(),
-                              active_segment_->footer(),
-                              active_segment_->first_entry_offset()));
-  *readable_segment = std::move(segment);
-  return Status::OK();
+  return RollOver(finished_segment, new_readable_segment);
 }
 
 void SegmentAllocator::SetSchemaForNextSegment(Schema schema,
@@ -617,8 +615,7 @@ Status SegmentAllocator::AsyncAllocateSegmentUnlocked() {
   DCHECK_EQ(kAllocationNotStarted, allocation_state_);
   allocation_status_.Reset();
   allocation_state_ = kAllocationInProgress;
-  return allocation_pool_->SubmitClosure(
-      Bind(&SegmentAllocator::AllocationTask, Unretained(this)));
+  return allocation_pool_->Submit([this]() { this->AllocationTask(); });
 }
 
 void SegmentAllocator::AllocationTask() {
@@ -635,15 +632,16 @@ Status SegmentAllocator::AllocateNewSegment() {
     allocation_state_ = kAllocationFinished;
   });
 
-  WritableFileOptions opts;
-  opts.sync_on_close = opts_->force_fsync_all;
+  // We could create the new segment file through the cache, but that's tricky
+  // because of the file rename that'll happen later. So instead, we'll create
+  // it outside the cache now, then reopen via the cache when we switch to it.
   string tmp_suffix = Substitute("$0$1", kTmpInfix, ".newsegmentXXXXXX");
   string path_tmpl = JoinPathSegments(ctx_->log_dir, tmp_suffix);
   VLOG_WITH_PREFIX(2) << "Creating temp. file for place holder segment, template: " << path_tmpl;
-  unique_ptr<WritableFile> segment_file;
+  unique_ptr<RWFile> segment_file;
   Env* env = ctx_->fs_manager->env();
-  RETURN_NOT_OK_PREPEND(env->NewTempWritableFile(
-      opts, path_tmpl, &next_segment_path_, &segment_file),
+  RETURN_NOT_OK_PREPEND(env->NewTempRWFile(
+      RWFileOptions(), path_tmpl, &next_segment_path_, &segment_file),
                         "could not create next WAL segment");
   next_segment_file_.reset(segment_file.release());
   VLOG_WITH_PREFIX(1) << "Created next WAL segment, placeholder path: " << next_segment_path_;
@@ -658,7 +656,8 @@ Status SegmentAllocator::AllocateNewSegment() {
                                                       FLAGS_fs_wal_dir_reserved_bytes));
     // TODO (perf) zero the new segments -- this could result in
     // additional performance improvements.
-    RETURN_NOT_OK_PREPEND(next_segment_file_->PreAllocate(max_segment_size_),
+    RETURN_NOT_OK_PREPEND(next_segment_file_->PreAllocate(
+        0, max_segment_size_, RWFile::CHANGE_FILE_SIZE),
                           "could not preallocate next WAL segment");
   }
   return Status::OK();
@@ -678,9 +677,15 @@ Status SegmentAllocator::SwitchToAllocatedSegment(
     RETURN_NOT_OK(env->SyncDir(ctx_->log_dir));
   }
 
+  // Reopen the allocated segment file thru the file cache.
+  if (PREDICT_TRUE(ctx_->file_cache && FLAGS_fs_wal_use_file_cache)) {
+    RETURN_NOT_OK(ctx_->file_cache->OpenFile<Env::MUST_EXIST>(
+        new_segment_path, &next_segment_file_));
+  }
+
   // Create a new segment in memory.
   unique_ptr<WritableLogSegment> new_segment(
-      new WritableLogSegment(new_segment_path, std::move(next_segment_file_)));
+      new WritableLogSegment(new_segment_path, next_segment_file_));
 
   // Set up the new header and footer.
   LogSegmentHeaderPB header;
@@ -700,21 +705,13 @@ Status SegmentAllocator::SwitchToAllocatedSegment(
     RETURN_NOT_OK(SchemaToPB(schema_, header.mutable_schema()));
     header.set_schema_version(schema_version_);
   }
-  RETURN_NOT_OK_PREPEND(new_segment->WriteHeaderAndOpen(header), "Failed to write header");
+  RETURN_NOT_OK_PREPEND(new_segment->WriteHeader(header), "Failed to write header");
 
   // Open the segment we just created in readable form; it is the caller's
   // responsibility to add it to the reader.
-  //
-  // TODO(todd): consider using a global FileCache here? With short log segments and
-  // lots of tablets, this file descriptor usage may add up.
   {
-    unique_ptr<RandomAccessFile> readable_file;
-
-    RandomAccessFileOptions opts;
-    RETURN_NOT_OK(env->NewRandomAccessFile(opts, new_segment_path, &readable_file));
     scoped_refptr<ReadableLogSegment> readable_segment(
-        new ReadableLogSegment(new_segment_path,
-                               shared_ptr<RandomAccessFile>(readable_file.release())));
+        new ReadableLogSegment(new_segment_path, std::move(next_segment_file_)));
     RETURN_NOT_OK(readable_segment->Init(header, new_segment->first_entry_offset()));
     *new_readable_segment = std::move(readable_segment);
   }
@@ -728,7 +725,7 @@ Status SegmentAllocator::SwitchToAllocatedSegment(
 }
 
 Status SegmentAllocator::RollOver(
-    scoped_refptr<ReadableLogSegment>* closed_segment,
+    scoped_refptr<ReadableLogSegment>* finished_segment,
     scoped_refptr<ReadableLogSegment>* new_readable_segment) {
   SCOPED_LATENCY_METRIC(ctx_->metrics, roll_latency);
 
@@ -739,7 +736,7 @@ Status SegmentAllocator::RollOver(
   // If this isn't the first active segment, close it and return a reopened
   // segment reader so that the caller can update its log reader.
   if (active_segment_) {
-    RETURN_NOT_OK(CloseCurrentSegment(closed_segment));
+    RETURN_NOT_OK(FinishCurrentSegment(finished_segment));
   }
   RETURN_NOT_OK(SwitchToAllocatedSegment(new_readable_segment));
 
@@ -755,6 +752,7 @@ const uint64_t Log::kInitialLogSegmentSequenceNumber = 0L;
 
 Status Log::Open(LogOptions options,
                  FsManager* fs_manager,
+                 FileCache* file_cache,
                  const string& tablet_id,
                  Schema schema,
                  uint32_t schema_version,
@@ -768,6 +766,7 @@ Status Log::Open(LogOptions options,
   ctx.metric_entity = metric_entity;
   ctx.metrics.reset(metric_entity ? new LogMetrics(metric_entity) : nullptr);
   ctx.fs_manager = fs_manager;
+  ctx.file_cache = file_cache;
   scoped_refptr<Log> new_log(new Log(std::move(options), std::move(ctx), std::move(schema),
                                      schema_version));
   RETURN_NOT_OK(new_log->Init());
@@ -788,14 +787,17 @@ Log::Log(LogOptions options, LogContext ctx, Schema schema, uint32_t schema_vers
 Status Log::Init() {
   CHECK_EQ(kLogInitialized, log_state_);
 
-  // Init the index
-  log_index_.reset(new LogIndex(ctx_.fs_manager->env(), ctx_.log_dir));
+  // Init the index.
+  log_index_.reset(new LogIndex(ctx_.fs_manager->env(),
+                                ctx_.file_cache,
+                                ctx_.log_dir));
 
   // Reader for previous segments.
   RETURN_NOT_OK(LogReader::Open(ctx_.fs_manager,
                                 log_index_,
                                 ctx_.tablet_id,
                                 ctx_.metric_entity.get(),
+                                ctx_.file_cache,
                                 &reader_));
 
   // The case where we are continuing an existing log.
@@ -827,25 +829,22 @@ Status Log::Init() {
   return Status::OK();
 }
 
-Status Log::CreateBatchFromPB(LogEntryTypePB type,
-                              unique_ptr<LogEntryBatchPB> entry_batch_pb,
-                              unique_ptr<LogEntryBatch>* entry_batch) {
+unique_ptr<LogEntryBatch> Log::CreateBatchFromPB(
+    LogEntryTypePB type,
+    unique_ptr<LogEntryBatchPB> entry_batch_pb,
+    StatusCallback cb) {
   int num_ops = entry_batch_pb->entry_size();
   unique_ptr<LogEntryBatch> new_entry_batch(new LogEntryBatch(
-      type, std::move(entry_batch_pb), num_ops));
+      type, std::move(entry_batch_pb), num_ops, std::move(cb)));
   new_entry_batch->Serialize();
   TRACE("Serialized $0 byte log entry", new_entry_batch->total_size_bytes());
-
-  *entry_batch = std::move(new_entry_batch);
-  return Status::OK();
+  return new_entry_batch;
 }
 
-Status Log::AsyncAppend(unique_ptr<LogEntryBatch> entry_batch, const StatusCallback& callback) {
+Status Log::AsyncAppend(unique_ptr<LogEntryBatch> entry_batch) {
   TRACE_EVENT0("log", "Log::AsyncAppend");
-
-  entry_batch->set_callback(callback);
   TRACE_EVENT_FLOW_BEGIN0("log", "Batch", entry_batch.get());
-  if (PREDICT_FALSE(!entry_batch_queue_.BlockingPut(entry_batch.get()))) {
+  if (PREDICT_FALSE(!entry_batch_queue_.BlockingPut(entry_batch.get()).ok())) {
     TRACE_EVENT_FLOW_END0("log", "Batch", entry_batch.get());
     return kLogShutdownStatus;
   }
@@ -855,17 +854,22 @@ Status Log::AsyncAppend(unique_ptr<LogEntryBatch> entry_batch, const StatusCallb
 }
 
 Status Log::AsyncAppendReplicates(const vector<ReplicateRefPtr>& replicates,
-                                  const StatusCallback& callback) {
-  unique_ptr<LogEntryBatchPB> batch_pb = CreateBatchFromAllocatedOperations(replicates);
-
-  unique_ptr<LogEntryBatch> batch;
-  RETURN_NOT_OK(CreateBatchFromPB(REPLICATE, std::move(batch_pb), &batch));
+                                  StatusCallback callback) {
+  unique_ptr<LogEntryBatchPB> batch_pb(new LogEntryBatchPB);
+  batch_pb->mutable_entry()->Reserve(replicates.size());
+  for (const auto& r : replicates) {
+    LogEntryPB* entry_pb = batch_pb->add_entry();
+    entry_pb->set_type(REPLICATE);
+    entry_pb->set_allocated_replicate(r->get());
+  }
+  unique_ptr<LogEntryBatch> batch = CreateBatchFromPB(
+      REPLICATE, std::move(batch_pb), std::move(callback));
   batch->SetReplicates(replicates);
-  return AsyncAppend(std::move(batch), callback);
+  return AsyncAppend(std::move(batch));
 }
 
-Status Log::AsyncAppendCommit(gscoped_ptr<consensus::CommitMsg> commit_msg,
-                              const StatusCallback& callback) {
+Status Log::AsyncAppendCommit(unique_ptr<consensus::CommitMsg> commit_msg,
+                              StatusCallback callback) {
   MAYBE_FAULT(FLAGS_fault_crash_before_append_commit);
 
   unique_ptr<LogEntryBatchPB> batch_pb(new LogEntryBatchPB);
@@ -873,9 +877,9 @@ Status Log::AsyncAppendCommit(gscoped_ptr<consensus::CommitMsg> commit_msg,
   entry->set_type(COMMIT);
   entry->set_allocated_commit(commit_msg.release());
 
-  unique_ptr<LogEntryBatch> entry_batch;
-  RETURN_NOT_OK(CreateBatchFromPB(COMMIT, std::move(batch_pb), &entry_batch));
-  AsyncAppend(std::move(entry_batch), callback);
+  unique_ptr<LogEntryBatch> entry_batch = CreateBatchFromPB(
+      COMMIT, std::move(batch_pb), std::move(callback));
+  AsyncAppend(std::move(entry_batch));
   return Status::OK();
 }
 
@@ -893,13 +897,13 @@ Status Log::WriteBatch(LogEntryBatch* entry_batch) {
     return Status::OK();
   }
 
-  scoped_refptr<ReadableLogSegment> closed_segment;
+  scoped_refptr<ReadableLogSegment> finished_segment;
   scoped_refptr<ReadableLogSegment> new_readable_segment;
   RETURN_NOT_OK(segment_allocator_.AllocateOrRollOverIfNecessary(
-      entry_batch_bytes, &closed_segment, &new_readable_segment));
-  if (closed_segment) {
+      entry_batch_bytes, &finished_segment, &new_readable_segment));
+  if (finished_segment) {
     // Must be done before a new segment is appended.
-    reader_->ReplaceLastSegment(std::move(closed_segment));
+    reader_->ReplaceLastSegment(std::move(finished_segment));
   }
   if (new_readable_segment) {
     reader_->AppendEmptySegment(std::move(new_readable_segment));
@@ -950,12 +954,12 @@ Status Log::UpdateIndexForBatch(const LogEntryBatch& batch,
 
 Status Log::AllocateSegmentAndRollOverForTests() {
   std::lock_guard<rw_spinlock> l(segment_idle_lock_);
-  scoped_refptr<ReadableLogSegment> closed_segment;
+  scoped_refptr<ReadableLogSegment> finished_segment;
   scoped_refptr<ReadableLogSegment> new_readable_segment;
   RETURN_NOT_OK(segment_allocator_.AllocateSegmentAndRollOver(
-      &closed_segment, &new_readable_segment));
-  if (closed_segment) {
-    reader_->ReplaceLastSegment(std::move(closed_segment));
+      &finished_segment, &new_readable_segment));
+  if (finished_segment) {
+    reader_->ReplaceLastSegment(std::move(finished_segment));
   }
   reader_->AppendEmptySegment(std::move(new_readable_segment));
   return Status::OK();
@@ -995,7 +999,7 @@ int GetPrefixSizeToGC(RetentionIndexes retention_indexes, const SegmentSequence&
 }
 
 void Log::GetSegmentsToGCUnlocked(RetentionIndexes retention_indexes,
-                                    SegmentSequence* segments_to_gc) const {
+                                  SegmentSequence* segments_to_gc) const {
   reader_->GetSegmentsSnapshot(segments_to_gc);
   segments_to_gc->resize(GetPrefixSizeToGC(retention_indexes, *segments_to_gc));
 }
@@ -1003,7 +1007,8 @@ void Log::GetSegmentsToGCUnlocked(RetentionIndexes retention_indexes,
 Status Log::Append(LogEntryPB* entry) {
   unique_ptr<LogEntryBatchPB> entry_batch_pb(new LogEntryBatchPB);
   entry_batch_pb->mutable_entry()->AddAllocated(entry);
-  LogEntryBatch entry_batch(entry->type(), std::move(entry_batch_pb), 1);
+  LogEntryBatch entry_batch(entry->type(), std::move(entry_batch_pb), 1,
+                            &DoNothingStatusCB);
   entry_batch.Serialize();
   Status s = WriteBatch(&entry_batch);
   if (s.ok()) {
@@ -1018,10 +1023,10 @@ Status Log::WaitUntilAllFlushed() {
   // the async api.
   unique_ptr<LogEntryBatchPB> entry_batch(new LogEntryBatchPB);
   entry_batch->add_entry()->set_type(log::FLUSH_MARKER);
-  unique_ptr<LogEntryBatch> reserved_entry_batch;
-  RETURN_NOT_OK(CreateBatchFromPB(FLUSH_MARKER, std::move(entry_batch), &reserved_entry_batch));
   Synchronizer s;
-  AsyncAppend(std::move(reserved_entry_batch), s.AsStatusCallback());
+  unique_ptr<LogEntryBatch> reserved_entry_batch = CreateBatchFromPB(
+      FLUSH_MARKER, std::move(entry_batch), s.AsStatusCallback());
+  AsyncAppend(std::move(reserved_entry_batch));
   return s.Wait();
 }
 
@@ -1053,7 +1058,7 @@ Status Log::GC(RetentionIndexes retention_indexes, int32_t* num_gced) {
 
     // Now that they are no longer referenced by the Log, delete the files.
     *num_gced = 0;
-    for (const scoped_refptr<ReadableLogSegment>& segment : segments_to_delete) {
+    for (const auto& segment : segments_to_delete) {
       string ops_str;
       if (segment->HasFooter() && segment->footer().has_min_replicate_index()) {
         DCHECK(segment->footer().has_max_replicate_index());
@@ -1062,7 +1067,13 @@ Status Log::GC(RetentionIndexes retention_indexes, int32_t* num_gced) {
                              segment->footer().max_replicate_index());
       }
       LOG_WITH_PREFIX(INFO) << "Deleting log segment in path: " << segment->path() << ops_str;
-      RETURN_NOT_OK(ctx_.fs_manager->env()->DeleteFile(segment->path()));
+      if (PREDICT_TRUE(ctx_.file_cache)) {
+        // Note: the segment files will only be deleted from disk when
+        // segments_to_delete goes out of scope.
+        RETURN_NOT_OK(ctx_.file_cache->DeleteFile(segment->path()));
+      } else {
+        RETURN_NOT_OK(ctx_.fs_manager->env()->DeleteFile(segment->path()));
+      }
       (*num_gced)++;
     }
 
@@ -1153,10 +1164,12 @@ Status Log::Close() {
     }
   }
 
-  RETURN_NOT_OK(segment_allocator_.CloseCurrentSegment(/*closed_segment=*/ nullptr));
+  RETURN_NOT_OK(segment_allocator_.FinishCurrentSegment(
+      /*finished_segment=*/ nullptr));
   VLOG_WITH_PREFIX(1) << "Log closed";
 
   // Release FDs held by these objects.
+  segment_allocator_.active_segment_.reset();
   log_index_.reset();
   reader_.reset();
   return Status::OK();
@@ -1175,6 +1188,9 @@ Status Log::DeleteOnDiskData(FsManager* fs_manager, const string& tablet_id) {
   }
   LOG(INFO) << Substitute("T $0 P $1: Deleting WAL directory at $2",
                           tablet_id, fs_manager->uuid(), wal_dir);
+  // We don't need to delete through the file cache; we're guaranteed that
+  // the log has been closed (though this invariant isn't verifiable here
+  // without additional plumbing).
   RETURN_NOT_OK_PREPEND(env->DeleteRecursively(wal_dir),
                         "Unable to recursively delete WAL dir for tablet " + tablet_id);
   return Status::OK();
@@ -1203,6 +1219,9 @@ Status Log::RemoveRecoveryDirIfExists(FsManager* fs_manager, const string& table
     return Status::OK();
   }
   VLOG(1) << kLogPrefix << "Deleting all files from renamed log recovery directory " << tmp_path;
+  // We don't need to delete through the file cache; we're guaranteed that
+  // the log has been closed (though this invariant isn't verifiable here
+  // without additional plumbing).
   RETURN_NOT_OK_PREPEND(fs_manager->env()->DeleteRecursively(tmp_path),
                         "Could not remove renamed recovery dir " + tmp_path);
   VLOG(1) << kLogPrefix << "Completed deletion of old log recovery files and directory "
@@ -1218,13 +1237,15 @@ Log::~Log() {
 
 LogEntryBatch::LogEntryBatch(LogEntryTypePB type,
                              unique_ptr<LogEntryBatchPB> entry_batch_pb,
-                             size_t count)
+                             size_t count,
+                             StatusCallback cb)
     : type_(type),
       entry_batch_pb_(std::move(entry_batch_pb)),
       total_size_bytes_(
           PREDICT_FALSE(count == 1 && entry_batch_pb_->entry(0).type() == FLUSH_MARKER) ?
           0 : entry_batch_pb_->ByteSize()),
-      count_(count) {
+      count_(count),
+      callback_(std::move(cb)) {
 }
 
 LogEntryBatch::~LogEntryBatch() {

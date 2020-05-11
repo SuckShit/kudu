@@ -29,6 +29,9 @@
 
 #include <cstddef>
 #include <map>
+// Not safe to include <memory>; this header must remain compatible with C++98.
+//
+// IWYU pragma: no_include <memory>
 #include <string>
 #include <vector>
 
@@ -70,8 +73,10 @@ class RemoteKsckCluster;
 
 namespace client {
 
+class KuduColumnarScanBatch;
 class KuduDelete;
 class KuduInsert;
+class KuduInsertIgnore;
 class KuduLoggingCallback;
 class KuduPartitioner;
 class KuduScanBatch;
@@ -89,8 +94,6 @@ class KuduWriteOperation;
 class ResourceMetrics;
 
 namespace internal {
-template <class ReqClass, class RespClass>
-class AsyncLeaderMasterRpc; // IWYU pragma: keep
 class Batcher;
 class ErrorCollector;
 class GetTableSchemaRpc;
@@ -100,7 +103,10 @@ class RemoteTablet;
 class RemoteTabletServer;
 class ReplicaController;
 class RetrieveAuthzTokenRpc;
+class ScanBatchDataInterface;
 class WriteRpc;
+template <class ReqClass, class RespClass>
+class AsyncLeaderMasterRpc; // IWYU pragma: keep
 } // namespace internal
 
 /// Install a callback for internal client logging.
@@ -964,6 +970,7 @@ class KUDU_EXPORT KuduTableStatistics {
   ~KuduTableStatistics();
 
   /// @return The table's on disk size.
+  ///  -1 is returned if the table doesn't support on_disk_size.
   ///
   /// @note This statistic is pre-replication.
   int64_t on_disk_size() const;
@@ -1037,6 +1044,11 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   ///   KuduSession::Apply().
   KuduInsert* NewInsert();
 
+  /// @return New @c INSERT_IGNORE operation for this table. It is the
+  ///   caller's responsibility to free the result, unless it is passed to
+  ///   KuduSession::Apply().
+  KuduInsertIgnore* NewInsertIgnore();
+
   /// @return New @c UPSERT operation for this table. It is the caller's
   ///   responsibility to free the result, unless it is passed to
   ///   KuduSession::Apply().
@@ -1078,6 +1090,74 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   KuduPredicate* NewComparisonPredicate(const Slice& col_name,
                                         KuduPredicate::ComparisonOp op,
                                         KuduValue* value);
+
+  /// Create a new IN Bloom filter predicate which can be used for scanners on
+  /// this table.
+  ///
+  /// @note This method is experimental and may change or disappear in future.
+  ///
+  /// A Bloom filter is a space-efficient probabilistic data structure used to
+  /// test set membership with a possibility of false positive matches.
+  /// See @c KuduBloomFilter for creating Bloom filters.
+  ///
+  /// IN list predicate can be used with small number of values; on the other
+  /// hand with IN Bloom filter predicate large number of values can be tested
+  /// for membership in a space-efficient manner.
+  ///
+  /// @param [in] col_name
+  ///   Name of the column to which the predicate applies.
+  /// @param [in] bloom_filters
+  ///   Vector of Bloom filters that contain the values inserted to match
+  ///   against the column. The column value must match against all the
+  ///   supplied Bloom filters to be returned by the scanner. On return,
+  ///   regardless of success or error, the returned predicate will take
+  ///   ownership of the pointers contained in @c bloom_filters.
+  /// @return Raw pointer to an IN Bloom filter predicate. The caller owns the
+  ///   predicate until it is passed into KuduScanner::AddConjunctPredicate().
+  ///   In the case of an error (e.g. an invalid column name),
+  ///   a non-NULL value is still returned. The error will be returned when
+  ///   attempting to add this predicate to a KuduScanner.
+  KuduPredicate* NewInBloomFilterPredicate(const Slice& col_name,
+                                           std::vector<KuduBloomFilter*>* bloom_filters);
+
+  /// @name Advanced/Unstable API
+  ///
+  /// There are no guarantees on the stability of this client API.
+  ///
+  ///@{
+  /// Create a new IN Bloom filter predicate using direct BlockBloomFilter
+  /// pointers which can be used for scanners on this table.
+  ///
+  /// A Bloom filter is a space-efficient probabilistic data structure used to
+  /// test set membership with a possibility of false positive matches.
+  ///
+  /// IN list predicate can be used with small number of values; on the other
+  /// hand with IN Bloom filter predicate large number of values can be tested
+  /// for membership in a space-efficient manner.
+  ///
+  /// @param [in] col_name
+  ///   Name of the column to which the predicate applies.
+  /// @param [in] allocator
+  ///   Pointer to the BlockBloomFilterBufferAllocatorIf allocator used with
+  ///   Bloom filters.
+  /// @param bloom_filters
+  ///   Vector of BlockBloomFilter pointers that contain the values inserted to
+  ///   match against the column. The column value must match against all the
+  ///   supplied Bloom filters to be returned by the scanner. On return,
+  ///   regardless of success or error, the returned predicate will NOT take
+  ///   ownership of the pointers contained in @c bloom_filters and caller is
+  ///   responsible for the lifecycle management of the Bloom filters.
+  ///   The supplied Bloom filters are expected to remain valid for the
+  ///   lifetime of the KuduScanner.
+  /// @return Raw pointer to an IN Bloom filter predicate. The caller owns the
+  ///   predicate until it is passed into KuduScanner::AddConjunctPredicate().
+  ///   In the case of an error (e.g. an invalid column name),
+  ///   a non-NULL value is still returned. The error will be returned when
+  ///   attempting to add this predicate to a KuduScanner.
+  KuduPredicate* NewInBloomFilterPredicate(const Slice& col_name,
+                                           const Slice& allocator,
+                                           const std::vector<Slice>& bloom_filters);
+  ///@}
 
   /// Create a new IN list predicate which can be used for scanners on this
   /// table.
@@ -2177,6 +2257,9 @@ class KUDU_EXPORT KuduScanner {
 
   /// Fetch the next batch of results for this scanner.
   ///
+  /// This variant may not be used when the scan is configured with the
+  /// COLUMNAR_LAYOUT RowFormatFlag.
+  ///
   /// A single KuduScanBatch object may be reused. Each subsequent call
   /// replaces the data from the previous call, and invalidates any
   /// KuduScanBatch::RowPtr objects previously obtained from the batch.
@@ -2184,6 +2267,19 @@ class KUDU_EXPORT KuduScanner {
   ///   Placeholder for the result.
   /// @return Operation result status.
   Status NextBatch(KuduScanBatch* batch);
+
+  /// Fetch the next batch of columnar results for this scanner.
+  ///
+  /// This variant may only be used when the scan is configured with the
+  /// COLUMNAR_LAYOUT RowFormatFlag.
+  ///
+  /// A single KuduColumnarScanBatch object may be reused. Each subsequent call
+  /// replaces the data from the previous call, and invalidates any
+  /// Slice objects previously obtained from the batch.
+  /// @param [out] batch
+  ///   Placeholder for the result.
+  /// @return Operation result status.
+  Status NextBatch(KuduColumnarScanBatch* batch);
 
   /// Get the KuduTabletServer that is currently handling the scan.
   ///
@@ -2311,6 +2407,15 @@ class KUDU_EXPORT KuduScanner {
   ///   results and might even cause the client to crash.
   static const uint64_t PAD_UNIXTIME_MICROS_TO_16_BYTES = 1 << 0;
 
+  /// Enable column-oriented data transfer. The server will transfer data to the client
+  /// in a columnar format rather than a row-wise format. The KuduColumnarScanBatch API
+  /// must be used to fetch results from this scan.
+  ///
+  /// NOTE: older versions of the Kudu server do not support this feature. Clients
+  /// aiming to support compatibility with previous versions should have a fallback
+  /// code path.
+  static const uint64_t COLUMNAR_LAYOUT = 1 << 1;
+
   /// Optionally set row format modifier flags.
   ///
   /// If flags is RowFormatFlags::NO_FLAGS, then no modifications will be made to the row
@@ -2357,6 +2462,8 @@ class KUDU_EXPORT KuduScanner {
 
  private:
   class KUDU_NO_EXPORT Data;
+
+  Status NextBatch(internal::ScanBatchDataInterface* batch);
 
   friend class KuduScanToken;
   FRIEND_TEST(ClientTest, TestBlockScannerHijackingAttempts);

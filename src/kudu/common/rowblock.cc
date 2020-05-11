@@ -16,12 +16,14 @@
 // under the License.
 #include "kudu/common/rowblock.h"
 
+#include <limits>
 #include <numeric>
 #include <vector>
 
 #include <glog/logging.h>
 
 #include "kudu/gutil/bits.h"
+#include "kudu/gutil/cpu.h"
 #include "kudu/gutil/port.h"
 #include "kudu/util/bitmap.h"
 
@@ -74,29 +76,46 @@ void SelectionVector::ClearToSelectAtMost(size_t max_rows) {
   }
 }
 
-void SelectionVector::GetSelectedRows(vector<int>* selected) const {
+
+template<bool BMI>
+static void GetSelectedRowsInternal(const uint8_t* __restrict__ bitmap,
+                                    int n_bytes,
+                                    uint16_t* __restrict__ dst) {
+  ForEachSetBit(bitmap, n_bytes * 8,
+                [&](int bit) {
+                  *dst++ = bit;
+                });
+}
+
+static const bool kHasBmi = base::CPU().has_bmi();
+
+#ifdef __x86_64__
+// Explicit instantiation with the BMI instruction set enabled, which
+// makes this slightly faster.
+template
+__attribute__((target("bmi")))
+void GetSelectedRowsInternal<true>(const uint8_t* __restrict__ bitmap,
+                                   int n_bytes,
+                                   uint16_t* __restrict__ dst);
+#endif
+
+SelectedRows SelectionVector::GetSelectedRows() const {
+  CHECK_LE(n_rows_, std::numeric_limits<uint16_t>::max());
   int n_selected = CountSelected();
-  selected->resize(n_selected);
-  if (n_selected == 0) {
-    return;
-  }
   if (n_selected == n_rows_) {
-    std::iota(selected->begin(), selected->end(), 0);
-    return;
+    return SelectedRows(this);
   }
 
-  const uint8_t* bitmap = &bitmap_[0];
-  int* dst = selected->data();
-  // Within each byte, keep flipping the least significant non-zero bit and adding
-  // the bit index to the output until none are set.
-  for (int i = 0; i < n_bytes_; i++) {
-    uint8_t bm = *bitmap++;
-    while (bm != 0) {
-      int bit = Bits::FindLSBSetNonZero(bm);
-      *dst++ = (i * 8) + bit;
-      bm ^= (1 << bit);
+  vector<uint16_t> selected;
+  if (n_selected > 0) {
+    selected.resize(n_selected);
+    if (kHasBmi) {
+      GetSelectedRowsInternal<true>(&bitmap_[0], n_bytes_, selected.data());
+    } else {
+      GetSelectedRowsInternal<false>(&bitmap_[0], n_bytes_, selected.data());
     }
   }
+  return SelectedRows(this, std::move(selected));
 }
 
 size_t SelectionVector::CountSelected() const {
@@ -138,6 +157,12 @@ bool operator!=(const SelectionVector& a, const SelectionVector& b) {
   return !(a == b);
 }
 
+std::vector<uint16_t> SelectedRows::CreateRowIndexes() {
+  std::vector<uint16_t> ret(num_selected());
+  std::iota(ret.begin(), ret.end(), 0);
+  return ret;
+}
+
 //////////////////////////////
 // RowBlock
 //////////////////////////////
@@ -146,7 +171,7 @@ RowBlock::RowBlock(const Schema* schema,
                    Arena *arena)
   : schema_(schema),
     columns_data_(schema->num_columns()),
-    column_null_bitmaps_(schema->num_columns()),
+    column_non_null_bitmaps_(schema->num_columns()),
     row_capacity_(nrows),
     nrows_(nrows),
     arena_(arena),
@@ -160,7 +185,7 @@ RowBlock::RowBlock(const Schema* schema,
     columns_data_[i] = new uint8_t[col_size];
 
     if (col_schema.is_nullable()) {
-      column_null_bitmaps_[i] = new uint8_t[bitmap_size];
+      column_non_null_bitmaps_[i] = new uint8_t[bitmap_size];
     }
   }
 }
@@ -169,7 +194,7 @@ RowBlock::~RowBlock() {
   for (uint8_t* column_data : columns_data_) {
     delete[] column_data;
   }
-  for (uint8_t* bitmap_data : column_null_bitmaps_) {
+  for (uint8_t* bitmap_data : column_non_null_bitmaps_) {
     delete[] bitmap_data;
   }
 }

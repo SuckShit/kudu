@@ -52,7 +52,9 @@ KEY_PATH = 'path'
 PAT_SASL_LIBPLAIN = re.compile(r'libplain')
 
 # Exclude libraries that are (L)GPL-licensed and libraries that are not
-# portable across Linux kernel versions.
+# portable across Linux kernel versions. One exception is 'libpcre', which
+# is BSD-licensed. It is excluded because it is a transitive dependency
+# introduced by 'libselinux'.
 PAT_LINUX_LIB_EXCLUDE = re.compile(r"""(libpthread|
                                         libc|
                                         libstdc\+\+|
@@ -66,6 +68,7 @@ PAT_LINUX_LIB_EXCLUDE = re.compile(r"""(libpthread|
                                         libcom_err|
                                         libdb-[\d.]+|
                                         libselinux|
+                                        libpcre|
                                         libtinfo
                                        )\.so""", re.VERBOSE)
 
@@ -88,7 +91,7 @@ PAT_MACOS_LIB_EXCLUDE = re.compile(r"""(AppleFSCompression$|
                                         libSystem|
                                         libapple_nghttp2|
                                         libarchive|
-                                        libc\+\+|
+                                        libc\+\+\.|
                                         libenergytrace|
                                         libicucore|
                                         libncurses|
@@ -158,10 +161,15 @@ def parse_load_commands_macos(cmd_type, dump):
   state = PARSING_NONE
   values = []
   for line in dump:
+    # Ensure the line is a string-like object.
+    try:
+      line = line.decode('utf-8')
+    except (UnicodeDecodeError, AttributeError):
+      pass
     if re.match('^Load command', line):
       state = PARSING_NEW_RECORD
       continue
-    splits = re.split('\s+', line.strip().decode("utf-8"), maxsplit=2)
+    splits = re.split('\s+', line.strip(), maxsplit=2)
     key = splits[0]
     val = splits[1] if len(splits) > 1 else None
     if state == PARSING_NEW_RECORD:
@@ -236,7 +244,13 @@ def get_artifact_name():
     raise NotImplementedError("Unsupported platform")
   arch = os.uname()[4]
   with open(os.path.join(SOURCE_ROOT, "version.txt"), 'r') as version:
-    version = version.readline().strip().decode("utf-8")
+    line = version.readline()
+    # Ensure the line is a string-like object.
+    try:
+      line = line.decode('utf-8')
+    except (UnicodeDecodeError, AttributeError):
+      pass
+    version = line.strip()
   artifact_name = "kudu-binary-%s-%s-%s" % (version, os_str, arch)
   return artifact_name
 
@@ -258,11 +272,11 @@ def prep_artifact_dirs(config):
   """
 
   if not os.path.exists(config[ARTIFACT_ROOT]):
-    os.makedirs(config[ARTIFACT_ROOT], mode=0755)
+    os.makedirs(config[ARTIFACT_ROOT], mode=0o755)
   if not os.path.exists(config[ARTIFACT_BIN_DIR]):
-    os.makedirs(config[ARTIFACT_BIN_DIR], mode=0755)
+    os.makedirs(config[ARTIFACT_BIN_DIR], mode=0o755)
   if not os.path.exists(config[ARTIFACT_LIB_DIR]):
-    os.makedirs(config[ARTIFACT_LIB_DIR], mode=0755)
+    os.makedirs(config[ARTIFACT_LIB_DIR], mode=0o755)
 
 def copy_file(src, dest):
   """
@@ -366,7 +380,7 @@ def relocate_deps_macos(target_src, target_dst, config):
 
   # For each dependency, relocate the path we will search for it and ensure it
   # is shipped with the archive.
-  for (dep_search_name, dep_src) in target_deps.iteritems():
+  for (dep_search_name, dep_src) in target_deps.items():
     # Filter out libs we don't want to archive.
     if PAT_MACOS_LIB_EXCLUDE.search(dep_search_name):
       continue
@@ -401,7 +415,7 @@ def relocate_sasl2(target_src, config):
   """
 
   # Find the libsasl2 module in our dependencies.
-  deps = get_resolved_deps(target_src);
+  deps = get_resolved_deps(target_src)
   sasl_lib = None
   for dep in deps:
     if re.search('libsasl2', dep):

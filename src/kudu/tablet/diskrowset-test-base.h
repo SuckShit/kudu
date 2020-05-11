@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_LAYER_TEST_BASE_H
-#define KUDU_TABLET_LAYER_TEST_BASE_H
+#pragma once
 
 #include <unistd.h>
 
@@ -56,11 +55,11 @@ namespace tablet {
 class TestRowSet : public KuduRowSetTest {
  public:
   TestRowSet()
-    : KuduRowSetTest(CreateTestSchema()),
-      n_rows_(FLAGS_roundtrip_num_rows),
-      op_id_(consensus::MaximumOpId()),
-      clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
-      log_anchor_registry_(new log::LogAnchorRegistry()) {
+      : KuduRowSetTest(CreateTestSchema()),
+        n_rows_(FLAGS_roundtrip_num_rows),
+        op_id_(consensus::MaximumOpId()),
+        clock_(Timestamp::kInitialTimestamp),
+        log_anchor_registry_(new log::LogAnchorRegistry()) {
     CHECK_GT(n_rows_, 0);
   }
 
@@ -186,7 +185,7 @@ class TestRowSet : public KuduRowSetTest {
     RowSetKeyProbe probe(rb.row());
 
     ProbeStats stats;
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
     Status s = rs->MutateRow(tx.timestamp(), probe, mutation, op_id_, nullptr, &stats, result);
     tx.Commit();
@@ -340,12 +339,10 @@ class TestRowSet : public KuduRowSetTest {
 
   size_t n_rows_;
   consensus::OpId op_id_; // Generally a "fake" OpId for these tests.
-  scoped_refptr<clock::Clock> clock_;
+  clock::LogicalClock clock_;
   MvccManager mvcc_;
   scoped_refptr<log::LogAnchorRegistry> log_anchor_registry_;
 };
 
 } // namespace tablet
 } // namespace kudu
-
-#endif

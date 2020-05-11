@@ -27,14 +27,14 @@
 #include <mutex>
 #include <ostream>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp> // IWYU pragma: keep
-#include <boost/function.hpp>
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+#include <google/protobuf/stubs/common.h>
 
 #include "kudu/client/authz_token_cache.h"
 #include "kudu/client/master_proxy_rpc.h"
@@ -73,6 +73,7 @@ DECLARE_int32(dns_resolver_max_threads_num);
 DECLARE_uint32(dns_resolver_cache_capacity_mb);
 DECLARE_uint32(dns_resolver_cache_ttl_sec);
 
+using boost::container::small_vector;
 using std::map;
 using std::pair;
 using std::set;
@@ -89,6 +90,7 @@ class SignedTokenPB;
 
 using master::AlterTableRequestPB;
 using master::AlterTableResponsePB;
+using master::ConnectToMasterResponsePB;
 using master::CreateTableRequestPB;
 using master::CreateTableResponsePB;
 using master::DeleteTableRequestPB;
@@ -119,7 +121,7 @@ using internal::RemoteTabletServer;
 Status RetryFunc(const MonoTime& deadline,
                  const string& retry_msg,
                  const string& timeout_msg,
-                 const boost::function<Status(const MonoTime&, bool*)>& func) {
+                 const std::function<Status(const MonoTime&, bool*)>& func) {
   DCHECK(deadline.Initialized());
 
   if (deadline < MonoTime::Now()) {
@@ -180,10 +182,11 @@ KuduClient::Data::~Data() {
   dns_resolver_.reset();
 }
 
-RemoteTabletServer* KuduClient::Data::SelectTServer(const scoped_refptr<RemoteTablet>& rt,
-                                                    const ReplicaSelection selection,
-                                                    const set<string>& blacklist,
-                                                    vector<RemoteTabletServer*>* candidates) const {
+RemoteTabletServer* KuduClient::Data::SelectTServer(
+    const scoped_refptr<RemoteTablet>& rt,
+    const ReplicaSelection selection,
+    const set<string>& blacklist,
+    vector<RemoteTabletServer*>* candidates) const {
   RemoteTabletServer* ret = nullptr;
   candidates->clear();
   switch (selection) {
@@ -216,28 +219,32 @@ RemoteTabletServer* KuduClient::Data::SelectTServer(const scoped_refptr<RemoteTa
         break;
       }
       // Choose a replica as follows:
-      // 1. If there is a replica local to the client, pick it. If there are
-      // multiple, pick a random one.
-      // 2. Otherwise, if there is a replica in the same location, pick it. If
-      // there are multiple, pick a random one.
+      // 1. If there is a replica local to the client according to its IP and
+      //    assigned location, pick it. If there are multiple, pick a random one.
+      // 2. Otherwise, if there is a replica in the same assigned location,
+      //    pick it. If there are multiple, pick a random one.
       // 3. If there are no local replicas or replicas in the same location,
-      // pick a random replica.
+      //    pick a random replica.
       // TODO(wdberkeley): Eventually, the client might use the hierarchical
       // structure of a location to determine proximity.
+      // NOTE: this is the same logic implemented in RemoteTablet.java.
       const string client_location = location();
-      vector<RemoteTabletServer*> local;
-      vector<RemoteTabletServer*> same_location;
+      small_vector<RemoteTabletServer*, 1> local;
+      small_vector<RemoteTabletServer*, 3> same_location;
       local.reserve(filtered.size());
       same_location.reserve(filtered.size());
       for (RemoteTabletServer* rts : filtered) {
-        if (IsTabletServerLocal(*rts)) {
-          local.push_back(rts);
-        }
-        if (!client_location.empty()) {
-          const string replica_location = rts->location();
-          if (client_location == replica_location) {
-            same_location.push_back(rts);
+        bool ts_same_location = !client_location.empty() && client_location == rts->location();
+        // Only consider a server "local" if the client is in the same
+        // location, or if there is missing location info.
+        if (client_location.empty() || rts->location().empty() ||
+            ts_same_location) {
+          if (IsTabletServerLocal(*rts)) {
+            local.push_back(rts);
           }
+        }
+        if (ts_same_location) {
+          same_location.push_back(rts);
         }
       }
       if (!local.empty()) {
@@ -331,11 +338,13 @@ Status KuduClient::Data::WaitForCreateTableToFinish(
     KuduClient* client,
     TableIdentifierPB table,
     const MonoTime& deadline) {
-  return RetryFunc(deadline,
-                   "Waiting on Create Table to be completed",
-                   "Timed out waiting for Table Creation",
-                   boost::bind(&KuduClient::Data::IsCreateTableInProgress,
-                               this, client, std::move(table), _1, _2));
+  return RetryFunc(
+      deadline,
+      "Waiting on Create Table to be completed",
+      "Timed out waiting for Table Creation",
+      [&](const MonoTime& deadline, bool* retry) {
+        return IsCreateTableInProgress(client, table, deadline, retry);
+      });
 }
 
 Status KuduClient::Data::DeleteTable(KuduClient* client,
@@ -397,11 +406,13 @@ Status KuduClient::Data::WaitForAlterTableToFinish(
     KuduClient* client,
     TableIdentifierPB table,
     const MonoTime& deadline) {
-  return RetryFunc(deadline,
-                   "Waiting on Alter Table to be completed",
-                   "Timed out waiting for AlterTable",
-                   boost::bind(&KuduClient::Data::IsAlterTableInProgress,
-                               this, client, std::move(table), _1, _2));
+  return RetryFunc(
+      deadline,
+      "Waiting on Alter Table to be completed",
+      "Timed out waiting for AlterTable",
+      [&](const MonoTime& deadline, bool* retry) {
+        return IsAlterTableInProgress(client, table, deadline, retry);
+      });
 }
 
 Status KuduClient::Data::InitLocalHostNames() {
@@ -436,7 +447,14 @@ Status KuduClient::Data::InitLocalHostNames() {
 }
 
 bool KuduClient::Data::IsLocalHostPort(const HostPort& hp) const {
-  return ContainsKey(local_host_names_, hp.host());
+  if (ContainsKey(local_host_names_, hp.host())) {
+    return true;
+  }
+
+  // It may be that HostPort is a numeric form (non-reversable) address like
+  // 127.0.1.1, etc. In that case we can still consider it local.
+  Sockaddr addr;
+  return addr.ParseFromNumericHostPort(hp).ok() && addr.IsAnyLocalAddress();
 }
 
 bool KuduClient::Data::IsTabletServerLocal(const RemoteTabletServer& rts) const {
@@ -578,7 +596,7 @@ Status KuduClient::Data::GetTableSchema(KuduClient* client,
 void KuduClient::Data::ConnectedToClusterCb(
     const Status& status,
     const pair<Sockaddr, string>& leader_addr_and_name,
-    const master::ConnectToMasterResponsePB& connect_response,
+    const ConnectToMasterResponsePB& connect_response,
     CredentialsPolicy cred_policy) {
 
   const auto& leader_addr = leader_addr_and_name.first;
@@ -643,7 +661,7 @@ void KuduClient::Data::ConnectedToClusterCb(
   }
 
   for (const StatusCallback& cb : cbs) {
-    cb.Run(status);
+    cb(status);
   }
 }
 
@@ -673,21 +691,23 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
       s = dns_resolver_->ResolveAddresses(hp, &addrs);
     }
     if (!s.ok()) {
-      cb.Run(s);
+      cb(s);
       return;
     }
     if (addrs.empty()) {
-      cb.Run(Status::InvalidArgument(Substitute("No master address specified by '$0'",
-                                                master_server_addr)));
+      cb(Status::InvalidArgument(Substitute("No master address specified by '$0'",
+                                            master_server_addr)));
       return;
     }
     if (addrs.size() > 1) {
-      KLOG_EVERY_N_SECS(WARNING, 1)
-          << Substitute("Specified master server address '$0' resolved to "
-                        "multiple IPs. Using $1",
-                        master_server_addr, addrs[0].ToString());
+      KLOG_EVERY_N_SECS(INFO, 1)
+          << Substitute("Specified master server address '$0' resolved to multiple IPs $1. "
+                        "Connecting to each one of them.",
+                        master_server_addr, Sockaddr::ToCommaSeparatedString(addrs));
     }
-    master_addrs_with_names.emplace_back(addrs[0], hp.host());
+    for (const Sockaddr& addr : addrs) {
+      master_addrs_with_names.emplace_back(addr, hp.host());
+    }
   }
 
   // This ensures that no more than one ConnectToClusterRpc of each credentials
@@ -729,11 +749,11 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
     // policy.
     scoped_refptr<internal::ConnectToClusterRpc> rpc(
         new internal::ConnectToClusterRpc(
-            std::bind(&KuduClient::Data::ConnectedToClusterCb, this,
-            std::placeholders::_1,
-            std::placeholders::_2,
-            std::placeholders::_3,
-            creds_policy),
+            [this, creds_policy](const Status& status,
+                                 const std::pair<Sockaddr, string>& leader_master,
+                                 const ConnectToMasterResponsePB& connect_response) {
+              this->ConnectedToClusterCb(status, leader_master, connect_response, creds_policy);
+            },
         std::move(master_addrs_with_names),
         deadline,
         client->default_rpc_timeout(),

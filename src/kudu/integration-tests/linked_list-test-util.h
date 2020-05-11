@@ -14,12 +14,16 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <iostream>
 #include <list>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -39,14 +43,12 @@
 #include "kudu/gutil/walltime.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/tablet/tablet.h"
-#include "kudu/util/atomic.h"
 #include "kudu/util/blocking_queue.h"
 #include "kudu/util/curl_util.h"
 #include "kudu/util/hdr_histogram.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
 #include "kudu/util/stopwatch.h"
-#include "kudu/util/thread.h"
 
 namespace kudu {
 
@@ -109,10 +111,10 @@ class LinkedListTester {
       int64_t *written_count);
 
   // Variant of VerifyLinkedListRemote that verifies at the specified snapshot timestamp.
-  Status VerifyLinkedListAtSnapshotRemote(const uint64_t snapshot_timestamp,
-                                          const int64_t expected,
-                                          const bool log_errors,
-                                          const boost::function<Status(const std::string&)>& cb,
+  Status VerifyLinkedListAtSnapshotRemote(uint64_t snapshot_timestamp,
+                                          int64_t expected,
+                                          bool log_errors,
+                                          const std::function<Status(const std::string&)>& cb,
                                           int64_t* verified_count) {
     return VerifyLinkedListRemote(snapshot_timestamp,
                                   expected,
@@ -121,9 +123,9 @@ class LinkedListTester {
                                   verified_count);
   }
 
-  Status VerifyLinkedListAtLatestRemote(const int64_t expected,
-                                        const bool log_errors,
-                                        const boost::function<Status(const std::string&)>& cb,
+  Status VerifyLinkedListAtLatestRemote(int64_t expected,
+                                        bool log_errors,
+                                        const std::function<Status(const std::string&)>& cb,
                                         int64_t* verified_count) {
     return VerifyLinkedListRemote(kNoSnapshot,
                                   expected,
@@ -133,9 +135,9 @@ class LinkedListTester {
   }
 
   // Variant of VerifyLinkedListremote that verifies at 'now'.
-  Status VerifyLinkedListAtNowSnapshotRemote(const int64_t expected,
-                                             const bool log_errors,
-                                             const boost::function<Status(const std::string&)>& cb,
+  Status VerifyLinkedListAtNowSnapshotRemote(int64_t expected,
+                                             bool log_errors,
+                                             const std::function<Status(const std::string&)>& cb,
                                              int64_t* verified_count) {
     return VerifyLinkedListRemote(kSnapshotAtNow,
                                   expected,
@@ -146,15 +148,15 @@ class LinkedListTester {
 
   // Run the verify step on a table with RPCs. Calls the provided callback 'cb' once during
   // verification to test scanner fault tolerance.
-  Status VerifyLinkedListRemote(const uint64_t snapshot_timestamp,
-                                const int64_t expected,
-                                const bool log_errors,
-                                const boost::function<Status(const std::string&)>& cb,
+  Status VerifyLinkedListRemote(uint64_t snapshot_timestamp,
+                                int64_t expected,
+                                bool log_errors,
+                                const std::function<Status(const std::string&)>& cb,
                                 int64_t* verified_count);
 
   // Run the verify step on a specific tablet.
   Status VerifyLinkedListLocal(const tablet::Tablet* tablet,
-                               const int64_t expected,
+                               int64_t expected,
                                int64_t* verified_count);
 
   // A variant of VerifyLinkedListRemote that is more robust towards ongoing
@@ -164,14 +166,14 @@ class LinkedListTester {
                        WaitAndVerifyMode mode = FINISH_WITH_SNAPSHOT_SCAN) {
     return WaitAndVerify(seconds_to_run,
                          expected,
-                         boost::bind(&LinkedListTester::ReturnOk, this, _1),
+                         [](const std::string& /*uuid*/) { return Status::OK(); },
                          mode);
   }
 
   // A variant of WaitAndVerify that also takes a callback to be run once during verification.
   Status WaitAndVerify(int seconds_to_run,
                        int64_t expected,
-                       const boost::function<Status(const std::string&)>& cb,
+                       const std::function<Status(const std::string&)>& cb,
                        WaitAndVerifyMode mode = FINISH_WITH_SNAPSHOT_SCAN);
 
   // Generates a vector of keys for the table such that each tablet is
@@ -194,9 +196,6 @@ class LinkedListTester {
   HdrHistogram latency_histogram_;
   client::sp::shared_ptr<client::KuduClient> client_;
   SnapsAndCounts sampled_timestamps_and_counts_;
-
- private:
-  Status ReturnOk(const std::string& str) { return Status::OK(); }
 };
 
 // Generates the linked list pattern.
@@ -230,7 +229,7 @@ class LinkedListChainGenerator {
     int64_t this_key = (Rand64() << 16) | chain_idx_;
     int64_t ts = GetCurrentTimeMicros();
 
-    gscoped_ptr<client::KuduInsert> insert(table->NewInsert());
+    std::unique_ptr<client::KuduInsert> insert(table->NewInsert());
     CHECK_OK(insert->mutable_row()->SetInt64(kKeyColumnName, this_key));
     CHECK_OK(insert->mutable_row()->SetInt64(kInsertTsColumnName, ts));
     CHECK_OK(insert->mutable_row()->SetInt64(kLinkColumnName, prev_key_));
@@ -266,16 +265,13 @@ class ScopedRowUpdater {
   // the lifetime of this object.
   explicit ScopedRowUpdater(client::KuduTable* table)
     : table_(table),
-      to_update_(kint64max) { // no limit
-    CHECK_OK(Thread::Create("linked_list-test", "updater",
-                            &ScopedRowUpdater::RowUpdaterThread, this, &updater_));
+      to_update_(kint64max), // no limit
+      updater_([this]() { this->RowUpdaterThread(); }) {
   }
 
   ~ScopedRowUpdater() {
     to_update_.Shutdown();
-    if (updater_) {
-      updater_->Join();
-    }
+    updater_.join();
   }
 
   BlockingQueue<int64_t>* to_update() { return &to_update_; }
@@ -286,8 +282,8 @@ class ScopedRowUpdater {
     session->SetTimeoutMillis(60000 /* 60 seconds */);
     CHECK_OK(session->SetFlushMode(client::KuduSession::AUTO_FLUSH_BACKGROUND));
 
-    int64_t next_key;
-    while (to_update_.BlockingGet(&next_key)) {
+    int64_t next_key = 0;
+    while (to_update_.BlockingGet(&next_key).ok()) {
       std::unique_ptr<client::KuduUpdate> update(table_->NewUpdate());
       CHECK_OK(update->mutable_row()->SetInt64(kKeyColumnName, next_key));
       CHECK_OK(update->mutable_row()->SetBool(kUpdatedColumnName, true));
@@ -299,115 +295,7 @@ class ScopedRowUpdater {
 
   client::KuduTable* table_;
   BlockingQueue<int64_t> to_update_;
-  scoped_refptr<Thread> updater_;
-};
-
-// A thread that periodically checks tablet and master web pages during the
-// linked list test.
-class PeriodicWebUIChecker {
- public:
-  PeriodicWebUIChecker(const cluster::ExternalMiniCluster& cluster,
-                       MonoDelta period,
-                       const std::string& tablet_id = "")
-      : period_(period), is_running_(true) {
-    // List of master web pages to fetch.
-    const std::vector<std::string> master_pages = {
-      "/dump-entities",
-      "/masters",
-      "/mem-trackers",
-      "/metrics",
-      "/stacks",
-      "/tables",
-      "/tablet-servers",
-      "/threadz",
-      "/threadz?group=all",
-    };
-
-    // List of tserver web pages to fetch.
-    const std::vector<std::string> ts_pages = {
-      "/maintenance-manager",
-      "/mem-trackers",
-      "/metrics",
-      "/scans",
-      "/stacks",
-      "/tablets",
-      "/threadz",
-      "/threadz?group=all",
-      tablet_id.empty()
-          ? "/transactions"
-          : strings::Substitute("/transactions?tablet_id=$0", tablet_id),
-    };
-
-    // Generate list of urls for each master and tablet server
-    for (int i = 0; i < cluster.num_masters(); i++) {
-      for (const auto& page : master_pages) {
-        urls_.emplace_back(strings::Substitute(
-            "http://$0$1",
-            cluster.master(i)->bound_http_hostport().ToString(),
-            page));
-      }
-    }
-    for (int i = 0; i < cluster.num_tablet_servers(); i++) {
-      for (const auto& page : ts_pages) {
-        urls_.emplace_back(strings::Substitute(
-            "http://$0$1",
-            cluster.tablet_server(i)->bound_http_hostport().ToString(),
-            page));
-      }
-    }
-    std::random_device rdev;
-    std::mt19937 gen(rdev());
-    std::shuffle(urls_.begin(), urls_.end(), gen);
-    CHECK_OK(Thread::Create("linked_list-test", "checker",
-                            &PeriodicWebUIChecker::CheckThread, this, &checker_));
-  }
-
-  ~PeriodicWebUIChecker() {
-    LOG(INFO) << "Shutting down curl thread";
-    is_running_.Store(false);
-    if (checker_) {
-      checker_->Join();
-    }
-  }
-
- private:
-  void CheckThread() {
-    EasyCurl curl;
-    // Set some timeout so that if the page deadlocks, we fail the test.
-    curl.set_timeout(MonoDelta::FromSeconds(120));
-    faststring dst;
-    LOG(INFO) << "Curl thread will poll the following URLs every " << period_.ToMilliseconds()
-        << " ms: ";
-    for (std::string url : urls_) {
-      LOG(INFO) << url;
-    }
-    while (is_running_.Load()) {
-      // Poll all of the URLs.
-      const MonoTime start = MonoTime::Now();
-      bool compression_enabled = true;
-      for (const auto& url : urls_) {
-        // Switch compression back and forth.
-        Status s = compression_enabled ? curl.FetchURL(url, &dst, {"Accept-Encoding: gzip"})
-                                       : curl.FetchURL(url, &dst);
-        compression_enabled = !compression_enabled;
-        if (s.ok()) {
-          CHECK_GT(dst.length(), 0);
-        }
-        CHECK(!s.IsTimedOut()) << "timed out fetching url " << url;
-      }
-      // Sleep until the next period
-      const MonoDelta elapsed = MonoTime::Now() - start;
-      const int64_t sleep_ns = period_.ToNanoseconds() - elapsed.ToNanoseconds();
-      if (sleep_ns > 0) {
-        SleepFor(MonoDelta::FromNanoseconds(sleep_ns));
-      }
-    }
-  }
-
-  const MonoDelta period_;
-  AtomicBool is_running_;
-  scoped_refptr<Thread> checker_;
-  std::vector<std::string> urls_;
+  std::thread updater_;
 };
 
 // Helper class to hold results from a linked list scan and perform the
@@ -446,7 +334,7 @@ class LinkedListVerifier {
 // LinkedListTester
 /////////////////////////////////////////////////////////////
 
-std::vector<const KuduPartialRow*> LinkedListTester::GenerateSplitRows(
+inline std::vector<const KuduPartialRow*> LinkedListTester::GenerateSplitRows(
     const client::KuduSchema& schema) {
   std::vector<const KuduPartialRow*> split_keys;
   for (int64_t val : GenerateSplitInts()) {
@@ -457,18 +345,19 @@ std::vector<const KuduPartialRow*> LinkedListTester::GenerateSplitRows(
   return split_keys;
 }
 
-std::vector<int64_t> LinkedListTester::GenerateSplitInts() {
+inline std::vector<int64_t> LinkedListTester::GenerateSplitInts() {
   std::vector<int64_t> ret;
   ret.reserve(num_tablets_ - 1);
-  int64_t increment = kint64max / num_tablets_;
+  const int64_t increment = kint64max / num_tablets_;
   for (int64_t i = 1; i < num_tablets_; i++) {
     ret.push_back(i * increment);
   }
   return ret;
 }
 
-Status LinkedListTester::CreateLinkedListTable() {
-  gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
+inline Status LinkedListTester::CreateLinkedListTable() {
+  std::unique_ptr<client::KuduTableCreator> table_creator(
+      client_->NewTableCreator());
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   RETURN_NOT_OK_PREPEND(table_creator->table_name(table_name_)
@@ -482,7 +371,7 @@ Status LinkedListTester::CreateLinkedListTable() {
   return Status::OK();
 }
 
-Status LinkedListTester::LoadLinkedList(
+inline Status LinkedListTester::LoadLinkedList(
     const MonoDelta& run_for,
     int num_samples,
     int64_t *written_count) {
@@ -495,16 +384,16 @@ Status LinkedListTester::LoadLinkedList(
   MonoTime start = MonoTime::Now();
   MonoTime deadline = start + run_for;
 
-  client::sp::shared_ptr<client::KuduSession> session = client_->NewSession();
+  client::sp::shared_ptr<client::KuduSession> session(client_->NewSession());
   session->SetTimeoutMillis(60000 /* 60 seconds */);
   RETURN_NOT_OK_PREPEND(session->SetFlushMode(client::KuduSession::MANUAL_FLUSH),
                         "Couldn't set flush mode");
 
   ScopedRowUpdater updater(table.get());
-  std::vector<LinkedListChainGenerator*> chains;
-  ElementDeleter d(&chains);
+  std::vector<std::unique_ptr<LinkedListChainGenerator>> chains;
+  chains.reserve(num_chains_);
   for (int i = 0; i < num_chains_; i++) {
-    chains.push_back(new LinkedListChainGenerator(i));
+    chains.emplace_back(new LinkedListChainGenerator(i));
   }
 
   MonoDelta sample_interval = MonoDelta::FromMicroseconds(run_for.ToMicroseconds() / num_samples);
@@ -536,7 +425,7 @@ Status LinkedListTester::LoadLinkedList(
       }
       return Status::OK();
     }
-    for (LinkedListChainGenerator* chain : chains) {
+    for (const auto& chain : chains) {
       RETURN_NOT_OK_PREPEND(chain->GenerateNextInsert(table.get(), session.get()),
                             "Unable to generate next insert into linked list chain");
     }
@@ -550,14 +439,14 @@ Status LinkedListTester::LoadLinkedList(
 
     if (enable_mutation_) {
       // Rows have been inserted; they're now safe to update.
-      for (LinkedListChainGenerator* chain : chains) {
+      for (const auto& chain : chains) {
         updater.to_update()->Put(chain->prev_key());
       }
     }
   }
 }
 
-void LinkedListTester::DumpInsertHistogram(bool print_flags) {
+inline void LinkedListTester::DumpInsertHistogram(bool print_flags) {
   // We dump to cout instead of using glog so the output isn't prefixed with
   // line numbers. This makes it less ugly to copy-paste into JIRA, etc.
   using std::cout;
@@ -588,9 +477,9 @@ static void VerifyNoDuplicateEntries(const std::vector<int64_t>& ints, int* erro
   }
 }
 
-Status LinkedListTester::VerifyLinkedListRemote(
-    const uint64_t snapshot_timestamp, const int64_t expected, bool log_errors,
-    const boost::function<Status(const std::string&)>& cb, int64_t* verified_count) {
+inline Status LinkedListTester::VerifyLinkedListRemote(
+    uint64_t snapshot_timestamp, int64_t expected, bool log_errors,
+    const std::function<Status(const std::string&)>& cb, int64_t* verified_count) {
 
   client::sp::shared_ptr<client::KuduTable> table;
   RETURN_NOT_OK(client_->OpenTable(table_name_, &table));
@@ -633,9 +522,9 @@ Status LinkedListTester::VerifyLinkedListRemote(
     // tserver. Do this only once.
     if (snapshot_timestamp != kSnapshotAtNow && !cb_called) {
       client::KuduTabletServer* kts_ptr;
-      scanner.GetCurrentServer(&kts_ptr);
-      gscoped_ptr<client::KuduTabletServer> kts(kts_ptr);
-      const std::string down_ts = kts->uuid();
+      RETURN_NOT_OK(scanner.GetCurrentServer(&kts_ptr));
+      std::unique_ptr<client::KuduTabletServer> kts(kts_ptr);
+      const auto& down_ts = kts->uuid();
       LOG(INFO) << "Calling callback on tserver " << down_ts;
       RETURN_NOT_OK(cb(down_ts));
       cb_called = true;
@@ -668,10 +557,9 @@ Status LinkedListTester::VerifyLinkedListRemote(
   return s;
 }
 
-Status LinkedListTester::VerifyLinkedListLocal(const tablet::Tablet* tablet,
-                                               int64_t expected,
-                                               int64_t* verified_count) {
-  DCHECK(tablet != NULL);
+inline Status LinkedListTester::VerifyLinkedListLocal(
+    const tablet::Tablet* tablet, int64_t expected, int64_t* verified_count) {
+  DCHECK(tablet);
   LinkedListVerifier verifier(num_chains_, enable_mutation_, expected,
                               GenerateSplitInts());
   verifier.StartScanTimer();
@@ -705,10 +593,9 @@ Status LinkedListTester::VerifyLinkedListLocal(const tablet::Tablet* tablet,
   return verifier.VerifyData(verified_count, true);
 }
 
-Status LinkedListTester::WaitAndVerify(int seconds_to_run,
-                                       int64_t expected,
-                                       const boost::function<Status(const std::string&)>& cb,
-                                       WaitAndVerifyMode mode) {
+inline Status LinkedListTester::WaitAndVerify(
+    int seconds_to_run, int64_t expected,
+    const std::function<Status(const std::string&)>& cb, WaitAndVerifyMode mode) {
 
   std::list<std::pair<int64_t, int64_t>> samples_as_list(
       sampled_timestamps_and_counts_.begin(),
@@ -736,9 +623,10 @@ Status LinkedListTester::WaitAndVerify(int seconds_to_run,
                                              &seen);
         called = true;
       } else {
-        s = VerifyLinkedListAtSnapshotRemote((*iter).first, (*iter).second, last_attempt,
-                                             boost::bind(&LinkedListTester::ReturnOk, this, _1),
-                                             &seen);
+        s = VerifyLinkedListAtSnapshotRemote(
+            (*iter).first, (*iter).second, last_attempt,
+            [](const std::string& /*uuid*/) { return Status::OK(); },
+            &seen);
       }
 
       if (s.ok() && (*iter).second != seen) {
@@ -769,7 +657,8 @@ Status LinkedListTester::WaitAndVerify(int seconds_to_run,
       case FINISH_WITH_SNAPSHOT_SCAN:
         if (s.ok()) {
           RETURN_NOT_OK(VerifyLinkedListAtNowSnapshotRemote(
-              expected, last_attempt, boost::bind(&LinkedListTester::ReturnOk, this, _1), &seen));
+              expected, last_attempt,
+              [](const std::string& /*uuid*/) { return Status::OK(); }, &seen));
         }
         break;
       case FINISH_WITH_SCAN_LATEST:
@@ -777,7 +666,8 @@ Status LinkedListTester::WaitAndVerify(int seconds_to_run,
         // so, in this case, retry.
         if (s.ok()) {
           s = VerifyLinkedListAtLatestRemote(
-              expected, last_attempt, boost::bind(&LinkedListTester::ReturnOk, this, _1), &seen);
+              expected, last_attempt,
+              [](const std::string& /*uuid*/) { return Status::OK(); }, &seen);
         }
         break;
     }

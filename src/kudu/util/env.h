@@ -9,25 +9,24 @@
 //
 // All Env implementations are safe for concurrent access from
 // multiple threads without any external synchronization.
-
-#ifndef STORAGE_LEVELDB_INCLUDE_ENV_H_
-#define STORAGE_LEVELDB_INCLUDE_ENV_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/gutil/callback_forward.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
 class faststring;
+class Fifo;
 class FileLock;
 class RandomAccessFile;
 class RWFile;
@@ -142,11 +141,15 @@ class Env {
                            const std::string& fname,
                            std::unique_ptr<RWFile>* result) = 0;
 
-  // Same as abovoe for NewTempWritableFile(), but for an RWFile.
+  // Same as above for NewTempWritableFile(), but for an RWFile.
   virtual Status NewTempRWFile(const RWFileOptions& opts,
                                const std::string& name_template,
                                std::string* created_filename,
                                std::unique_ptr<RWFile>* res) = 0;
+
+  // Creates a new fifo.
+  virtual Status NewFifo(const std::string& fname,
+                         std::unique_ptr<Fifo>* fifo) = 0;
 
   // Returns true iff the named file exists.
   virtual bool FileExists(const std::string& fname) = 0;
@@ -273,7 +276,7 @@ class Env {
   //
   // Returning an error won't halt the walk, but it will cause it to return
   // with an error status when it's done.
-  typedef Callback<Status(FileType, const std::string&, const std::string&)> WalkCallback;
+  typedef std::function<Status(FileType, const std::string&, const std::string&)> WalkCallback;
 
   // Whether to walk directories in pre-order or post-order.
   enum DirectoryOrder {
@@ -361,6 +364,9 @@ class Env {
   // On success, 'result' contains the answer. On failure, 'result' is unset.
   virtual Status IsFileWorldReadable(const std::string& path, bool* result) = 0;
 
+  // Creates symlink 'dst' that points to 'source'.
+  virtual Status CreateSymLink(const std::string& src, const std::string& dst) = 0;
+
   // Special string injected into file-growing operations' random failures
   // (if enabled).
   //
@@ -368,16 +374,42 @@ class Env {
   static const char* const kInjectedFailureStatusMsg;
 
  private:
-  // No copying allowed
-  Env(const Env&);
-  void operator=(const Env&);
+  DISALLOW_COPY_AND_ASSIGN(Env);
+};
+
+// A bare-bones abstraction common to all file implementations.
+class File {
+ public:
+  virtual ~File();
+
+  // Returns the filename provided at construction time.
+  virtual const std::string& filename() const = 0;
+};
+
+// A simple fifo abstraction.
+class Fifo : public File {
+ public:
+  // Opens the fifo for reads. This will wait until the fifo has also been
+  // opened for writes.
+  virtual Status OpenForReads() = 0;
+
+  // Opens the fifo for writes. This will wait until the fifo has also been
+  // opened for reads.
+  virtual Status OpenForWrites() = 0;
+
+  // Returns the read fd, set when opened for reads. The fifo must have been
+  // opened for reads before calling.
+  virtual int read_fd() const = 0;
+
+  // Returns the write fd, set when opened for writes. The fifo must have been
+  // opened for writes before calling.
+  virtual int write_fd() const = 0;
 };
 
 // A file abstraction for reading sequentially through a file
-class SequentialFile {
+class SequentialFile : public File {
  public:
   SequentialFile() { }
-  virtual ~SequentialFile();
 
   // Read up to "result.size" bytes from the file.
   // Sets "result.data" to the data that was read.
@@ -396,9 +428,6 @@ class SequentialFile {
   //
   // REQUIRES: External synchronization
   virtual Status Skip(uint64_t n) = 0;
-
-  // Returns the filename provided when the SequentialFile was constructed.
-  virtual const std::string& filename() const = 0;
 };
 
 // A file abstraction for randomly reading the contents of a file.
@@ -407,10 +436,9 @@ class SequentialFile {
 // implementations must ensure that any mutable state changes brought on by
 // instance destruction and recreation (i.e. triggered by cache eviction and
 // reloading events) do not affect correctness.
-class RandomAccessFile {
+class RandomAccessFile : public File {
  public:
   RandomAccessFile() { }
-  virtual ~RandomAccessFile();
 
   // Read "result.size" bytes from the file starting at "offset".
   // Copies the resulting data into "result.data".
@@ -440,9 +468,6 @@ class RandomAccessFile {
   // Returns the size of the file
   virtual Status Size(uint64_t *size) const = 0;
 
-  // Returns the filename provided when the RandomAccessFile was constructed.
-  virtual const std::string& filename() const = 0;
-
   // Returns the approximate memory usage of this RandomAccessFile including
   // the object itself.
   virtual size_t memory_footprint() const = 0;
@@ -469,7 +494,7 @@ struct RandomAccessFileOptions {
 // A file abstraction for sequential writing.  The implementation
 // must provide buffering since callers may append small fragments
 // at a time to the file.
-class WritableFile {
+class WritableFile : public File {
  public:
   enum FlushMode {
     FLUSH_SYNC,
@@ -477,7 +502,6 @@ class WritableFile {
   };
 
   WritableFile() { }
-  virtual ~WritableFile();
 
   virtual Status Append(const Slice& data) = 0;
 
@@ -512,13 +536,8 @@ class WritableFile {
 
   virtual uint64_t Size() const = 0;
 
-  // Returns the filename provided when the WritableFile was constructed.
-  virtual const std::string& filename() const = 0;
-
  private:
-  // No copying allowed
-  WritableFile(const WritableFile&);
-  void operator=(const WritableFile&);
+  DISALLOW_COPY_AND_ASSIGN(WritableFile);
 };
 
 // Creation-time options for RWFile
@@ -547,17 +566,14 @@ struct RWFileOptions {
 // implementations must ensure that any mutable state changes brought on by
 // instance destruction and recreation (i.e. triggered by cache eviction and
 // reloading events) do not affect correctness.
-class RWFile {
+class RWFile : public File {
  public:
   enum FlushMode {
     FLUSH_SYNC,
     FLUSH_ASYNC
   };
 
-  RWFile() {
-  }
-
-  virtual ~RWFile();
+  RWFile() { }
 
   // Read "result.size" bytes from the file starting at "offset".
   // Copies the resulting data into "result.data".
@@ -659,9 +675,6 @@ class RWFile {
   typedef std::map<uint64_t, uint64_t> ExtentMap;
   virtual Status GetExtentMap(ExtentMap* out) const = 0;
 
-  // Returns the filename provided when the RWFile was constructed.
-  virtual const std::string& filename() const = 0;
-
  private:
   DISALLOW_COPY_AND_ASSIGN(RWFile);
 };
@@ -672,14 +685,15 @@ class FileLock {
   FileLock() { }
   virtual ~FileLock();
  private:
-  // No copying allowed
-  FileLock(const FileLock&);
-  void operator=(const FileLock&);
+  DISALLOW_COPY_AND_ASSIGN(FileLock);
 };
 
 // A utility routine: write "data" to the named file.
 extern Status WriteStringToFile(Env* env, const Slice& data,
                                 const std::string& fname);
+// Like above but also fsyncs the new file.
+extern Status WriteStringToFileSync(Env* env, const Slice& data,
+                                    const std::string& fname);
 
 // A utility routine: read contents of named file into *data
 extern Status ReadFileToString(Env* env, const std::string& fname,
@@ -689,5 +703,3 @@ extern Status ReadFileToString(Env* env, const std::string& fname,
 std::ostream& operator<<(std::ostream& o, Env::ResourceLimitType t);
 
 }  // namespace kudu
-
-#endif  // STORAGE_LEVELDB_INCLUDE_ENV_H_

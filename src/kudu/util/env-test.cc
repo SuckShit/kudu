@@ -34,12 +34,15 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -49,7 +52,6 @@
 #include <glog/stl_logging.h> // IWYU pragma: keep
 #include <gtest/gtest.h>
 
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
@@ -82,6 +84,7 @@ namespace kudu {
 using std::pair;
 using std::shared_ptr;
 using std::string;
+using std::thread;
 using std::unique_ptr;
 using std::unordered_set;
 using std::vector;
@@ -748,13 +751,17 @@ TEST_F(TestEnv, TestWalk) {
 
   // Do the walk.
   unordered_set<string> actual;
-  ASSERT_OK(env_->Walk(root, Env::PRE_ORDER, Bind(&TestWalkCb, &actual)));
+  ASSERT_OK(env_->Walk(
+      root, Env::PRE_ORDER,
+      [&actual](Env::FileType type, const string& dirname, const string& basename) {
+        return TestWalkCb(&actual, type, dirname, basename);
+      }));
   ASSERT_EQ(expected, actual);
 }
 
 TEST_F(TestEnv, TestWalkNonExistentPath) {
   // A walk on a non-existent path should fail.
-  Status s = env_->Walk("/not/a/real/path", Env::PRE_ORDER, Bind(&NoopTestWalkCb));
+  Status s = env_->Walk("/not/a/real/path", Env::PRE_ORDER, &NoopTestWalkCb);
   ASSERT_TRUE(s.IsIOError());
   ASSERT_STR_CONTAINS(s.ToString(), "One or more errors occurred");
 }
@@ -773,7 +780,7 @@ TEST_F(TestEnv, TestWalkBadPermissions) {
 
   // A walk on a directory without execute permission should fail,
   // unless the calling process has super-user's effective ID.
-  Status s = env_->Walk(kTestPath, Env::PRE_ORDER, Bind(&NoopTestWalkCb));
+  Status s = env_->Walk(kTestPath, Env::PRE_ORDER, &NoopTestWalkCb);
   if (geteuid() == 0) {
     ASSERT_TRUE(s.ok()) << s.ToString();
   } else {
@@ -797,8 +804,11 @@ TEST_F(TestEnv, TestWalkCbReturnsError) {
   unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(JoinPathSegments(new_dir, new_file), &writer));
   int num_calls = 0;
-  ASSERT_TRUE(env_->Walk(new_dir, Env::PRE_ORDER,
-                         Bind(&TestWalkErrorCb, &num_calls)).IsIOError());
+  ASSERT_TRUE(env_->Walk(
+      new_dir, Env::PRE_ORDER,
+      [&num_calls](Env::FileType type, const string& dirname, const string& basename) {
+        return TestWalkErrorCb(&num_calls, type, dirname, basename);
+      }).IsIOError());
 
   // Once for the directory and once for the file inside it.
   ASSERT_EQ(2, num_calls);
@@ -1192,6 +1202,51 @@ TEST_F(TestEnv, TestInjectEIO) {
   FLAGS_env_inject_eio_globs = "neither_path";
   ASSERT_OK(rw1->Close());
   ASSERT_OK(rw2->Close());
+}
+
+TEST_F(TestEnv, TestCreateSymlink) {
+  const string kSrc = JoinPathSegments(test_dir_, "foo");
+  const string kDst = JoinPathSegments(test_dir_, "bar");
+  ASSERT_OK(env_->CreateDir(kSrc));
+  ASSERT_OK(env_->CreateSymLink(kSrc, kDst));
+
+  unique_ptr<WritableFile> file;
+  ASSERT_OK(env_->NewWritableFile(WritableFileOptions(),
+                                  JoinPathSegments(kSrc, "foobar"),
+                                  &file));
+
+  ASSERT_TRUE(env_->FileExists(JoinPathSegments(kDst, "foobar")));
+}
+
+TEST_F(TestEnv, TestCreateFifo) {
+  const string kFifo = JoinPathSegments(test_dir_, "fifo");
+  unique_ptr<Fifo> fifo;
+  // Open a fifo for reads and writes.
+  ASSERT_OK(env_->NewFifo(kFifo, &fifo));
+  thread t([&] {
+    ASSERT_OK(fifo->OpenForReads());
+  });
+  ASSERT_OK(fifo->OpenForWrites());
+  t.join();
+
+  Slice data("it's the final countdown");
+  ssize_t written;
+  RETRY_ON_EINTR(written, write(fifo->write_fd(), data.data(), data.size()));
+  ASSERT_EQ(data.size(), written);
+  char buf[32];
+  ssize_t n;
+  RETRY_ON_EINTR(n, read(fifo->read_fd(), buf, arraysize(buf)));
+  ASSERT_EQ(data.size(), n);
+  Slice read_data(buf, n);
+  ASSERT_EQ(data, read_data);
+
+  // Trying to create the same fifo should fail.
+  Status s = env_->NewFifo(kFifo, &fifo);
+  ASSERT_TRUE(s.IsAlreadyPresent()) << s.ToString();
+
+  // Until our fifo gets deleted.
+  ASSERT_OK(env_->DeleteFile(kFifo));
+  ASSERT_OK(env_->NewFifo(kFifo, &fifo));
 }
 
 }  // namespace kudu

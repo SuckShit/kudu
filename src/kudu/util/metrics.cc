@@ -426,6 +426,9 @@ Status MetricEntity::CollectTo(MergedEntityMetrics* collections,
     scoped_refptr<Metric> entry = FindPtrOrNull(entity_collection, prototype);
     if (!entry) {
       scoped_refptr<Metric> new_metric = metric->snapshot();
+      if (!new_metric->invalid_for_merge_) {
+        new_metric->UpdateModificationEpoch();
+      }
       InsertOrDie(&entity_collection, new_metric->prototype(), new_metric);
     } else {
       entry->MergeFrom(metric);
@@ -650,8 +653,8 @@ FunctionGaugeDetacher::FunctionGaugeDetacher() {
 }
 
 FunctionGaugeDetacher::~FunctionGaugeDetacher() {
-  for (const Closure& c : callbacks_) {
-    c.Run();
+  for (const auto& f : functions_) {
+    f();
   }
 }
 
@@ -843,6 +846,11 @@ void MeanGauge::MergeFrom(const scoped_refptr<Metric>& other) {
 
 void MeanGauge::WriteValue(JsonWriter* writer) const {
   writer->Double(value());
+
+  writer->String("total_sum");
+  writer->Double(total_sum());
+  writer->String("total_count");
+  writer->Double(total_count());
 }
 
 //
@@ -892,7 +900,7 @@ HistogramPrototype::HistogramPrototype(const MetricPrototype::CtorArgs& args,
   : MetricPrototype(args),
     max_trackable_value_(max_trackable_value),
     num_sig_digits_(num_sig_digits) {
-  // Better to crash at definition time that at instantiation time.
+  // Better to crash at definition time than at instantiation time.
   CHECK(HdrHistogram::IsValidHighestTrackableValue(max_trackable_value))
       << Substitute("Invalid max trackable value on histogram $0: $1",
                     args.name_, max_trackable_value);

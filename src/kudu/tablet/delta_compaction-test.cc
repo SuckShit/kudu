@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -35,7 +36,6 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/tablet/delta_iterator_merger.h"
 #include "kudu/tablet/delta_key.h"
@@ -78,7 +78,7 @@ class TestDeltaCompaction : public KuduTest {
     return builder.Build();
   }
 
-  Status GetDeltaFileWriter(gscoped_ptr<DeltaFileWriter>* dfw,
+  Status GetDeltaFileWriter(unique_ptr<DeltaFileWriter>* dfw,
                             BlockId* block_id) const {
     unique_ptr<WritableBlock> block;
     RETURN_NOT_OK(fs_manager_->CreateNewBlock({}, &block));
@@ -99,7 +99,7 @@ class TestDeltaCompaction : public KuduTest {
   virtual void SetUp() OVERRIDE {
     KuduTest::SetUp();
     SeedRandom();
-    fs_manager_.reset(new FsManager(env_, GetTestPath("fs_root")));
+    fs_manager_.reset(new FsManager(env_, FsManagerOpts(GetTestPath("fs_root"))));
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
     ASSERT_OK(fs_manager_->Open());
   }
@@ -107,7 +107,7 @@ class TestDeltaCompaction : public KuduTest {
  protected:
   int64_t deltafile_idx_;
   Schema schema_;
-  gscoped_ptr<FsManager> fs_manager_;
+  unique_ptr<FsManager> fs_manager_;
 };
 
 TEST_F(TestDeltaCompaction, TestMergeMultipleSchemas) {
@@ -134,7 +134,7 @@ TEST_F(TestDeltaCompaction, TestMergeMultipleSchemas) {
   for (const Schema& schema : schemas) {
     // Write the Deltas
     BlockId block_id;
-    gscoped_ptr<DeltaFileWriter> dfw;
+    unique_ptr<DeltaFileWriter> dfw;
     ASSERT_OK(GetDeltaFileWriter(&dfw, &block_id));
 
     // Generate N updates with the new schema, some of them are on existing
@@ -143,7 +143,7 @@ TEST_F(TestDeltaCompaction, TestMergeMultipleSchemas) {
     // and update number (see update_value assignment).
     size_t kNumUpdates = 10;
     size_t kNumMultipleUpdates = kNumUpdates / 2;
-    DeltaStats stats;
+    unique_ptr<DeltaStats> stats(new DeltaStats);
     for (size_t i = 0; i < kNumUpdates; ++i) {
       buf.clear();
       RowChangeListEncoder update(&buf);
@@ -151,7 +151,7 @@ TEST_F(TestDeltaCompaction, TestMergeMultipleSchemas) {
         ColumnId col_id = schema.column_id(col_idx);
         DCHECK_GE(col_id, 0);
 
-        stats.IncrUpdateCount(col_id, 1);
+        stats->IncrUpdateCount(col_id, 1);
         const ColumnSchema& col_schema = schema.column(col_idx);
         int update_value = deltafile_idx * 100 + i;
         switch (col_schema.type_info()->physical_type()) {
@@ -180,12 +180,12 @@ TEST_F(TestDeltaCompaction, TestMergeMultipleSchemas) {
       DeltaKey key((i < kNumMultipleUpdates) ? i : row_id, Timestamp(curr_timestamp));
       RowChangeList row_changes = update.as_changelist();
       ASSERT_OK(dfw->AppendDelta<REDO>(key, row_changes));
-      ASSERT_OK(stats.UpdateStats(key.timestamp(), row_changes));
+      ASSERT_OK(stats->UpdateStats(key.timestamp(), row_changes));
       curr_timestamp++;
       row_id++;
     }
 
-    dfw->WriteDeltaStats(stats);
+    dfw->WriteDeltaStats(std::move(stats));
     ASSERT_OK(dfw->Finish());
     shared_ptr<DeltaFileReader> dfr;
     ASSERT_OK(GetDeltaFileReader(block_id, &dfr));
@@ -199,7 +199,7 @@ TEST_F(TestDeltaCompaction, TestMergeMultipleSchemas) {
   opts.projection = &merge_schema;
   unique_ptr<DeltaIterator> merge_iter;
   ASSERT_OK(DeltaIteratorMerger::Create(inputs, opts, &merge_iter));
-  gscoped_ptr<DeltaFileWriter> dfw;
+  unique_ptr<DeltaFileWriter> dfw;
   BlockId block_id;
   ASSERT_OK(GetDeltaFileWriter(&dfw, &block_id));
   ASSERT_OK(WriteDeltaIteratorToFile<REDO>(merge_iter.get(),

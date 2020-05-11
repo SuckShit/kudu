@@ -18,11 +18,11 @@
 #include "kudu/tablet/tablet.h"
 
 #include <algorithm>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <mutex>
 #include <ostream>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -32,6 +32,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/clock/clock.h"
 #include "kudu/clock/hybrid_clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/encoded_key.h"
@@ -50,8 +51,6 @@
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/io_context.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/human_readable.h"
@@ -163,6 +162,18 @@ METRIC_DEFINE_gauge_size(tablet, num_rowsets_on_disk, "Tablet Number of Rowsets 
                          kudu::MetricUnit::kUnits,
                          "Number of diskrowsets in this tablet",
                          kudu::MetricLevel::kInfo);
+METRIC_DEFINE_gauge_uint64(tablet, last_read_elapsed_time, "Seconds Since Last Read",
+                           kudu::MetricUnit::kSeconds,
+                           "The elapsed time, in seconds, since the last read operation on this "
+                           "tablet, or since this Tablet object was created on current tserver if "
+                           "it hasn't been read since then.",
+                           kudu::MetricLevel::kDebug);
+METRIC_DEFINE_gauge_uint64(tablet, last_write_elapsed_time, "Seconds Since Last Write",
+                           kudu::MetricUnit::kSeconds,
+                           "The elapsed time, in seconds, since the last write operation on this "
+                           "tablet, or since this Tablet object was created on current tserver if "
+                           "it hasn't been written to since then.",
+                           kudu::MetricLevel::kDebug);
 
 using kudu::MaintenanceManager;
 using kudu::clock::HybridClock;
@@ -202,7 +213,7 @@ TabletComponents::TabletComponents(shared_ptr<MemRowSet> mrs,
 ////////////////////////////////////////////////////////////
 
 Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
-               scoped_refptr<clock::Clock> clock,
+               clock::Clock* clock,
                shared_ptr<MemTracker> parent_mem_tracker,
                MetricRegistry* metric_registry,
                scoped_refptr<LogAnchorRegistry> log_anchor_registry)
@@ -211,9 +222,11 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
     log_anchor_registry_(std::move(log_anchor_registry)),
     mem_trackers_(tablet_id(), std::move(parent_mem_tracker)),
     next_mrs_id_(0),
-    clock_(std::move(clock)),
+    clock_(clock),
     rowsets_flush_sem_(1),
-    state_(kInitialized) {
+    state_(kInitialized),
+    last_write_time_(MonoTime::Now()),
+    last_read_time_(MonoTime::Now()) {
       CHECK(schema()->has_column_ids());
   compaction_policy_.reset(CreateCompactionPolicy());
 
@@ -226,15 +239,22 @@ Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
     metric_entity_ = METRIC_ENTITY_tablet.Instantiate(metric_registry, tablet_id(), attrs);
     metrics_.reset(new TabletMetrics(metric_entity_));
     METRIC_memrowset_size.InstantiateFunctionGauge(
-      metric_entity_, Bind(&Tablet::MemRowSetSize, Unretained(this)))
-      ->AutoDetach(&metric_detacher_);
+        metric_entity_, [this]() { return this->MemRowSetSize(); })
+        ->AutoDetach(&metric_detacher_);
     METRIC_on_disk_data_size.InstantiateFunctionGauge(
-      metric_entity_, Bind(&Tablet::OnDiskDataSize, Unretained(this)))
-      ->AutoDetach(&metric_detacher_);
+        metric_entity_, [this]() { return this->OnDiskDataSize(); })
+        ->AutoDetach(&metric_detacher_);
     METRIC_num_rowsets_on_disk.InstantiateFunctionGauge(
-      metric_entity_, Bind(&Tablet::num_rowsets, Unretained(this)))
-      ->AutoDetach(&metric_detacher_);
-    METRIC_merged_entities_count_of_tablet.InstantiateHidden(metric_entity_, 1);
+        metric_entity_, [this]() { return this->num_rowsets(); })
+        ->AutoDetach(&metric_detacher_);
+    METRIC_last_read_elapsed_time.InstantiateFunctionGauge(
+        metric_entity_, [this]() { return this->LastReadElapsedSeconds(); },
+        MergeType::kMin)
+        ->AutoDetach(&metric_detacher_);
+    METRIC_last_write_elapsed_time.InstantiateFunctionGauge(
+        metric_entity_, [this]() { return this->LastWriteElapsedSeconds(); },
+        MergeType::kMin)
+        ->AutoDetach(&metric_detacher_);
   }
 
   if (FLAGS_tablet_throttler_rpc_per_sec > 0 || FLAGS_tablet_throttler_bytes_per_sec > 0) {
@@ -358,7 +378,7 @@ void Tablet::Shutdown() {
   // ShutDown(), and need to flush the metadata to indicate that the tablet is deleted.
   // During that flush, we don't want metadata to call back into the Tablet, so we
   // have to unregister the pre-flush callback.
-  metadata_->SetPreFlushCallback(Bind(DoNothingStatusClosure));
+  metadata_->SetPreFlushCallback(&DoNothingStatusClosure);
 }
 
 Status Tablet::GetMappedReadProjection(const Schema& projection,
@@ -511,7 +531,7 @@ void Tablet::AssignTimestampAndStartTransactionForTests(WriteTransactionState* t
 }
 
 void Tablet::StartTransaction(WriteTransactionState* tx_state) {
-  gscoped_ptr<ScopedTransaction> mvcc_tx;
+  unique_ptr<ScopedTransaction> mvcc_tx;
   DCHECK(tx_state->has_timestamp());
   mvcc_tx.reset(new ScopedTransaction(&mvcc_, tx_state->timestamp()));
   tx_state->SetMvccTx(std::move(mvcc_tx));
@@ -537,6 +557,7 @@ bool Tablet::ValidateOpOrMarkFailed(RowOp* op) {
 Status Tablet::ValidateOp(const RowOp& op) {
   switch (op.decoded_op.type) {
     case RowOperationsPB::INSERT:
+    case RowOperationsPB::INSERT_IGNORE:
     case RowOperationsPB::UPSERT:
       return ValidateInsertOrUpsertUnlocked(op);
 
@@ -588,19 +609,27 @@ Status Tablet::InsertOrUpsertUnlocked(const IOContext* io_context,
   DCHECK(op->checked_present);
   DCHECK(op->valid);
 
-  const bool is_upsert = op->decoded_op.type == RowOperationsPB::UPSERT;
+  RowOperationsPB_Type op_type = op->decoded_op.type;
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
 
   if (op->present_in_rowset) {
-    if (is_upsert) {
-      return ApplyUpsertAsUpdate(io_context, tx_state, op, op->present_in_rowset, stats);
+    switch (op_type) {
+      case RowOperationsPB::UPSERT:
+        return ApplyUpsertAsUpdate(io_context, tx_state, op, op->present_in_rowset, stats);
+      case RowOperationsPB::INSERT_IGNORE:
+        op->SetErrorIgnored();
+        return Status::OK();
+      case RowOperationsPB::INSERT: {
+        Status s = Status::AlreadyPresent("key already present");
+        if (metrics_) {
+          metrics_->insertions_failed_dup_key->Increment();
+        }
+        op->SetFailed(s);
+        return s;
+      }
+      default:
+        LOG(FATAL) << "Unknown operation type: " << op_type;
     }
-    Status s = Status::AlreadyPresent("key already present");
-    if (metrics_) {
-      metrics_->insertions_failed_dup_key->Increment();
-    }
-    op->SetFailed(s);
-    return s;
   }
 
   Timestamp ts = tx_state->timestamp();
@@ -616,11 +645,19 @@ Status Tablet::InsertOrUpsertUnlocked(const IOContext* io_context,
     op->SetInsertSucceeded(comps->memrowset->mrs_id());
   } else {
     if (s.IsAlreadyPresent()) {
-      if (is_upsert) {
-        return ApplyUpsertAsUpdate(io_context, tx_state, op, comps->memrowset.get(), stats);
-      }
-      if (metrics_) {
-        metrics_->insertions_failed_dup_key->Increment();
+      switch (op_type) {
+        case RowOperationsPB::UPSERT:
+          return ApplyUpsertAsUpdate(io_context, tx_state, op, comps->memrowset.get(), stats);
+        case RowOperationsPB::INSERT_IGNORE:
+          op->SetErrorIgnored();
+          return Status::OK();
+        case RowOperationsPB::INSERT:
+          if (metrics_) {
+            metrics_->insertions_failed_dup_key->Increment();
+          }
+          break;
+        default:
+          LOG(FATAL) << "Unknown operation type: " << op_type;
       }
     }
     op->SetFailed(s);
@@ -653,7 +690,7 @@ Status Tablet::ApplyUpsertAsUpdate(const IOContext* io_context,
   // were unset (eg because the table only _has_ primary keys, or because
   // the rest are intended to be set to their defaults), we need to
   // avoid doing anything.
-  gscoped_ptr<OperationResultPB> result(new OperationResultPB());
+  unique_ptr<OperationResultPB> result(new OperationResultPB());
   if (enc.is_empty()) {
     upsert->SetMutateSucceeded(std::move(result));
     return Status::OK();
@@ -727,7 +764,7 @@ Status Tablet::MutateRowUnlocked(const IOContext* io_context,
   DCHECK(mutate->checked_present);
   DCHECK(mutate->valid);
 
-  gscoped_ptr<OperationResultPB> result(new OperationResultPB());
+  unique_ptr<OperationResultPB> result(new OperationResultPB());
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
   Timestamp ts = tx_state->timestamp();
 
@@ -916,6 +953,11 @@ Status Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
     DCHECK(row_op->has_result());
   }
 
+  {
+    std::lock_guard<rw_spinlock> l(last_rw_time_lock_);
+    last_write_time_ = MonoTime::Now();
+  }
+
   if (metrics_ && num_ops > 0) {
     metrics_->AddProbeStats(tx_state->mutable_op_stats(0), num_ops, tx_state->arena());
   }
@@ -961,6 +1003,7 @@ Status Tablet::ApplyRowOperation(const IOContext* io_context,
   Status s;
   switch (row_op->decoded_op.type) {
     case RowOperationsPB::INSERT:
+    case RowOperationsPB::INSERT_IGNORE:
     case RowOperationsPB::UPSERT:
       s = InsertOrUpsertUnlocked(io_context, tx_state, row_op, stats);
       if (s.IsAlreadyPresent()) {
@@ -1417,21 +1460,29 @@ void Tablet::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
   }
 
   vector<MaintenanceOp*> maintenance_ops;
-  gscoped_ptr<MaintenanceOp> rs_compact_op(new CompactRowSetsOp(this));
+  unique_ptr<MaintenanceOp> rs_compact_op(new CompactRowSetsOp(this));
   maint_mgr->RegisterOp(rs_compact_op.get());
   maintenance_ops.push_back(rs_compact_op.release());
 
-  gscoped_ptr<MaintenanceOp> minor_delta_compact_op(new MinorDeltaCompactionOp(this));
+  unique_ptr<MaintenanceOp> minor_delta_compact_op(new MinorDeltaCompactionOp(this));
   maint_mgr->RegisterOp(minor_delta_compact_op.get());
   maintenance_ops.push_back(minor_delta_compact_op.release());
 
-  gscoped_ptr<MaintenanceOp> major_delta_compact_op(new MajorDeltaCompactionOp(this));
+  unique_ptr<MaintenanceOp> major_delta_compact_op(new MajorDeltaCompactionOp(this));
   maint_mgr->RegisterOp(major_delta_compact_op.get());
   maintenance_ops.push_back(major_delta_compact_op.release());
 
-  gscoped_ptr<MaintenanceOp> undo_delta_block_gc_op(new UndoDeltaBlockGCOp(this));
+  unique_ptr<MaintenanceOp> undo_delta_block_gc_op(new UndoDeltaBlockGCOp(this));
   maint_mgr->RegisterOp(undo_delta_block_gc_op.get());
   maintenance_ops.push_back(undo_delta_block_gc_op.release());
+
+  // The deleted rowset GC operation relies on live rowset counting. If this
+  // tablet doesn't support such counting, do not register the op.
+  if (metadata_->supports_live_row_count()) {
+    unique_ptr<MaintenanceOp> deleted_rowset_gc_op(new DeletedRowsetGCOp(this));
+    maint_mgr->RegisterOp(deleted_rowset_gc_op.get());
+    maintenance_ops.push_back(deleted_rowset_gc_op.release());
+  }
 
   std::lock_guard<simple_spinlock> l(state_lock_);
   maintenance_ops_.swap(maintenance_ops);
@@ -1537,6 +1588,8 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   {
     TRACE_EVENT0("tablet", "Opening compaction results");
     for (const shared_ptr<RowSetMetadata>& meta : new_drs_metas) {
+      // TODO(awong): it'd be nice to plumb delta stats from the rowset writer
+      // into the new deltafile readers opened here.
       shared_ptr<DiskRowSet> new_rowset;
       Status s = DiskRowSet::Open(meta,
                                   log_anchor_registry_.get(),
@@ -1957,6 +2010,23 @@ size_t Tablet::OnDiskDataSize() const {
   return ret;
 }
 
+uint64_t Tablet::LastReadElapsedSeconds() const {
+  shared_lock<rw_spinlock> l(last_rw_time_lock_);
+  DCHECK(last_read_time_.Initialized());
+  return static_cast<uint64_t>((MonoTime::Now() - last_read_time_).ToSeconds());
+}
+
+void Tablet::UpdateLastReadTime() const {
+  std::lock_guard<rw_spinlock> l(last_rw_time_lock_);
+  last_read_time_ = MonoTime::Now();
+}
+
+uint64_t Tablet::LastWriteElapsedSeconds() const {
+  shared_lock<rw_spinlock> l(last_rw_time_lock_);
+  DCHECK(last_write_time_.Initialized());
+  return static_cast<uint64_t>((MonoTime::Now() - last_write_time_).ToSeconds());
+}
+
 size_t Tablet::DeltaMemStoresSize() const {
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
@@ -2245,6 +2315,87 @@ Status Tablet::InitAncientUndoDeltas(MonoDelta time_budget, int64_t* bytes_in_an
                                     tablet_init_duration.ToString());
 
   if (bytes_in_ancient_undos) *bytes_in_ancient_undos = tablet_bytes_in_ancient_undos;
+  return Status::OK();
+}
+
+Status Tablet::GetBytesInAncientDeletedRowsets(int64_t* bytes_in_ancient_deleted_rowsets) {
+  Timestamp ancient_history_mark;
+  if (!Tablet::GetTabletAncientHistoryMark(&ancient_history_mark)) {
+    VLOG_WITH_PREFIX(1) << "Cannot get ancient history mark. "
+                           "The clock is likely not a hybrid clock";
+    *bytes_in_ancient_deleted_rowsets = 0;
+    return Status::OK();
+  }
+
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+  int64_t bytes = 0;
+  {
+    std::lock_guard<std::mutex> csl(compact_select_lock_);
+    for (const auto& rowset : comps->rowsets->all_rowsets()) {
+      if (!rowset->IsAvailableForCompaction()) {
+        continue;
+      }
+      bool deleted_and_ancient = false;
+      RETURN_NOT_OK(rowset->IsDeletedAndFullyAncient(ancient_history_mark, &deleted_and_ancient));
+      if (deleted_and_ancient) {
+        bytes += rowset->OnDiskSize();
+      }
+    }
+  }
+  metrics_->deleted_rowset_estimated_retained_bytes->set_value(bytes);
+  *bytes_in_ancient_deleted_rowsets = bytes;
+  return Status::OK();
+}
+
+Status Tablet::DeleteAncientDeletedRowsets() {
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
+  const MonoTime start_time = MonoTime::Now();
+  Timestamp ancient_history_mark;
+  if (!Tablet::GetTabletAncientHistoryMark(&ancient_history_mark)) {
+    VLOG_WITH_PREFIX(1) << "Cannot get ancient history mark. "
+                           "The clock is likely not a hybrid clock";
+    return Status::OK();
+  }
+
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+
+  // We'll take our the rowsets' locks to ensure we don't GC the rowsets while
+  // they're being compacted.
+  RowSetVector to_delete;
+  int num_unavailable_for_delete = 0;
+  vector<std::unique_lock<std::mutex>> rowset_locks;
+  int64_t bytes_deleted = 0;
+  {
+    std::lock_guard<std::mutex> csl(compact_select_lock_);
+    for (const auto& rowset : comps->rowsets->all_rowsets()) {
+      // Check if this rowset has been locked by a compaction. If so, we
+      // shouldn't attempt to delete it.
+      if (!rowset->IsAvailableForCompaction()) {
+        num_unavailable_for_delete++;
+        continue;
+      }
+      bool deleted_and_empty = false;
+      RETURN_NOT_OK(rowset->IsDeletedAndFullyAncient(ancient_history_mark, &deleted_and_empty));
+      if (deleted_and_empty) {
+        // If we intend on deleting the rowset, take its lock so concurrent
+        // compactions don't try to select it for compactions.
+        std::unique_lock<std::mutex> l(*rowset->compact_flush_lock(), std::try_to_lock);
+        CHECK(l.owns_lock());
+        to_delete.emplace_back(rowset);
+        rowset_locks.emplace_back(std::move(l));
+        bytes_deleted += rowset->OnDiskSize();
+      }
+    }
+  }
+  if (to_delete.empty()) {
+    return Status::OK();
+  }
+  RETURN_NOT_OK(HandleEmptyCompactionOrFlush(
+      to_delete, TabletMetadata::kNoMrsFlushed));
+  metrics_->deleted_rowset_gc_bytes_deleted->IncrementBy(bytes_deleted);
+  metrics_->deleted_rowset_gc_duration->Increment((MonoTime::Now() - start_time).ToMilliseconds());
   return Status::OK();
 }
 

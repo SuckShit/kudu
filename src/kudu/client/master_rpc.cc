@@ -20,19 +20,18 @@
 #include "kudu/client/master_rpc.h"
 
 #include <algorithm>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <ostream>
 #include <utility>
 
-#include <boost/bind.hpp>
 #include <glog/logging.h>
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.proxy.h"
@@ -43,11 +42,6 @@
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
-
-using std::pair;
-using std::shared_ptr;
-using std::string;
-using std::vector;
 
 using kudu::consensus::RaftPeerPB;
 using kudu::master::ConnectToMasterRequestPB;
@@ -62,6 +56,11 @@ using kudu::rpc::ErrorStatusPB;
 using kudu::rpc::Messenger;
 using kudu::rpc::Rpc;
 using kudu::rpc::RpcController;
+using std::pair;
+using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
@@ -147,15 +146,11 @@ void ConnectToMasterRpc::SendRpc() {
     ConnectToMasterRequestPB req;
     controller->RequireServerFeature(master::MasterFeatures::CONNECT_TO_MASTER);
     proxy.ConnectToMasterAsync(req, out_, controller,
-                               boost::bind(&ConnectToMasterRpc::SendRpcCb,
-                                           this,
-                                           Status::OK()));
+                               [this]() { this->SendRpcCb(Status::OK()); });
   } else {
     GetMasterRegistrationRequestPB req;
     proxy.GetMasterRegistrationAsync(req, &old_rpc_resp_, controller,
-                                     boost::bind(&ConnectToMasterRpc::SendRpcCb,
-                                                 this,
-                                                 Status::OK()));
+                                     [this]() { this->SendRpcCb(Status::OK()); });
   }
 }
 
@@ -171,7 +166,7 @@ void ConnectToMasterRpc::SendRpcCb(const Status& status) {
   // will be Status::OK.
   //
   // TODO(todd): this is the most confusing code I've ever seen...
-  gscoped_ptr<ConnectToMasterRpc> deleter(this);
+  unique_ptr<ConnectToMasterRpc> deleter(this);
   Status new_status = status;
 
   rpc::RpcController* rpc = mutable_retrier()->mutable_controller();
@@ -226,7 +221,7 @@ void ConnectToMasterRpc::SendRpcCb(const Status& status) {
       new_status = StatusFromPB(out_->error().status());
     }
   }
-  user_cb_.Run(new_status);
+  user_cb_(new_status);
 }
 
 } // anonymous namespace
@@ -277,8 +272,9 @@ void ConnectToClusterRpc::SendRpc() {
 
   std::lock_guard<simple_spinlock> l(lock_);
   for (int i = 0; i < addrs_with_names_.size(); i++) {
+    scoped_refptr<ConnectToClusterRpc> self(this);
     ConnectToMasterRpc* rpc = new ConnectToMasterRpc(
-        Bind(&ConnectToClusterRpc::SingleNodeCallback, this, i),
+        [self, i](const Status& s) { self->SingleNodeCallback(i, s); },
         addrs_with_names_[i],
         actual_deadline,
         retrier().messenger(),
@@ -349,9 +345,9 @@ void ConnectToClusterRpc::SingleNodeCallback(int master_idx,
       if (resp.role() != RaftPeerPB::LEADER) {
         string msg;
         if (resp.master_addrs_size() > 0 &&
-            resp.master_addrs_size() != addrs_with_names_.size()) {
+            resp.master_addrs_size() > addrs_with_names_.size()) {
           // If we connected to a non-leader, and it responds that the
-          // number of masters in the cluster don't match the client's
+          // number of masters in the cluster is more than the client's
           // view of the number of masters, then it's likely the client
           // is mis-configured (i.e with a subset of the masters).
           // We'll include that info in the error message.

@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/consensus/log_cache.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -35,14 +39,11 @@
 #include "kudu/consensus/consensus-test-util.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/log.h"
-#include "kudu/consensus/log_cache.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/ref_counted_replicate.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -57,12 +58,14 @@
 using std::atomic;
 using std::shared_ptr;
 using std::thread;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
 DECLARE_int32(log_cache_size_limit_mb);
 DECLARE_int32(global_log_cache_size_limit_mb);
 
+METRIC_DECLARE_entity(server);
 METRIC_DECLARE_entity(tablet);
 
 namespace kudu {
@@ -74,25 +77,29 @@ static const char* kTestTablet = "test-tablet";
 class LogCacheTest : public KuduTest {
  public:
   LogCacheTest()
-    : schema_(GetSimpleTestSchema()),
-      metric_entity_(METRIC_ENTITY_tablet.Instantiate(&metric_registry_, "LogCacheTest")) {
+      : schema_(GetSimpleTestSchema()),
+        metric_entity_server_(METRIC_ENTITY_server.Instantiate(
+            &metric_registry_, "LogCacheTest::server")),
+        metric_entity_tablet_(METRIC_ENTITY_tablet.Instantiate(
+            &metric_registry_, "LogCacheTest::tablet")) {
   }
 
   virtual void SetUp() OVERRIDE {
     KuduTest::SetUp();
-    fs_manager_.reset(new FsManager(env_, GetTestPath("fs_root")));
+    fs_manager_.reset(new FsManager(env_, FsManagerOpts(GetTestPath("fs_root"))));
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
     ASSERT_OK(fs_manager_->Open());
     CHECK_OK(log::Log::Open(log::LogOptions(),
                             fs_manager_.get(),
+                            /*file_cache*/nullptr,
                             kTestTablet,
                             schema_,
                             0, // schema_version
-                            nullptr,
+                            /*metric_entity*/nullptr,
                             &log_));
 
     CloseAndReopenCache(MinimumOpId());
-    clock_.reset(new clock::HybridClock());
+    clock_.reset(new clock::HybridClock(metric_entity_server_));
     ASSERT_OK(clock_->Init());
   }
 
@@ -101,7 +108,7 @@ class LogCacheTest : public KuduTest {
   }
 
   void CloseAndReopenCache(const OpId& preceding_id) {
-    cache_.reset(new LogCache(metric_entity_,
+    cache_.reset(new LogCache(metric_entity_tablet_,
                               log_.get(),
                               kPeerUuid,
                               kTestTablet));
@@ -122,18 +129,19 @@ class LogCacheTest : public KuduTest {
       vector<ReplicateRefPtr> msgs;
       msgs.push_back(make_scoped_refptr_replicate(
                        CreateDummyReplicate(term, index, clock_->Now(), payload_size).release()));
-      RETURN_NOT_OK(cache_->AppendOperations(msgs, Bind(&FatalOnError)));
+      RETURN_NOT_OK(cache_->AppendOperations(msgs, [](const Status& s) { FatalOnError(s); }));
     }
     return Status::OK();
   }
 
   const Schema schema_;
   MetricRegistry metric_registry_;
-  scoped_refptr<MetricEntity> metric_entity_;
-  gscoped_ptr<FsManager> fs_manager_;
-  gscoped_ptr<LogCache> cache_;
+  scoped_refptr<MetricEntity> metric_entity_server_;
+  scoped_refptr<MetricEntity> metric_entity_tablet_;
+  unique_ptr<FsManager> fs_manager_;
+  unique_ptr<LogCache> cache_;
   scoped_refptr<log::Log> log_;
-  scoped_refptr<clock::Clock> clock_;
+  unique_ptr<clock::Clock> clock_;
 };
 
 

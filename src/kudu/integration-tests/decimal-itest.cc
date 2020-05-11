@@ -16,8 +16,8 @@
 // under the License.
 
 #include <cstdint>
+#include <memory>
 #include <string>
-#include <vector>
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -25,19 +25,18 @@
 #include "kudu/client/client.h"
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/value.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/util/decimal_util.h"
 #include "kudu/util/int128.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 
 using std::string;
-using std::vector;
+using std::unique_ptr;
 
 namespace kudu {
 namespace client {
@@ -89,7 +88,7 @@ TEST_F(DecimalItest, TestDecimalTypes) {
   ASSERT_OK(builder.Build(&schema));
 
   // Create Table
-  gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
+  unique_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(kTableName)
       .schema(&schema)
       .num_replicas(kNumServers)
@@ -99,7 +98,7 @@ TEST_F(DecimalItest, TestDecimalTypes) {
   ASSERT_OK(client_->OpenTable(kTableName, &table));
 
   // Alter Default Value
-  gscoped_ptr<client::KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  unique_ptr<client::KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
   table_alterer->AlterColumn("alteredDefault")->Default(KuduValue::FromDecimal(456789, 2));
   ASSERT_OK(table_alterer->Alter());
 

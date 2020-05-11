@@ -15,12 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Require cmake that can build LLVM [1].
+# Require cmake that can work with OpenJDK 10 and newer [1].
 #
 # Note: cmake in thirdparty/ will always meet this minimum.
 #
-# 1. http://llvm.org/releases/3.9.0/docs/ReleaseNotes.html
-cmake_minimum_required(VERSION 3.4.3)
+# 1. https://gitlab.kitware.com/cmake/cmake/issues/17938
+cmake_minimum_required(VERSION 3.11.2)
+
+project(Kudu)
 
 # Prevent builds from the top-level source directory. This ensures that build
 # output is well isolated from the source tree.
@@ -74,7 +76,6 @@ if (SLASH_POS EQUAL -1)
   endfunction()
 endif()
 
-# TODO: can we somehow pass this into the java build?
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/version.txt" KUDU_VERSION_NUMBER)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake_modules")
@@ -82,10 +83,33 @@ include(CMakeParseArguments)
 
 set(BUILD_SUPPORT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build-support)
 set(THIRDPARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty)
+set(THIRDPARTY_TOOLCHAIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/clang-toolchain)
 set(THIRDPARTY_INSTALL_DIR ${THIRDPARTY_DIR}/installed)
 set(THIRDPARTY_INSTALL_COMMON_DIR ${THIRDPARTY_INSTALL_DIR}/common)
 set(THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR ${THIRDPARTY_INSTALL_DIR}/uninstrumented)
 set(THIRDPARTY_INSTALL_TSAN_DIR ${THIRDPARTY_INSTALL_DIR}/tsan)
+
+# Set the Java directory so our C++ tests are able to access its contents.
+# This can be useful to, e.g. spawn a Java subprocess.
+set(JAVA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/java)
+
+# Adds the EXTRA_GRADLE_FLAGS environment variable to a cmake list and calls `separate_arguments`.
+# This solves the problem of escaped spaces in the EXTRA_GRADLE_FLAGS environment variable.
+list(APPEND GRADLE_FLAGS $ENV{EXTRA_GRADLE_FLAGS})
+separate_arguments(GRADLE_FLAGS)
+# We always want Gradle to use the plain console and quiet flag when called from cmake.
+list(APPEND GRADLE_FLAGS --quiet --console=plain)
+list(REMOVE_DUPLICATES GRADLE_FLAGS)
+
+# Initialize Gradle to ensure the wrapper is downloaded.
+# This is important so that multiple calls to Gradle don't try and
+# download the gradle-wrapper.jar at the same time.
+set(GRADLE_WRAPPER_JAR ${JAVA_DIR}/gradle/wrapper/gradle-wrapper.jar)
+add_custom_command(OUTPUT ${GRADLE_WRAPPER_JAR}
+  COMMAND ./gradlew --version ${GRADLE_FLAGS}
+  COMMAND ./gradlew initializeTasks ${GRADLE_FLAGS}
+  WORKING_DIRECTORY "${JAVA_DIR}")
+add_custom_target(init_gradle DEPENDS ${GRADLE_WRAPPER_JAR})
 
 # Allow "make install" to not depend on all targets.
 #
@@ -122,9 +146,16 @@ endif()
 # Compiler flags
 ############################################################
 
+# Determine compiler version
+include(CompilerInfo)
+
+
 # compiler flags that are common across debug/release builds
 #  -msse4.2: Enable sse4.2 compiler intrinsics.
-set(CXX_COMMON_FLAGS "-msse4.2")
+execute_process(COMMAND uname -p OUTPUT_VARIABLE ARCH_NAME)
+if (NOT "${ARCH_NAME}" MATCHES "aarch64")
+  set(CXX_COMMON_FLAGS "-msse4.2")
+endif()
 #  -Wall: Enable all warnings.
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wall")
 #  -Wno-sign-compare: suppress warnings for comparison between signed and unsigned
@@ -182,12 +213,6 @@ set(CXX_FLAGS_DEBUG "-ggdb")
 set(CXX_FLAGS_FASTDEBUG "-ggdb -O1 -fno-omit-frame-pointer")
 set(CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG -fno-omit-frame-pointer")
 
-if (NOT "${KUDU_USE_LTO}" STREQUAL "")
-  set(CXX_FLAGS_RELEASE "${CXX_FLAGS_RELEASE} -flto -fuse-ld=lld")
-  set(CMAKE_AR "llvm-ar")
-  set(CMAKE_RANLIB "llvm-ranlib")
-endif()
-
 set(CXX_FLAGS_PROFILE_GEN "${CXX_FLAGS_RELEASE} -fprofile-generate")
 set(CXX_FLAGS_PROFILE_BUILD "${CXX_FLAGS_RELEASE} -fprofile-use")
 
@@ -224,10 +249,17 @@ endif ()
 # Add common flags
 set(CMAKE_CXX_FLAGS "${CXX_COMMON_FLAGS} ${CMAKE_CXX_FLAGS}")
 
-# Determine compiler version
-include(CompilerInfo)
-
 if ("${COMPILER_FAMILY}" STREQUAL "clang")
+  # Ensure that we don't use old versions of clang. There isn't anything
+  # particularly wrong with those, but no reason to support going back
+  # this far.
+  if ("${COMPILER_VERSION}" VERSION_LESS "6.0")
+    message(FATAL_ERROR "Clang version ${COMPILER_VERSION} too old. "
+      "Consider using the version of clang in ${THIRDPARTY_TOOLCHAIN_DIR}:\n"
+      ""
+      "  CC=${BUILD_SUPPORT_DIR}/ccache-clang/clang CXX=$CC++ cmake <args>")
+  endif()
+
   # Using Clang with ccache causes a bunch of spurious warnings that are
   # purportedly fixed in the next version of ccache. See the following for details:
   #
@@ -317,18 +349,6 @@ if (${KUDU_USE_ASAN})
     message(SEND_ERROR "Cannot use ASAN without clang or gcc >= 4.8")
   endif()
 
-  # If UBSAN is also enabled, and we're on clang < 3.5, ensure static linking is
-  # enabled. Otherwise, we run into https://llvm.org/bugs/show_bug.cgi?id=18211
-  if("${KUDU_USE_UBSAN}" AND
-      "${COMPILER_FAMILY}" STREQUAL "clang" AND
-      "${COMPILER_VERSION}" VERSION_LESS "3.5")
-    if("${KUDU_LINK}" STREQUAL "a")
-      message("Using static linking for ASAN+UBSAN build")
-      set(KUDU_LINK "s")
-    elseif("${KUDU_LINK}" STREQUAL "d")
-      message(SEND_ERROR "Cannot use dynamic linking when ASAN and UBSAN are both enabled")
-    endif()
-  endif()
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -DADDRESS_SANITIZER")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLEAK_SANITIZER")
 endif()
@@ -397,22 +417,35 @@ if (${KUDU_USE_TSAN})
   endif()
 endif()
 
+include("KuduLinker")
+APPEND_LINKER_FLAGS()
 
 if ("${KUDU_USE_ASAN}" OR "${KUDU_USE_TSAN}" OR "${KUDU_USE_UBSAN}")
   # GCC 4.8 and 4.9 (latest as of this writing) don't allow you to specify a
   # sanitizer blacklist.
   if("${COMPILER_FAMILY}" STREQUAL "clang")
-    # Require clang 3.4 or newer; clang 3.3 has issues with TSAN and pthread
-    # symbol interception.
-    if("${COMPILER_VERSION}" VERSION_LESS "3.4")
-      message(SEND_ERROR "Must use clang 3.4 or newer to run a sanitizer build."
-        " Try using clang from thirdparty/")
-    endif()
     add_definitions("-fsanitize-blacklist=${BUILD_SUPPORT_DIR}/sanitize-blacklist.txt")
   else()
     message(WARNING "GCC does not support specifying a sanitizer blacklist. Known sanitizer check failures will not be suppressed.")
   endif()
 endif()
+
+if (KUDU_USE_LTO)
+  if(NOT "${CMAKE_EXE_LINKER_FLAGS}" MATCHES "-fuse-ld=lld" OR
+     NOT "${COMPILER_FAMILY}" STREQUAL "clang")
+    message(FATAL_ERROR "must use clang and lld for LTO build")
+  endif()
+  if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
+    # Doesn't make much sense to do LTO on a non-release build -- it's slow
+    # and the only reason you'd want to do it is high performance.
+    message(FATAL_ERROR "LTO only supported for release builds")
+  endif()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flto=thin")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--thinlto-cache-dir=${CMAKE_CURRENT_BINARY_DIR}/lto.cache")
+  set(CMAKE_AR "${THIRDPARTY_TOOLCHAIN_DIR}/bin/llvm-ar")
+  set(CMAKE_RANLIB "${THIRDPARTY_TOOLCHAIN_DIR}/bin/llvm-ranlib")
+endif()
+
 
 # Code coverage
 if ("${KUDU_GENERATE_COVERAGE}")
@@ -437,93 +470,6 @@ if ("${KUDU_LINK}" STREQUAL "a")
     message("Using static linking for ${CMAKE_BUILD_TYPE} builds")
     set(KUDU_LINK "s")
   endif()
-endif()
-
-# Interrogates the linker version via the C++ compiler to determine whether
-# we're using the gold linker, and if so, extracts its version.
-#
-# If the gold linker is being used, sets GOLD_VERSION in the parent scope with
-# the extracted version.
-#
-# Any additional arguments are passed verbatim into the C++ compiler invocation.
-function(GET_GOLD_VERSION)
-  # The gold linker is only for ELF binaries, which macOS doesn't use.
-  if (APPLE)
-    return()
-  endif()
-
-  execute_process(COMMAND ${CMAKE_CXX_COMPILER} "-Wl,--version" ${ARGN}
-    ERROR_QUIET
-    OUTPUT_VARIABLE LINKER_OUTPUT)
-  # We're expecting LINKER_OUTPUT to look like one of these:
-  #   GNU gold (version 2.24) 1.11
-  #   GNU gold (GNU Binutils for Ubuntu 2.30) 1.15
-  if (LINKER_OUTPUT MATCHES "GNU gold")
-    string(REGEX MATCH "GNU gold \\([^\\)]*\\) (([0-9]+\\.?)+)" _ "${LINKER_OUTPUT}")
-    if (NOT CMAKE_MATCH_1)
-      message(SEND_ERROR "Could not extract GNU gold version. "
-        "Linker version output: ${LINKER_OUTPUT}")
-    endif()
-    set(GOLD_VERSION "${CMAKE_MATCH_1}" PARENT_SCOPE)
-  endif()
-endfunction()
-
-# Is the compiler hard-wired to use the gold linker?
-GET_GOLD_VERSION()
-if (GOLD_VERSION)
-  set(MUST_USE_GOLD 1)
-else()
-  # Can the compiler optionally enable the gold linker?
-  GET_GOLD_VERSION("-fuse-ld=gold")
-
-  # We can't use the gold linker if it's inside devtoolset because the compiler
-  # won't find it when invoked directly from make/ninja (which is typically
-  # done outside devtoolset).
-  execute_process(COMMAND which ld.gold
-    OUTPUT_VARIABLE GOLD_LOCATION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
-  if ("${GOLD_LOCATION}" MATCHES "^/opt/rh/devtoolset")
-    message("Skipping optional gold linker (version ${GOLD_VERSION}) because "
-      "it's in devtoolset")
-    set(GOLD_VERSION)
-  endif()
-endif()
-if (GOLD_VERSION)
-  # Older versions of the gold linker are vulnerable to a bug [1] which
-  # prevents weak symbols from being overridden properly. This leads to
-  # omitting of Kudu's tcmalloc dependency if using dynamic linking.
-  #
-  # How we handle this situation depends on other factors:
-  # - If gold is optional, we won't use it.
-  # - If gold is required and we're using dynamic linking, we'll either:
-  #   - Raise an error in RELEASE builds (we shouldn't release such a product), or
-  #   - Drop tcmalloc in all other builds.
-  #
-  # 1. https://sourceware.org/bugzilla/show_bug.cgi?id=16979.
-  if ("${GOLD_VERSION}" VERSION_LESS "1.12")
-    set(KUDU_BUGGY_GOLD 1)
-  endif()
-  if (MUST_USE_GOLD)
-    message("Using hard-wired gold linker (version ${GOLD_VERSION})")
-    if (KUDU_BUGGY_GOLD AND "${KUDU_LINK}" STREQUAL "d")
-      if ("${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
-        message(SEND_ERROR "Configured to use buggy gold with dynamic linking "
-          "in a RELEASE build; this would cause tcmalloc symbols to get dropped")
-      endif()
-      message("Hard-wired gold linker is buggy, dropping tcmalloc dependency")
-      set(GOLD_INCOMPATIBLE_WITH_TCMALLOC 1)
-    endif()
-  elseif (NOT KUDU_BUGGY_GOLD)
-    # The Gold linker must be manually enabled.
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fuse-ld=gold")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fuse-ld=gold")
-    message("Using optional gold linker (version ${GOLD_VERSION})")
-  else()
-    message("Optional gold linker is buggy, using ld linker instead")
-  endif()
-else()
-  message("Using ld linker")
 endif()
 
 # Having set KUDU_LINK due to build type and/or sanitizer, it's now safe to
@@ -1127,11 +1073,9 @@ endif()
 
 ## Google PerfTools
 ##
-## Disabled with TSAN/ASAN as well as with gold+dynamic linking (see
-## earlier comment).
+## Disabled with TSAN/ASAN.
 if (NOT "${KUDU_USE_ASAN}" AND
-    NOT "${KUDU_USE_TSAN}" AND
-    NOT "${GOLD_INCOMPATIBLE_WITH_TCMALLOC}")
+    NOT "${KUDU_USE_TSAN}")
   find_package(GPerf REQUIRED)
   ADD_THIRDPARTY_LIB(tcmalloc
     STATIC_LIB "${TCMALLOC_STATIC_LIB}"
@@ -1146,6 +1090,11 @@ endif()
 
 ## curl
 find_package(CURL REQUIRED)
+include_directories(SYSTEM ${CURL_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(curl
+  STATIC_LIB "${CURL_STATIC_LIB}"
+  SHARED_LIB "${CURL_SHARED_LIB}"
+  DEPS zlib)
 
 ## crcutil
 find_package(Crcutil REQUIRED)
@@ -1251,7 +1200,7 @@ ADD_THIRDPARTY_LIB(boost_date_time
 # in the libc++ library for some reason.
 if (APPLE)
   get_filename_component(SIZED_DEALLOCATION_TEST_TCMALLOC_LIBDIR
-    ${TCMALLOC_STATIC_LIB} DIRECTORY)
+    "${TCMALLOC_STATIC_LIB}" DIRECTORY)
   execute_process(
     COMMAND printf
       "#include <new>\nint main(){(::operator delete)(0,256);return 0;}\n"
@@ -1264,8 +1213,7 @@ if (APPLE)
   endif()
 else()
   if (KUDU_TCMALLOC_AVAILABLE AND
-      (("${COMPILER_FAMILY}" STREQUAL "clang" AND
-        "${COMPILER_VERSION}" VERSION_GREATER "3.7") OR
+      (("${COMPILER_FAMILY}" STREQUAL "clang") OR
        ("${COMPILER_FAMILY}" STREQUAL "gcc" AND
         "${COMPILER_VERSION}" VERSION_GREATER "5.0")))
     set(COMPILER_SUPPORTS_SIZED_DEALLOCATION TRUE)
@@ -1374,7 +1322,7 @@ endif (UNIX)
 ############################################################
 if (UNIX)
   add_custom_target(generated-headers
-    DEPENDS pb-gen krpc-gen hms_thrift sentry_thrift)
+    DEPENDS pb-gen krpc-gen hms_thrift gen_version_info)
 endif (UNIX)
 
 ############################################################
@@ -1486,10 +1434,11 @@ add_subdirectory(src/kudu/integration-tests)
 add_subdirectory(src/kudu/kserver)
 add_subdirectory(src/kudu/master)
 add_subdirectory(src/kudu/mini-cluster)
+add_subdirectory(src/kudu/postgres)
+add_subdirectory(src/kudu/ranger)
 add_subdirectory(src/kudu/rebalance)
 add_subdirectory(src/kudu/rpc)
 add_subdirectory(src/kudu/security)
-add_subdirectory(src/kudu/sentry)
 add_subdirectory(src/kudu/server)
 add_subdirectory(src/kudu/subprocess)
 add_subdirectory(src/kudu/tablet)

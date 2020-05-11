@@ -14,13 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_COMMON_ROWBLOCK_H
-#define KUDU_COMMON_ROWBLOCK_H
+#pragma once
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <glog/logging.h>
@@ -28,7 +28,6 @@
 #include "kudu/common/columnblock.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/bitmap.h"
@@ -38,6 +37,7 @@ namespace kudu {
 
 class Arena;
 class RowBlockRow;
+class SelectedRows;
 
 // Bit-vector representing the selection status of each row in a row block.
 //
@@ -103,9 +103,10 @@ class SelectionVector {
     return BitmapFindFirstSet(&bitmap_[0], row_offset, n_rows_, row);
   }
 
-  // Sets '*selected' to the indices of all rows marked as selected
-  // in this selection vector.
-  void GetSelectedRows(std::vector<int>* selected) const;
+  // Processes the selection vector to return a SelectedRows object which indicates
+  // the indices of the selected rows. The returned object refers to the memory
+  // of this SelectionVector and must not be retained longer than this instance.
+  SelectedRows GetSelectedRows() const;
 
   uint8_t *mutable_bitmap() {
     return &bitmap_[0];
@@ -178,7 +179,7 @@ class SelectionVector {
   size_t n_rows_;
   size_t n_bytes_;
 
-  gscoped_array<uint8_t> bitmap_;
+  std::unique_ptr<uint8_t[]> bitmap_;
 
   DISALLOW_COPY_AND_ASSIGN(SelectionVector);
 };
@@ -223,6 +224,76 @@ class SelectionVectorView {
   SelectionVector* sel_vec_;
   size_t row_offset_;
 };
+
+// Result type for SelectionVector::GetSelectedRows.
+class SelectedRows {
+ public:
+  bool all_selected() const {
+    return all_selected_;
+  }
+
+  int num_selected() const {
+    return all_selected_ ? sel_vector_->nrows() : indexes_.size();
+  }
+
+  // Get the selected rows.
+  //
+  // NOTE: callers must check all_selected() first, and not use this
+  // function if all rows are selected. 'AsRowIndexes()' may be used instead.
+  const std::vector<uint16_t>& indexes() const {
+    DCHECK(!all_selected_);
+    return indexes_;
+  }
+
+  const uint8_t* bitmap() const {
+    return sel_vector_->bitmap();
+  }
+
+  // Convert this object to a simple vector of row indexes, materializing that
+  // vector in the case that all of the rows are selected.
+  std::vector<uint16_t> ToRowIndexes() && {
+    if (!all_selected_) {
+      return std::move(indexes_);
+    }
+    return CreateRowIndexes();
+  }
+
+  // Call F(index) for each selected index.
+  template<class F>
+  void ForEachIndex(F func) const {
+    if (all_selected_) {
+      int n_sel = num_selected();
+      for (int i = 0; i < n_sel; i++) {
+        func(i);
+      }
+    } else {
+      for (uint16_t i : indexes_) {
+        func(i);
+      }
+    }
+  }
+
+ private:
+  friend class SelectionVector;
+
+  explicit SelectedRows(const SelectionVector* sel_vector)
+      : sel_vector_(sel_vector),
+        all_selected_(true) {
+  }
+  explicit SelectedRows(const SelectionVector* sel_vector,
+                        std::vector<uint16_t> indexes)
+      : sel_vector_(sel_vector),
+        all_selected_(false),
+        indexes_(std::move(indexes)) {
+  }
+
+  std::vector<uint16_t> CreateRowIndexes();
+
+  const SelectionVector* const sel_vector_;
+  const bool all_selected_;
+  std::vector<uint16_t> indexes_;
+};
+
 
 // A block of decoded rows.
 // Wrapper around a buffer, which keeps the buffer's size, associated arena,
@@ -271,7 +342,7 @@ class RowBlock {
 
     const ColumnSchema& col_schema = schema_->column(col_idx);
     uint8_t* col_data = columns_data_[col_idx];
-    uint8_t* nulls_bitmap = column_null_bitmaps_[col_idx];
+    uint8_t* nulls_bitmap = column_non_null_bitmaps_[col_idx];
 
     return ColumnBlock(col_schema.type_info(), nulls_bitmap, col_data, nrows, arena_);
   }
@@ -300,8 +371,8 @@ class RowBlock {
       size_t col_size = col_schema.type_info()->size() * row_capacity_;
       memset(columns_data_[i], '\0', col_size);
 
-      if (column_null_bitmaps_[i] != NULL) {
-        memset(column_null_bitmaps_[i], '\0', bitmap_size);
+      if (column_non_null_bitmaps_[i] != NULL) {
+        memset(column_non_null_bitmaps_[i], '\0', bitmap_size);
       }
     }
   }
@@ -367,7 +438,7 @@ class RowBlock {
 
   const Schema* schema_;
   std::vector<uint8_t*> columns_data_;
-  std::vector<uint8_t*> column_null_bitmaps_;
+  std::vector<uint8_t*> column_non_null_bitmaps_;
 
   // The maximum number of rows that can be stored in our allocated buffer.
   size_t row_capacity_;
@@ -471,5 +542,3 @@ inline RowBlockRow RowBlock::row(size_t idx) const {
 }
 
 } // namespace kudu
-
-#endif

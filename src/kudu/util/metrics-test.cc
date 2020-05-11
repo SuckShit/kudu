@@ -18,6 +18,7 @@
 #include "kudu/util/metrics.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <ostream>
@@ -32,8 +33,6 @@
 #include <gtest/gtest.h>
 #include <rapidjson/document.h>
 
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
@@ -206,6 +205,34 @@ TEST_F(MetricsTest, SimpleMeanGaugeMergeTest) {
   ASSERT_EQ(4, average_usage_for_merge->value());
 }
 
+TEST_F(MetricsTest, TestMeanGaugeJsonPrint) {
+  scoped_refptr<MeanGauge> test_meangauge =
+    METRIC_test_mean_gauge.InstantiateMeanGauge(entity_);
+  const double kTotalSum = 5.0;
+  const double kTotalCount = 2.0;
+  test_meangauge->set_value(kTotalSum, kTotalCount);
+
+  std::ostringstream out;
+  JsonWriter writer(&out, JsonWriter::PRETTY);
+  CHECK_OK(entity_->WriteAsJson(&writer, MetricJsonOptions()));
+
+  JsonReader reader(out.str());
+  ASSERT_OK(reader.Init());
+  vector<const rapidjson::Value*> metrics;
+  ASSERT_OK(reader.ExtractObjectArray(reader.root(), "metrics", &metrics));
+  ASSERT_EQ(1, metrics.size());
+
+  double total_sum;
+  ASSERT_OK(reader.ExtractDouble(metrics[0], "total_sum", &total_sum));
+  double total_count;
+  ASSERT_OK(reader.ExtractDouble(metrics[0], "total_count", &total_count));
+  double value;
+  ASSERT_OK(reader.ExtractDouble(metrics[0], "value", &value));
+  ASSERT_EQ(total_sum, kTotalSum);
+  ASSERT_EQ(total_count, kTotalCount);
+  ASSERT_EQ(value, kTotalSum/kTotalCount);
+}
+
 METRIC_DEFINE_gauge_uint64(test_entity, test_gauge, "Test uint64 Gauge",
                            MetricUnit::kBytes, "Description of Test Gauge",
                            kudu::MetricLevel::kInfo);
@@ -221,11 +248,11 @@ TEST_F(MetricsTest, SimpleAtomicGaugeTest) {
   ASSERT_EQ(5, mem_usage->value());
 }
 
-TEST_F(MetricsTest, SimpleAtomicGaugeMergeTest) {
+TEST_F(MetricsTest, SimpleAtomicGaugeSumTypeMergeTest) {
   scoped_refptr<AtomicGauge<uint64_t> > mem_usage =
-    METRIC_test_gauge.Instantiate(entity_, 2);
+      METRIC_test_gauge.Instantiate(entity_, 2);
   scoped_refptr<AtomicGauge<uint64_t> > mem_usage_for_merge =
-    METRIC_test_gauge.Instantiate(entity_same_attr_, 3);
+      METRIC_test_gauge.Instantiate(entity_same_attr_, 3);
   mem_usage_for_merge->MergeFrom(mem_usage);
   ASSERT_EQ(2, mem_usage->value());
   ASSERT_EQ(5, mem_usage_for_merge->value());
@@ -235,6 +262,38 @@ TEST_F(MetricsTest, SimpleAtomicGaugeMergeTest) {
   ASSERT_EQ(14, mem_usage_for_merge->value());
   mem_usage_for_merge->MergeFrom(mem_usage_for_merge);
   ASSERT_EQ(14, mem_usage_for_merge->value());
+}
+
+TEST_F(MetricsTest, SimpleAtomicGaugeMaxTypeMergeTest) {
+  scoped_refptr<AtomicGauge<uint64_t> > stop_time =
+      METRIC_test_gauge.Instantiate(entity_, 2, MergeType::kMax);
+  scoped_refptr<AtomicGauge<uint64_t> > stop_time_for_merge =
+      METRIC_test_gauge.Instantiate(entity_same_attr_, 3, MergeType::kMax);
+  stop_time_for_merge->MergeFrom(stop_time);
+  ASSERT_EQ(2, stop_time->value());
+  ASSERT_EQ(3, stop_time_for_merge->value());
+  stop_time->IncrementBy(7);
+  stop_time_for_merge->MergeFrom(stop_time);
+  ASSERT_EQ(9, stop_time->value());
+  ASSERT_EQ(9, stop_time_for_merge->value());
+  stop_time_for_merge->MergeFrom(stop_time_for_merge);
+  ASSERT_EQ(9, stop_time_for_merge->value());
+}
+
+TEST_F(MetricsTest, SimpleAtomicGaugeMinTypeMergeTest) {
+  scoped_refptr<AtomicGauge<uint64_t> > start_time =
+      METRIC_test_gauge.Instantiate(entity_, 3, MergeType::kMin);
+  scoped_refptr<AtomicGauge<uint64_t> > start_time_for_merge =
+      METRIC_test_gauge.Instantiate(entity_same_attr_, 5, MergeType::kMin);
+  start_time_for_merge->MergeFrom(start_time);
+  ASSERT_EQ(3, start_time->value());
+  ASSERT_EQ(3, start_time_for_merge->value());
+  start_time->DecrementBy(2);
+  start_time_for_merge->MergeFrom(start_time);
+  ASSERT_EQ(1, start_time->value());
+  ASSERT_EQ(1, start_time_for_merge->value());
+  start_time_for_merge->MergeFrom(start_time_for_merge);
+  ASSERT_EQ(1, start_time_for_merge->value());
 }
 
 METRIC_DEFINE_gauge_int64(test_entity, test_func_gauge, "Test Function Gauge",
@@ -249,7 +308,7 @@ TEST_F(MetricsTest, SimpleFunctionGaugeTest) {
   int metric_val = 1000;
   scoped_refptr<FunctionGauge<int64_t> > gauge =
     METRIC_test_func_gauge.InstantiateFunctionGauge(
-      entity_, Bind(&MyFunction, Unretained(&metric_val)));
+        entity_, [&metric_val]() { return MyFunction(&metric_val); });
 
   ASSERT_EQ(1000, gauge->value());
   ASSERT_EQ(1001, gauge->value());
@@ -270,9 +329,9 @@ METRIC_DEFINE_gauge_int64(test_entity, test_func_gauge_snapshot, "Test Function 
 class FunctionGaugeOwner {
  public:
   explicit FunctionGaugeOwner(const scoped_refptr<MetricEntity>& entity) {
-    METRIC_test_func_gauge_snapshot.InstantiateFunctionGauge(entity,
-       Bind(&FunctionGaugeOwner::Count, Unretained(this)))
-       ->AutoDetach(&metric_detacher_);
+    METRIC_test_func_gauge_snapshot.InstantiateFunctionGauge(
+        entity, [this]() { return this->Count(); })
+        ->AutoDetach(&metric_detacher_);
   }
 
   int64_t Count() {
@@ -318,12 +377,14 @@ TEST_F(MetricsTest, SimpleFunctionGaugeMergeTest) {
   int metric_val = 1000;
   scoped_refptr<FunctionGauge<int64_t> > gauge =
     METRIC_test_func_gauge.InstantiateFunctionGauge(
-      entity_, Bind(&MyFunction, Unretained(&metric_val)));
+        entity_, [&metric_val]() { return MyFunction(&metric_val); });
 
   int metric_val_for_merge = 1234;
   scoped_refptr<FunctionGauge<int64_t> > gauge_for_merge =
     METRIC_test_func_gauge.InstantiateFunctionGauge(
-      entity_same_attr_, Bind(&MyFunction, Unretained(&metric_val_for_merge)));
+        entity_same_attr_, [&metric_val_for_merge]() {
+          return MyFunction(&metric_val_for_merge);
+        });
 
   gauge_for_merge->MergeFrom(gauge);
   ASSERT_EQ(1001, gauge->value());
@@ -341,7 +402,7 @@ TEST_F(MetricsTest, AutoDetachToLastValue) {
   int metric_val = 1000;
   scoped_refptr<FunctionGauge<int64_t> > gauge =
     METRIC_test_func_gauge.InstantiateFunctionGauge(
-        entity_, Bind(&MyFunction, Unretained(&metric_val)));
+        entity_, [&metric_val]() { return MyFunction(&metric_val); });
 
   ASSERT_EQ(1000, gauge->value());
   ASSERT_EQ(1001, gauge->value());
@@ -360,7 +421,7 @@ TEST_F(MetricsTest, AutoDetachToConstant) {
   int metric_val = 1000;
   scoped_refptr<FunctionGauge<int64_t> > gauge =
     METRIC_test_func_gauge.InstantiateFunctionGauge(
-        entity_, Bind(&MyFunction, Unretained(&metric_val)));
+        entity_, [&metric_val]() { return MyFunction(&metric_val); });
 
   ASSERT_EQ(1000, gauge->value());
   ASSERT_EQ(1001, gauge->value());
@@ -783,7 +844,7 @@ TEST_F(MetricsTest, TestDontDumpUntouched) {
   scoped_refptr<Histogram> hist = METRIC_test_hist.Instantiate(entity_);
   scoped_refptr<FunctionGauge<int64_t> > function_gauge =
     METRIC_test_func_gauge.InstantiateFunctionGauge(
-        entity_, Bind(&MyFunction, Unretained(&metric_val)));
+        entity_, [&metric_val]() { return MyFunction(&metric_val); });
   scoped_refptr<AtomicGauge<uint64_t> > atomic_gauge =
     METRIC_test_gauge.Instantiate(entity_, 0);
 

@@ -14,13 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#pragma once
 
-#ifndef KUDU_CONSENSUS_CONSENSUS_QUEUE_H_
-#define KUDU_CONSENSUS_CONSENSUS_QUEUE_H_
-
+#include <atomic>
 #include <cstdint>
 #include <functional>
-#include <iosfwd>
+#include <ostream>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -34,7 +33,6 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/ref_counted_replicate.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/threading/thread_collision_warner.h"
 #include "kudu/util/locks.h"
@@ -59,8 +57,8 @@ class ConsensusRequestPB;
 class ConsensusResponsePB;
 class ConsensusStatusPB;
 class PeerMessageQueueObserver;
-class TimeManager;
 class StartTabletCopyRequestPB;
+class TimeManager;
 
 // The id for the server-wide consensus queue MemTracker.
 extern const char kConsensusQueueParentTrackerId[];
@@ -126,7 +124,7 @@ class PeerMessageQueue {
     // Check that the terms seen from a given peer only increase
     // monotonically.
     void CheckMonotonicTerms(int64_t term) {
-      DCHECK_GE(term, last_seen_term_);
+      DCHECK_GE(term, last_seen_term_) << "peer info: " << ToString();
       last_seen_term_ = term;
     }
 
@@ -168,6 +166,10 @@ class PeerMessageQueue {
     // the local peer's WAL.
     bool wal_catchup_possible;
 
+    // Whether the peer's server is quiescing, which dictates whether the peer
+    // is a candidate for leadership successor.
+    bool remote_server_quiescing;
+
     // The peer's latest overall health status.
     HealthReportPB::HealthStatus last_overall_health_status;
 
@@ -184,10 +186,11 @@ class PeerMessageQueue {
 
   PeerMessageQueue(const scoped_refptr<MetricEntity>& metric_entity,
                    scoped_refptr<log::Log> log,
-                   scoped_refptr<TimeManager> time_manager,
+                   TimeManager* time_manager,
                    RaftPeerPB local_peer_pb,
                    std::string tablet_id,
                    std::unique_ptr<ThreadPoolToken> raft_pool_observers_token,
+                   const std::atomic<bool>* server_quiescing,
                    OpId last_locally_replicated,
                    const OpId& last_locally_committed);
 
@@ -434,7 +437,7 @@ class PeerMessageQueue {
     Mode mode;
 
     // The currently-active raft config. Only set if in LEADER mode.
-    gscoped_ptr<RaftConfigPB> active_config;
+    std::unique_ptr<RaftConfigPB> active_config;
 
     std::string ToString() const;
   };
@@ -547,6 +550,10 @@ class PeerMessageQueue {
   // The pool token which executes observer notifications.
   std::unique_ptr<ThreadPoolToken> raft_pool_observers_token_;
 
+  // Shared boolean that indicates whether the server is quiescing, in which
+  // case leadership should be transferred away from this peer.
+  const std::atomic<bool>* server_quiescing_;
+
   // PB containing identifying information about the local peer.
   const RaftPeerPB local_peer_pb_;
 
@@ -571,7 +578,7 @@ class PeerMessageQueue {
 
   Metrics metrics_;
 
-  scoped_refptr<TimeManager> time_manager_;
+  TimeManager* time_manager_;
 };
 
 // The interface between RaftConsensus and the PeerMessageQueue.
@@ -606,5 +613,3 @@ class PeerMessageQueueObserver {
 
 }  // namespace consensus
 }  // namespace kudu
-
-#endif /* KUDU_CONSENSUS_CONSENSUS_QUEUE_H_ */

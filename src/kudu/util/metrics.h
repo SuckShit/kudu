@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_UTIL_METRICS_H
-#define KUDU_UTIL_METRICS_H
+#pragma once
 
 /////////////////////////////////////////////////////
 // Kudu Metrics
@@ -226,24 +225,26 @@
 //
 /////////////////////////////////////////////////////
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/callback.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
@@ -279,7 +280,7 @@
   ::kudu::GaugePrototype<std::string> METRIC_##name(                 \
       ::kudu::MetricPrototype::CtorArgs(#entity, #name, label, unit, desc, level, ## __VA_ARGS__))
 #define METRIC_DEFINE_gauge_bool(entity, name, label, unit, desc, level, ...) \
-  ::kudu::GaugePrototype<bool> METRIC_##  name(                    \
+  ::kudu::GaugePrototype<bool> METRIC_##name(                    \
       ::kudu::MetricPrototype::CtorArgs(#entity, #name, label, unit, desc, level, ## __VA_ARGS__))
 #define METRIC_DEFINE_gauge_int32(entity, name, label, unit, desc, level, ...) \
   ::kudu::GaugePrototype<int32_t> METRIC_##name(                   \
@@ -296,7 +297,9 @@
 #define METRIC_DEFINE_gauge_double(entity, name, label, unit, desc, level, ...) \
   ::kudu::GaugePrototype<double> METRIC_##name(                      \
       ::kudu::MetricPrototype::CtorArgs(#entity, #name, label, unit, desc, level, ## __VA_ARGS__))
-
+#define METRIC_DEFINE_gauge_size(entity, name, label, unit, desc, level, ...) \
+  ::kudu::GaugePrototype<size_t> METRIC_##name(                    \
+      ::kudu::MetricPrototype::CtorArgs(#entity, #name, label, unit, desc, level, ## __VA_ARGS__))
 #define METRIC_DEFINE_histogram(entity, name, label, unit, desc, level, max_val, num_sig_digits) \
   ::kudu::HistogramPrototype METRIC_##name(                                       \
       ::kudu::MetricPrototype::CtorArgs(#entity, #name, label, unit, desc, level), \
@@ -321,19 +324,10 @@
   extern ::kudu::GaugePrototype<uint64_t> METRIC_##name
 #define METRIC_DECLARE_gauge_double(name) \
   extern ::kudu::GaugePrototype<double> METRIC_##name
-#define METRIC_DECLARE_histogram(name) \
-  extern ::kudu::HistogramPrototype METRIC_##name
-
-#if defined(__APPLE__)
-#define METRIC_DEFINE_gauge_size(entity, name, label, unit, desc, level, ...) \
-  ::kudu::GaugePrototype<size_t> METRIC_##name(                    \
-      ::kudu::MetricPrototype::CtorArgs(#entity, #name, label, unit, desc, level, ## __VA_ARGS__))
 #define METRIC_DECLARE_gauge_size(name) \
   extern ::kudu::GaugePrototype<size_t> METRIC_##name
-#else
-#define METRIC_DEFINE_gauge_size METRIC_DEFINE_gauge_uint64
-#define METRIC_DECLARE_gauge_size METRIC_DECLARE_gauge_uint64
-#endif
+#define METRIC_DECLARE_histogram(name) \
+  extern ::kudu::HistogramPrototype METRIC_##name
 
 template <typename Type> class Singleton;
 
@@ -349,8 +343,6 @@ class Metric;
 class MetricEntity;
 class MetricEntityPrototype;
 class MetricRegistry;
-template <typename Sig>
-class Callback;
 template<typename T>
 class AtomicGauge;
 template<typename T>
@@ -428,6 +420,17 @@ enum class MetricLevel {
   kDebug = 0,
   kInfo = 1,
   kWarn = 2
+};
+
+// Type of behavior when two metrics merge together, it only take effect on the result
+// of MergeFrom.
+enum class MergeType {
+  // Set the result as the sum of the two metrics.
+  kSum = 0,
+  // Set the result as the maximum one of the two metrics.
+  kMax = 1,
+  // Set the result as the minimum one of the two metrics.
+  kMin = 2
 };
 
 struct MetricFilters {
@@ -643,13 +646,15 @@ class MetricEntity : public RefCountedThreadSafe<MetricEntity> {
 
   template<typename T>
   scoped_refptr<AtomicGauge<T> > FindOrCreateGauge(const GaugePrototype<T>* proto,
-                                                   const T& initial_value);
+                                                   const T& initial_value,
+                                                   MergeType type = MergeType::kSum);
 
   scoped_refptr<MeanGauge> FindOrCreateMeanGauge(const GaugePrototype<double>* proto);
 
   template<typename T>
-  scoped_refptr<FunctionGauge<T> > FindOrCreateFunctionGauge(const GaugePrototype<T>* proto,
-                                                             const Callback<T()>& function);
+  scoped_refptr<FunctionGauge<T>> FindOrCreateFunctionGauge(const GaugePrototype<T>* proto,
+                                                            std::function<T()> function,
+                                                            MergeType type = MergeType::kSum);
 
   // Return the metric instantiated from the given prototype, or NULL if none has been
   // instantiated. Primarily used by tests trying to read metric values.
@@ -949,8 +954,8 @@ class GaugePrototype : public MetricPrototype {
   // Instantiate a "manual" gauge.
   scoped_refptr<AtomicGauge<T> > Instantiate(
       const scoped_refptr<MetricEntity>& entity,
-      const T& initial_value) const {
-    return entity->FindOrCreateGauge(this, initial_value);
+      const T& initial_value, MergeType type = MergeType::kSum) const {
+    return entity->FindOrCreateGauge(this, initial_value, type);
   }
 
   scoped_refptr<MeanGauge> InstantiateMeanGauge(
@@ -961,16 +966,18 @@ class GaugePrototype : public MetricPrototype {
   // Instantiate a gauge that is backed by the given callback.
   scoped_refptr<FunctionGauge<T> > InstantiateFunctionGauge(
       const scoped_refptr<MetricEntity>& entity,
-      const Callback<T()>& function) const {
-    return entity->FindOrCreateFunctionGauge(this, function);
+      std::function<T()> function,
+      MergeType type = MergeType::kSum) const {
+    return entity->FindOrCreateFunctionGauge(this, std::move(function), type);
   }
 
   // Instantiate a "manual" gauge and hide it. It will appear
   // when its value is updated, or when its entity is merged.
   scoped_refptr<AtomicGauge<T> > InstantiateHidden(
       const scoped_refptr<MetricEntity>& entity,
-      const T& initial_value) const {
-    auto gauge = Instantiate(entity, initial_value);
+      const T& initial_value,
+      MergeType type = MergeType::kSum) const {
+    auto gauge = Instantiate(entity, initial_value, type);
     gauge->InvalidateEpoch();
     return gauge;
   }
@@ -979,8 +986,9 @@ class GaugePrototype : public MetricPrototype {
   // invalidate the result when merge with other metric.
   scoped_refptr<AtomicGauge<T> > InstantiateInvalid(
       const scoped_refptr<MetricEntity>& entity,
-      const T& initial_value) const {
-    auto gauge = InstantiateHidden(entity, initial_value);
+      const T& initial_value,
+      MergeType type = MergeType::kSum) const {
+    auto gauge = InstantiateHidden(entity, initial_value, type);
     gauge->InvalidateForMerge();
     return gauge;
   }
@@ -1071,12 +1079,13 @@ class MeanGauge : public Gauge {
 template <typename T>
 class AtomicGauge : public Gauge {
  public:
-  AtomicGauge(const GaugePrototype<T>* proto, T initial_value)
+  AtomicGauge(const GaugePrototype<T>* proto, T initial_value, MergeType type)
     : Gauge(proto),
-      value_(initial_value) {
+      value_(initial_value),
+      type_(type) {
   }
   scoped_refptr<Metric> snapshot() const override {
-    auto p = new AtomicGauge(down_cast<const GaugePrototype<T>*>(prototype_), value());
+    auto p = new AtomicGauge(down_cast<const GaugePrototype<T>*>(prototype_), value(), type_);
     p->m_epoch_.store(m_epoch_);
     p->invalid_for_merge_ = invalid_for_merge_;
     p->retire_time_ = retire_time_;
@@ -1085,14 +1094,15 @@ class AtomicGauge : public Gauge {
   T value() const {
     return static_cast<T>(value_.Load(kMemOrderRelease));
   }
-  virtual void set_value(const T& value) {
+  void set_value(const T& value) {
+    UpdateModificationEpoch();
     value_.Store(static_cast<int64_t>(value), kMemOrderNoBarrier);
   }
   void Increment() {
     UpdateModificationEpoch();
     value_.IncrementBy(1, kMemOrderNoBarrier);
   }
-  virtual void IncrementBy(int64_t amount) {
+  void IncrementBy(int64_t amount) {
     UpdateModificationEpoch();
     value_.IncrementBy(amount, kMemOrderNoBarrier);
   }
@@ -1114,14 +1124,29 @@ class AtomicGauge : public Gauge {
       return;
     }
 
-    IncrementBy(down_cast<AtomicGauge<T>*>(other.get())->value());
+    auto other_value = down_cast<AtomicGauge<T>*>(other.get())->value();
+    switch (type_) {
+      case MergeType::kSum:
+        IncrementBy(other_value);
+        break;
+      case MergeType::kMax:
+        set_value(std::max(value(), other_value));
+        break;
+      case MergeType::kMin:
+        set_value(std::min(value(), other_value));
+        break;
+      default:
+        LOG(FATAL) << "Unknown AtomicGauge type: " << prototype()->name();
+    }
   }
  protected:
   virtual void WriteValue(JsonWriter* writer) const OVERRIDE {
     writer->Value(value());
   }
-  AtomicInt<int64_t> value_;
  private:
+  AtomicInt<int64_t> value_;
+  MergeType type_;
+
   DISALLOW_COPY_AND_ASSIGN(AtomicGauge);
 };
 
@@ -1144,7 +1169,7 @@ class AtomicGauge : public Gauge {
 //  public:
 //   MyClassWithMetrics(const scoped_refptr<MetricEntity>& entity) {
 //     METRIC_my_metric.InstantiateFunctionGauge(entity,
-//       Bind(&MyClassWithMetrics::ComputeMyMetric, Unretained(this)))
+//       [this]() { return this->ComputeMyMetric(); })
 //       ->AutoDetach(&metric_detacher_);
 //   }
 //   ~MyClassWithMetrics() {
@@ -1165,11 +1190,11 @@ class FunctionGaugeDetacher {
   template<typename T>
   friend class FunctionGauge;
 
-  void OnDestructor(const Closure& c) {
-    callbacks_.push_back(c);
+  void OnDestructor(std::function<void()> f) {
+    functions_.emplace_back(std::move(f));
   }
 
-  std::vector<Closure> callbacks_;
+  std::vector<std::function<void()>> functions_;
 
   DISALLOW_COPY_AND_ASSIGN(FunctionGaugeDetacher);
 };
@@ -1190,7 +1215,7 @@ class FunctionGauge : public Gauge {
  public:
   scoped_refptr<Metric> snapshot() const override {
     auto p = new FunctionGauge(down_cast<const GaugePrototype<T>*>(prototype_),
-                               Callback<T()>(function_));
+                               function_, type_);
     // The bounded function is associated with another MetricEntity instance, here we don't know
     // when it release, it's not safe to keep the function as a member, so it's needed to
     // call DetachToCurrentValue() to make it safe.
@@ -1203,7 +1228,7 @@ class FunctionGauge : public Gauge {
 
   T value() const {
     std::lock_guard<simple_spinlock> l(lock_);
-    return function_.Run();
+    return function_();
   }
 
   virtual void WriteValue(JsonWriter* writer) const OVERRIDE {
@@ -1215,7 +1240,7 @@ class FunctionGauge : public Gauge {
   // Gauge, use a normal Gauge instead of a FunctionGauge.
   void DetachToConstant(T v) {
     std::lock_guard<simple_spinlock> l(lock_);
-    function_ = Bind(&FunctionGauge::Return, v);
+    function_ = [v]() { return v; };
   }
 
   // Get the current value of the gauge, and detach so that it continues to return this
@@ -1228,8 +1253,8 @@ class FunctionGauge : public Gauge {
   // Automatically detach this gauge when the given 'detacher' destructs.
   // After detaching, the metric will return 'value' in perpetuity.
   void AutoDetach(FunctionGaugeDetacher* detacher, T value = T()) {
-    detacher->OnDestructor(Bind(&FunctionGauge<T>::DetachToConstant,
-                                this, value));
+    scoped_refptr<FunctionGauge<T>> self(this);
+    detacher->OnDestructor([self, value]() { self->DetachToConstant(value); });
   }
 
   // Automatically detach this gauge when the given 'detacher' destructs.
@@ -1242,8 +1267,8 @@ class FunctionGauge : public Gauge {
   // should declare the detacher member after all other class members that might be
   // accessed by the gauge function implementation.
   void AutoDetachToLastValue(FunctionGaugeDetacher* detacher) {
-    detacher->OnDestructor(Bind(&FunctionGauge<T>::DetachToCurrentValue,
-                                this));
+    scoped_refptr<FunctionGauge<T>> self(this);
+    detacher->OnDestructor([self]() { self->DetachToCurrentValue(); });
   }
 
   virtual bool IsUntouched() const override {
@@ -1256,27 +1281,42 @@ class FunctionGauge : public Gauge {
       return;
     }
 
+    if (InvalidateIfNeededInMerge(other)) {
+      return;
+    }
+
     // It's not needed to check whether a FunctionGauge is InvalidateIfNeededInMerge
     // or not, because it's always 'touched' after constructing.
-    DetachToConstant(value() + down_cast<FunctionGauge<T>*>(other.get())->value());
+    auto other_value = down_cast<FunctionGauge<T>*>(other.get())->value();
+    switch (type_) {
+      case MergeType::kSum:
+        DetachToConstant(value() + other_value);
+        break;
+      case MergeType::kMax:
+        DetachToConstant(std::max(value(), other_value));
+        break;
+      case MergeType::kMin:
+        DetachToConstant(std::min(value(), other_value));
+        break;
+      default:
+        LOG(FATAL) << "Unknown FunctionGauge type: " << prototype()->name();
+    }
   }
 
  private:
   friend class MetricEntity;
 
-  FunctionGauge(const GaugePrototype<T>* proto, Callback<T()> function)
-      : Gauge(proto), function_(std::move(function)) {
+  FunctionGauge(const GaugePrototype<T>* proto, std::function<T()> function, MergeType type)
+      : Gauge(proto), function_(std::move(function)), type_(type) {
     // Override the modification epoch to the maximum, since we don't have any idea
     // when the bound function changes value.
     m_epoch_ = std::numeric_limits<decltype(m_epoch_.load())>::max();
   }
 
-  static T Return(T v) {
-    return v;
-  }
-
   mutable simple_spinlock lock_;
-  Callback<T()> function_;
+  std::function<T()> function_;
+  MergeType type_;
+
   DISALLOW_COPY_AND_ASSIGN(FunctionGauge);
 };
 
@@ -1420,7 +1460,7 @@ class Histogram : public Metric {
   explicit Histogram(const HistogramPrototype* proto);
   Histogram(const HistogramPrototype* proto, const HdrHistogram& hdr_hist);
 
-  const gscoped_ptr<HdrHistogram> histogram_;
+  const std::unique_ptr<HdrHistogram> histogram_;
   DISALLOW_COPY_AND_ASSIGN(Histogram);
 };
 
@@ -1472,13 +1512,14 @@ inline scoped_refptr<Histogram> MetricEntity::FindOrCreateHistogram(
 template<typename T>
 inline scoped_refptr<AtomicGauge<T> > MetricEntity::FindOrCreateGauge(
     const GaugePrototype<T>* proto,
-    const T& initial_value) {
+    const T& initial_value,
+    MergeType type) {
   CheckInstantiation(proto);
   std::lock_guard<simple_spinlock> l(lock_);
   scoped_refptr<AtomicGauge<T> > m = down_cast<AtomicGauge<T>*>(
       FindPtrOrNull(metric_map_, proto).get());
   if (!m) {
-    m = new AtomicGauge<T>(proto, initial_value);
+    m = new AtomicGauge<T>(proto, initial_value, type);
     InsertOrDie(&metric_map_, proto, m);
   }
   return m;
@@ -1500,18 +1541,17 @@ inline scoped_refptr<MeanGauge> MetricEntity::FindOrCreateMeanGauge(
 template<typename T>
 inline scoped_refptr<FunctionGauge<T> > MetricEntity::FindOrCreateFunctionGauge(
     const GaugePrototype<T>* proto,
-    const Callback<T()>& function) {
+    std::function<T()> function,
+    MergeType type) {
   CheckInstantiation(proto);
   std::lock_guard<simple_spinlock> l(lock_);
   scoped_refptr<FunctionGauge<T> > m = down_cast<FunctionGauge<T>*>(
       FindPtrOrNull(metric_map_, proto).get());
   if (!m) {
-    m = new FunctionGauge<T>(proto, function);
+    m = new FunctionGauge<T>(proto, std::move(function), type);
     InsertOrDie(&metric_map_, proto, m);
   }
   return m;
 }
 
 } // namespace kudu
-
-#endif // KUDU_UTIL_METRICS_H

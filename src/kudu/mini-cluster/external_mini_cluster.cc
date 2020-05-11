@@ -25,11 +25,11 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
@@ -47,12 +47,12 @@
 #include "kudu/hms/mini_hms.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/ranger/mini_ranger.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/test/mini_kdc.h"
-#include "kudu/sentry/mini_sentry.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -117,12 +117,13 @@ ExternalMiniClusterOptions::ExternalMiniClusterOptions()
       num_data_dirs(1),
       enable_kerberos(false),
       hms_mode(HmsMode::NONE),
-      enable_sentry(false),
+      enable_ranger(false),
       logtostderr(true),
       start_process_timeout(MonoDelta::FromSeconds(70)),
       rpc_negotiation_timeout(MonoDelta::FromSeconds(3))
 #if !defined(NO_CHRONY)
       , num_ntp_servers(1)
+      , ntp_config_mode(BuiltinNtpConfigMode::ALL_SERVERS)
 #endif // #if !defined(NO_CHRONY) ...
 {
 }
@@ -167,19 +168,31 @@ Status ExternalMiniCluster::HandleOptions() {
   return Status::OK();
 }
 
-Status ExternalMiniCluster::AddTimeSourceFlags(std::vector<std::string>* flags) {
+Status ExternalMiniCluster::AddTimeSourceFlags(
+    int idx, std::vector<std::string>* flags) {
+  DCHECK_LE(0, idx);
   DCHECK(flags);
 #if defined(NO_CHRONY)
   flags->emplace_back("--time_source=system_unsync");
 #else
-  if (opts_.num_ntp_servers > 0) {
+  CHECK_LE(0, opts_.num_ntp_servers);
+  if (opts_.num_ntp_servers == 0) {
+    flags->emplace_back("--time_source=system_unsync");
+  } else {
     vector<string> ntp_endpoints;
     CHECK_EQ(opts_.num_ntp_servers, ntp_servers_.size());
-    for (const auto& server : ntp_servers_) {
-      ntp_endpoints.emplace_back(server->address().ToString());
+    // Point the built-in NTP client to the test NTP servers.
+    switch (opts_.ntp_config_mode) {
+      case BuiltinNtpConfigMode::ALL_SERVERS:
+        for (const auto& server : ntp_servers_) {
+          ntp_endpoints.emplace_back(server->address().ToString());
+        }
+        break;
+      case BuiltinNtpConfigMode::ROUND_ROBIN_SINGLE_SERVER:
+        ntp_endpoints.emplace_back(
+            ntp_servers_[idx % opts_.num_ntp_servers]->address().ToString());
+        break;
     }
-    // Point the built-in NTP client to the test NTP server running as a part
-    // of the cluster.
     flags->emplace_back(Substitute("--builtin_ntp_servers=$0",
                                    JoinStrings(ntp_endpoints, ",")));
     // The chronyd server supports very short polling interval: let's use this
@@ -192,35 +205,9 @@ Status ExternalMiniCluster::AddTimeSourceFlags(std::vector<std::string>* flags) 
     // Switch the clock to use the built-in NTP client which clock is
     // synchronized with the test NTP server.
     flags->emplace_back("--time_source=builtin");
-  } else {
-    flags->emplace_back("--time_source=system_unsync");
   }
 #endif // #if defined(NO_CHRONY) ... else ...
   return Status::OK();
-}
-
-Status ExternalMiniCluster::StartSentry() {
-  sentry_->SetDataRoot(opts_.cluster_root);
-
-  if (hms_) {
-    sentry_->EnableHms(hms_->uris());
-  }
-
-  if (opts_.enable_kerberos) {
-    string spn = Substitute("sentry/$0", sentry_->address().host());
-    string ktpath;
-    RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(spn, &ktpath),
-                          "could not create keytab");
-    sentry_->EnableKerberos(kdc_->GetEnvVars()["KRB5_CONFIG"],
-                            Substitute("$0@KRBTEST.COM", spn),
-                            ktpath);
-  }
-
-  return sentry_->Start();
-}
-
-Status ExternalMiniCluster::StopSentry() {
-  return sentry_->Stop();
 }
 
 Status ExternalMiniCluster::Start() {
@@ -289,36 +276,38 @@ Status ExternalMiniCluster::Start() {
   }
 #endif // #if !defined(NO_CHRONY) ...
 
-  // Start the Sentry service and the HMS in the following steps, in order
-  // to deal with the circular dependency in terms of configuring each
-  // with the other's IP/port.
-  // 1. Pick a bind IP using UNIQUE_LOOPBACK mode for the Sentry service.
-  //    Statically choose a random port. Since the Sentry service will
-  //    live on its own IP address, there's no danger of collision.
-  // 2. Start the HMS, configured to talk to the Sentry service. Find out
-  //    which port it's on.
-  // 3. Start the Sentry service with the chosen address/port from step 1.
-  //
-  // We can also pick a random port for the HMS in step 2, however, due to
-  // HIVE-18998 (which is addressed in Hive 4.0.0 by HIVE-20794), this is not
-  // an option.
-  // TODO(hao): Pick a static port for the HMS to bind to when we move to Hive 4.
-  //
-  // Note that when UNIQUE_LOOPBACK mode is not supported (i.e. on macOS),
-  // we cannot choose a port at random as that can cause a port collision.
-  // In that case, we start the Sentry service with the picked IP address
-  // and port 0 in step 1. Find out which port it's on by polling lsof.
-  // In step 3, restart the Sentry service and reconfigure it to talk to
-  // the HMS's port.
-
-  if (opts_.enable_sentry) {
-    sentry_.reset(new sentry::MiniSentry());
+  if (opts_.enable_ranger) {
     string host = GetBindIpForExternalServer(0);
-    uint16_t port = opts_.bind_mode == BindMode::UNIQUE_LOOPBACK ? 10000 : 0;
-    sentry_->SetAddress(HostPort(host, port));
-    if (opts_.bind_mode != BindMode::UNIQUE_LOOPBACK) {
-      RETURN_NOT_OK_PREPEND(StartSentry(), "Failed to start the Sentry service");
+    ranger_.reset(new ranger::MiniRanger(cluster_root(), host));
+    if (opts_.enable_kerberos) {
+
+      // The SPNs match the ones defined in mini_ranger_configs.h.
+      string admin_keytab;
+      RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(
+            Substitute("rangeradmin/$0@KRBTEST.COM", host),
+            &admin_keytab),
+          "could not create rangeradmin keytab");
+
+      string lookup_keytab;
+      RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(
+            Substitute("rangerlookup/$0@KRBTEST.COM", host),
+            &lookup_keytab),
+          "could not create rangerlookup keytab");
+
+      string spnego_keytab;
+      RETURN_NOT_OK_PREPEND(kdc_->CreateServiceKeytab(
+            Substitute("HTTP/$0@KRBTEST.COM", host),
+            &spnego_keytab),
+          "could not create ranger HTTP keytab");
+
+      ranger_->EnableKerberos(kdc_->GetEnvVars()["KRB5_CONFIG"], admin_keytab,
+                              lookup_keytab, spnego_keytab);
     }
+
+    RETURN_NOT_OK_PREPEND(ranger_->Start(), "Failed to start the Ranger service");
+    RETURN_NOT_OK_PREPEND(ranger_->CreateClientConfig(JoinPathSegments(cluster_root(),
+                                                                       "ranger-client")),
+                          "Failed to write Ranger client config");
   }
 
   // Start the HMS.
@@ -341,23 +330,8 @@ Status ExternalMiniCluster::Start() {
                            rpc::SaslProtection::kAuthentication);
     }
 
-    if (opts_.enable_sentry) {
-      string sentry_spn = Substitute("sentry/$0@KRBTEST.COM", sentry_->address().host());
-      hms_->EnableSentry(sentry_->address(), sentry_spn);
-    }
-
     RETURN_NOT_OK_PREPEND(hms_->Start(),
                           "Failed to start the Hive Metastore");
-
-    // (Re)start Sentry with the HMS address.
-    if (opts_.enable_sentry) {
-      if (opts_.bind_mode != BindMode::UNIQUE_LOOPBACK) {
-        RETURN_NOT_OK_PREPEND(StopSentry(),
-                              "Failed to stop the Sentry service");
-      }
-      RETURN_NOT_OK_PREPEND(StartSentry(),
-                            "Failed to start the Sentry service");
-    }
   }
 
   RETURN_NOT_OK_PREPEND(StartMasters(), "failed to start masters");
@@ -548,7 +522,6 @@ Status ExternalMiniCluster::StartMasters() {
     flags.emplace_back("--location_mapping_by_uuid");
 #   endif
   }
-  RETURN_NOT_OK(AddTimeSourceFlags(&flags));
 
   // Add custom master flags.
   copy(opts_.extra_master_flags.begin(), opts_.extra_master_flags.end(),
@@ -570,6 +543,13 @@ Status ExternalMiniCluster::StartMasters() {
       opts.perf_record_filename =
           Substitute("$0/perf-$1.data", opts.log_dir, daemon_id);
     }
+
+    vector<string> time_source_flags;
+    RETURN_NOT_OK(AddTimeSourceFlags(i, &time_source_flags));
+    // Custom flags come last because they can contain overrides.
+    flags.insert(flags.begin(),
+                 time_source_flags.begin(), time_source_flags.end());
+
     opts.extra_flags = SubstituteInFlags(flags, i);
     opts.start_process_timeout = opts_.start_process_timeout;
     opts.rpc_bind_address = master_rpc_addrs[i];
@@ -579,12 +559,10 @@ Status ExternalMiniCluster::StartMasters() {
         opts.extra_flags.emplace_back("--hive_metastore_sasl_enabled=true");
       }
     }
-    if (opts_.enable_sentry) {
-      opts.extra_flags.emplace_back(Substitute("--sentry_service_rpc_addresses=$0",
-                                               sentry_->address().ToString()));
-      if (!opts_.enable_kerberos) {
-        opts.extra_flags.emplace_back("--sentry_service_security_mode=none");
-      }
+    if (opts_.enable_ranger) {
+      opts.extra_flags.emplace_back(Substitute("--ranger_config_path=$0",
+                                               JoinPathSegments(cluster_root(),
+                                                                "ranger-client")));
     }
     opts.logtostderr = opts_.logtostderr;
 
@@ -636,7 +614,7 @@ Status ExternalMiniCluster::AddTabletServer() {
         Substitute("$0/perf-$1.data", opts.log_dir, daemon_id);
   }
   vector<string> extra_flags;
-  RETURN_NOT_OK(AddTimeSourceFlags(&extra_flags));
+  RETURN_NOT_OK(AddTimeSourceFlags(idx, &extra_flags));
   auto flags = SubstituteInFlags(opts_.extra_tserver_flags, idx);
   copy(flags.begin(), flags.end(), std::back_inserter(extra_flags));
   opts.extra_flags = extra_flags;
@@ -939,67 +917,78 @@ string ExternalMiniCluster::UuidForTS(int ts_idx) const {
 //------------------------------------------------------------
 
 ExternalDaemon::ExternalDaemon(ExternalDaemonOptions opts)
-    : opts_(std::move(opts)) {
+    : opts_(std::move(opts)),
+      parent_tid_(std::this_thread::get_id()) {
   CHECK(rpc_bind_address().Initialized());
 }
 
 ExternalDaemon::~ExternalDaemon() {
 }
 
-Status ExternalDaemon::EnableKerberos(MiniKdc* kdc, const string& bind_host) {
-  string spn = "kudu/" + bind_host;
-  string ktpath;
-  RETURN_NOT_OK_PREPEND(kdc->CreateServiceKeytab(spn, &ktpath),
-                        "could not create keytab");
-  extra_env_ = kdc->GetEnvVars();
-
-  // Insert Kerberos flags at the front of extra_flags, so that user specified
-  // flags will override them.
-  opts_.extra_flags.insert(opts_.extra_flags.begin(), {
-    Substitute("--keytab_file=$0", ktpath),
-    Substitute("--principal=$0", spn),
-    "--rpc_authentication=required",
-    "--superuser_acl=test-admin",
-    "--user_acl=test-user",
-  });
-
-  return Status::OK();
-}
-
 Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   CHECK(!process_);
+  const auto this_tid = std::this_thread::get_id();
+  CHECK_EQ(parent_tid_, this_tid)
+    << "Process being started from thread " << this_tid << " which is different"
+    << " from the instantiating thread " << parent_tid_;
 
-  vector<string> argv;
+  RETURN_NOT_OK(env_util::CreateDirsRecursively(Env::Default(), log_dir()));
+  const string info_path = JoinPathSegments(data_dirs()[0], "info.pb");
 
-  // First the exe for argv[0].
-  argv.push_back(opts_.exe);
+  vector<string> argv = {
+    // First the exe for argv[0].
+    opts_.exe,
 
-  // Then all the flags coming from the minicluster framework.
-  argv.insert(argv.end(), user_flags.begin(), user_flags.end());
+    // Basic flags for Kudu server.
+    "--fs_wal_dir=" + wal_dir(),
+    "--fs_data_dirs=" + JoinStrings(data_dirs(), ","),
+    "--block_manager=" + opts_.block_manager_type,
+    "--webserver_interface=localhost",
 
-  // Disable fsync to dramatically speed up runtime. This is safe as no tests
-  // rely on forcefully cutting power to a machine or equivalent.
-  argv.emplace_back("--never_fsync");
+    // Disable fsync to dramatically speed up runtime. This is safe as no tests
+    // rely on forcefully cutting power to a machine or equivalent.
+    "--never_fsync",
 
-  // Generate smaller RSA keys -- generating a 1024-bit key is faster
-  // than generating the default 2048-bit key, and we don't care about
-  // strong encryption in tests. Setting it lower (e.g. 512 bits) results
-  // in OpenSSL errors RSA_sign:digest too big for rsa key:rsa_sign.c:122
-  // since we are using strong/high TLS v1.2 cipher suites, so the minimum
-  // size of TLS-related RSA key is 768 bits (due to the usage of
-  // the ECDHE-RSA-AES256-GCM-SHA384 suite). However, to work with Java
-  // client it's necessary to have at least 1024 bits for certificate RSA key
-  // due to Java security policies.
-  argv.emplace_back("--ipki_server_key_size=1024");
+    // Generate smaller RSA keys -- generating a 768-bit key is faster
+    // than generating the default 2048-bit key, and we don't care about
+    // strong encryption in tests. Setting it lower (e.g. 512 bits) results
+    // in OpenSSL errors RSA_sign:digest too big for rsa key:rsa_sign.c:122
+    // since we are using strong/high TLS v1.2 cipher suites, so the minimum
+    // size of TLS-related RSA key is 768 bits (due to the usage of
+    // the ECDHE-RSA-AES256-GCM-SHA384 suite).
+    "--ipki_server_key_size=768",
 
-  // Disable minidumps by default since many tests purposely inject faults.
-  argv.emplace_back("--enable_minidumps=false");
+    // The RSA key of 768 bits is too short if OpenSSL security level is set to
+    // 1 or higher (applicable for OpenSSL 1.1.0 and newer). Lowering the
+    // security level to 0 makes possible ot use shorter keys in such cases.
+    "--openssl_security_level_override=0",
 
-  // Disable redaction.
-  argv.emplace_back("--redact=none");
+    // Disable minidumps by default since many tests purposely inject faults.
+    "--enable_minidumps=false",
 
-  // Enable metrics logging.
-  argv.emplace_back("--metrics_log_interval_ms=1000");
+    // Disable redaction of the information in logs and Web UI.
+    "--redact=none",
+
+    // Enable metrics logging.
+    "--metrics_log_interval_ms=1000",
+
+    // Even if we are logging to stderr, metrics logs and minidumps end up being
+    // written based on -log_dir. So, we have to set that too.
+    "--log_dir=" + log_dir(),
+
+    // Tell the server to dump its port information so we can pick it up.
+    "--server_dump_info_path=" + info_path,
+    "--server_dump_info_format=pb",
+
+    // We use ephemeral ports in many tests. They don't work for production,
+    // but are OK in unit tests.
+    "--rpc_server_allow_ephemeral_ports",
+
+    // Allow unsafe and experimental flags from tests, since we often use
+    // fault injection, etc.
+    "--unlock_experimental_flags",
+    "--unlock_unsafe_flags",
+  };
 
   if (opts_.logtostderr) {
     // Ensure that logging goes to the test output and doesn't get buffered.
@@ -1007,24 +996,8 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
     argv.emplace_back("--logbuflevel=-1");
   }
 
-  // Even if we are logging to stderr, metrics logs and minidumps end up being
-  // written based on -log_dir. So, we have to set that too.
-  argv.push_back("--log_dir=" + log_dir());
-  RETURN_NOT_OK(env_util::CreateDirsRecursively(Env::Default(), log_dir()));
-
-  // Tell the server to dump its port information so we can pick it up.
-  string info_path = JoinPathSegments(data_dirs()[0], "info.pb");
-  argv.push_back("--server_dump_info_path=" + info_path);
-  argv.emplace_back("--server_dump_info_format=pb");
-
-  // We use ephemeral ports in many tests. They don't work for production, but are OK
-  // in unit tests.
-  argv.emplace_back("--rpc_server_allow_ephemeral_ports");
-
-  // Allow unsafe and experimental flags from tests, since we often use
-  // fault injection, etc.
-  argv.emplace_back("--unlock_experimental_flags");
-  argv.emplace_back("--unlock_unsafe_flags");
+  // Add all the flags coming from the minicluster framework.
+  argv.insert(argv.end(), user_flags.begin(), user_flags.end());
 
   // Then the "extra flags" passed into the ctor (from the ExternalMiniCluster
   // options struct). These come at the end so they can override things like
@@ -1119,6 +1092,26 @@ void ExternalDaemon::SetMetastoreIntegration(const string& hms_uris,
                                              bool enable_kerberos) {
   opts_.extra_flags.emplace_back(Substitute("--hive_metastore_uris=$0", hms_uris));
   opts_.extra_flags.emplace_back(Substitute("--hive_metastore_sasl_enabled=$0", enable_kerberos));
+}
+
+Status ExternalDaemon::EnableKerberos(MiniKdc* kdc, const string& bind_host) {
+  string spn = "kudu/" + bind_host;
+  string ktpath;
+  RETURN_NOT_OK_PREPEND(kdc->CreateServiceKeytab(spn, &ktpath),
+                        "could not create keytab");
+  extra_env_ = kdc->GetEnvVars();
+
+  // Insert Kerberos flags at the front of extra_flags, so that user specified
+  // flags will override them.
+  opts_.extra_flags.insert(opts_.extra_flags.begin(), {
+    Substitute("--keytab_file=$0", ktpath),
+    Substitute("--principal=$0", spn),
+    "--rpc_authentication=required",
+    "--superuser_acl=test-admin",
+    "--user_acl=test-user",
+  });
+
+  return Status::OK();
 }
 
 Status ExternalDaemon::Pause() {
@@ -1303,9 +1296,7 @@ void ExternalDaemon::CheckForLeaks() {
 HostPort ExternalDaemon::bound_rpc_hostport() const {
   CHECK(status_);
   CHECK_GE(status_->bound_rpc_addresses_size(), 1);
-  HostPort ret;
-  CHECK_OK(HostPortFromPB(status_->bound_rpc_addresses(0), &ret));
-  return ret;
+  return HostPortFromPB(status_->bound_rpc_addresses(0));
 }
 
 Sockaddr ExternalDaemon::bound_rpc_addr() const {
@@ -1321,9 +1312,7 @@ HostPort ExternalDaemon::bound_http_hostport() const {
   if (status_->bound_http_addresses_size() == 0) {
     return HostPort();
   }
-  HostPort ret;
-  CHECK_OK(HostPortFromPB(status_->bound_http_addresses(0), &ret));
-  return ret;
+  return HostPortFromPB(status_->bound_http_addresses(0));
 }
 
 const NodeInstancePB& ExternalDaemon::instance_id() const {
@@ -1375,7 +1364,6 @@ Status ExternalMaster::Restart() {
 
   vector<string> flags(GetCommonFlags());
   flags.push_back(Substitute("--rpc_bind_addresses=$0", bound_rpc_.ToString()));
-
   if (bound_http_.Initialized()) {
     flags.push_back(Substitute("--webserver_interface=$0", bound_http_.host()));
     flags.push_back(Substitute("--webserver_port=$0", bound_http_.port()));
@@ -1432,21 +1420,17 @@ Status ExternalMaster::WaitForCatalogManager(WaitMode wait_mode) {
   return Status::OK();
 }
 
-vector<string> ExternalMaster::GetCommonFlags() const {
-  return {
-    "--fs_wal_dir=" + wal_dir(),
-    "--fs_data_dirs=" + JoinStrings(data_dirs(), ","),
-    "--block_manager=" + opts_.block_manager_type,
-    "--webserver_interface=localhost",
-
+const vector<string>& ExternalMaster::GetCommonFlags() {
+  static const vector<string> kFlags = {
     // See the in-line comment for "--ipki_server_key_size" flag in
     // ExternalDaemon::StartProcess() method.
-    "--ipki_ca_key_size=1024",
+    "--ipki_ca_key_size=768",
 
-    // As for the TSK keys, 512 bits is the minimum since we are using the SHA256
-    // digest for token signing/verification.
+    // As for the TSK keys, 512 bits is the minimum since we are using
+    // SHA256 digest for token signing/verification.
     "--tsk_num_rsa_bits=512",
   };
+  return kFlags;
 }
 
 
@@ -1465,21 +1449,15 @@ ExternalTabletServer::~ExternalTabletServer() {
 }
 
 Status ExternalTabletServer::Start() {
-  vector<string> flags;
-  flags.push_back("--fs_wal_dir=" + wal_dir());
-  flags.push_back("--fs_data_dirs=" + JoinStrings(data_dirs(), ","));
-  flags.push_back("--block_manager=" + opts_.block_manager_type);
-  flags.push_back(Substitute("--rpc_bind_addresses=$0",
-                             rpc_bind_address().ToString()));
-  flags.push_back(Substitute("--local_ip_for_outbound_sockets=$0",
-                             rpc_bind_address().host()));
-  flags.push_back(Substitute("--webserver_interface=$0",
-                             rpc_bind_address().host()));
-  flags.emplace_back("--webserver_port=0");
-  flags.push_back(Substitute("--tserver_master_addrs=$0",
-                             HostPort::ToCommaSeparatedString(master_addrs_)));
-  RETURN_NOT_OK(StartProcess(flags));
-  return Status::OK();
+  vector<string> flags {
+    Substitute("--rpc_bind_addresses=$0", rpc_bind_address().ToString()),
+    Substitute("--local_ip_for_outbound_sockets=$0", rpc_bind_address().host()),
+    Substitute("--webserver_interface=$0", rpc_bind_address().host()),
+    "--webserver_port=0",
+    Substitute("--tserver_master_addrs=$0",
+               HostPort::ToCommaSeparatedString(master_addrs_)),
+  };
+  return StartProcess(flags);
 }
 
 Status ExternalTabletServer::Restart() {
@@ -1487,20 +1465,17 @@ Status ExternalTabletServer::Restart() {
   if (bound_rpc_.port() == 0) {
     return Status::IllegalState("Tablet server cannot be restarted. Must call Shutdown() first.");
   }
-  vector<string> flags;
-  flags.push_back("--fs_wal_dir=" + wal_dir());
-  flags.push_back("--fs_data_dirs=" + JoinStrings(data_dirs(), ","));
-  flags.push_back("--block_manager=" + opts_.block_manager_type);
-  flags.push_back(Substitute("--rpc_bind_addresses=$0", bound_rpc_.ToString()));
-  flags.push_back(Substitute("--local_ip_for_outbound_sockets=$0",
-                             rpc_bind_address().host()));
+  vector<string> flags {
+    Substitute("--rpc_bind_addresses=$0", bound_rpc_.ToString()),
+    Substitute("--local_ip_for_outbound_sockets=$0", rpc_bind_address().host()),
+    Substitute("--tserver_master_addrs=$0",
+               HostPort::ToCommaSeparatedString(master_addrs_)),
+  };
   if (bound_http_.Initialized()) {
     flags.push_back(Substitute("--webserver_port=$0", bound_http_.port()));
     flags.push_back(Substitute("--webserver_interface=$0",
                                bound_http_.host()));
   }
-  flags.push_back(Substitute("--tserver_master_addrs=$0",
-                             HostPort::ToCommaSeparatedString(master_addrs_)));
   return StartProcess(flags);
 }
 

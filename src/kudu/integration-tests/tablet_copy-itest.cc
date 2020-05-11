@@ -17,6 +17,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -35,7 +37,7 @@
 
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/common/partial_row.h"
 #include "kudu/common/wire_protocol-test-util.h"
 #include "kudu/common/wire_protocol.h"
@@ -48,7 +50,6 @@
 #include "kudu/consensus/opid_util.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -128,6 +129,7 @@ using std::mutex;
 using std::set;
 using std::string;
 using std::thread;
+using std::unique_ptr;
 using std::unordered_map;
 using std::vector;
 using strings::Substitute;
@@ -423,8 +425,7 @@ TEST_F(TabletCopyITest, TestCopyAfterFailedCopy) {
   ASSERT_OK(DeleteTabletWithRetries(follower_ts, tablet_id,
                                     TabletDataState::TABLET_DATA_TOMBSTONED,
                                     kTimeout));
-  HostPort leader_addr;
-  ASSERT_OK(HostPortFromPB(leader_ts->registration.rpc_addresses(0), &leader_addr));
+  HostPort leader_addr = HostPortFromPB(leader_ts->registration.rpc_addresses(0));
 
   // Inject failures to the metadata and trigger the tablet copy. This will
   // cause the copy to fail.
@@ -501,7 +502,7 @@ TEST_F(TabletCopyITest, TestDeleteTabletDuringTabletCopy) {
   ASSERT_OK(env_->CreateDir(testbase));
   opts.wal_root = JoinPathSegments(testbase, "wals");
   opts.data_roots.push_back(JoinPathSegments(testbase, "data-0"));
-  gscoped_ptr<FsManager> fs_manager(new FsManager(env_, opts));
+  unique_ptr<FsManager> fs_manager(new FsManager(env_, opts));
   ASSERT_OK(fs_manager->CreateInitialFileSystemLayout());
   ASSERT_OK(fs_manager->Open());
   scoped_refptr<ConsensusMetadataManager> cmeta_manager(
@@ -642,7 +643,7 @@ TEST_F(TabletCopyITest, TestConcurrentTabletCopys) {
   }
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-  gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
   ASSERT_OK(table_creator->table_name(TestWorkload::kDefaultTableName)
                           .split_rows(splits)
                           .schema(&client_schema)
@@ -1163,8 +1164,7 @@ TEST_F(TabletCopyITest, TestTabletCopyThrottling) {
   // ServiceUnavailable error.
   ASSERT_OK(cluster_->tablet_server(1)->Restart());
 
-  HostPort ts0_hostport;
-  ASSERT_OK(HostPortFromPB(ts0->registration.rpc_addresses(0), &ts0_hostport));
+  HostPort ts0_hostport = HostPortFromPB(ts0->registration.rpc_addresses(0));
 
   // Attempt to copy all of the tablets from TS0 to TS1 in parallel. Tablet
   // copies are repeated periodically until complete.

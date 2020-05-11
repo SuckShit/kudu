@@ -47,7 +47,6 @@
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/io_context.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/array_view.h"
@@ -920,18 +919,18 @@ string CFileIterator::PreparedBlock::ToString() const {
 }
 
 // Decode the null header in the beginning of the data block
-Status DecodeNullInfo(Slice *data_block, uint32_t *num_rows_in_block, Slice *null_bitmap) {
+Status DecodeNullInfo(Slice *data_block, uint32_t *num_rows_in_block, Slice *non_null_bitmap) {
   if (!GetVarint32(data_block, num_rows_in_block)) {
     return Status::Corruption("bad null header, num elements in block");
   }
 
-  uint32_t null_bitmap_size;
-  if (!GetVarint32(data_block, &null_bitmap_size)) {
+  uint32_t non_null_bitmap_size;
+  if (!GetVarint32(data_block, &non_null_bitmap_size)) {
     return Status::Corruption("bad null header, bitmap size");
   }
 
-  *null_bitmap = Slice(data_block->data(), null_bitmap_size);
-  data_block->remove_prefix(null_bitmap_size);
+  *non_null_bitmap = Slice(data_block->data(), non_null_bitmap_size);
+  data_block->remove_prefix(non_null_bitmap_size);
   return Status::OK();
 }
 
@@ -949,9 +948,9 @@ Status CFileIterator::ReadCurrentDataBlock(const IndexTreeIterator &idx_iter,
                                                 prep_block->rle_bitmap.size(), 1);
   }
 
-  BlockDecoder *bd;
-  RETURN_NOT_OK(reader_->type_encoding_info()->CreateBlockDecoder(&bd, data_block, this));
-  prep_block->dblk_.reset(bd);
+  RETURN_NOT_OK(reader_->type_encoding_info()->CreateBlockDecoder(
+      &prep_block->dblk_, data_block, this));
+
   RETURN_NOT_OK_PREPEND(prep_block->dblk_->ParseHeader(),
                         Substitute("unable to decode data block header in block $0 ($1)",
                                    reader_->block_id().ToString(),
@@ -961,7 +960,7 @@ Status CFileIterator::ReadCurrentDataBlock(const IndexTreeIterator &idx_iter,
   // since the data block decoder only knows about the non-null values.
   // For non-nullable ones, we use the information from the block decoder.
   if (!reader_->is_nullable()) {
-    num_rows_in_block = bd->Count();
+    num_rows_in_block = prep_block->dblk_->Count();
   }
 
   io_stats_.cells_read += num_rows_in_block;

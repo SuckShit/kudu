@@ -31,6 +31,11 @@ METRIC_DEFINE_counter(tablet, rows_inserted, "Rows Inserted",
     kudu::MetricUnit::kRows,
     "Number of rows inserted into this tablet since service start",
     kudu::MetricLevel::kInfo);
+METRIC_DEFINE_counter(tablet, insert_ignore_errors, "Insert Ignore Errors",
+    kudu::MetricUnit::kRows,
+    "Number of insert ignore operations for this tablet which were "
+    "ignored due to an error since service start",
+    kudu::MetricLevel::kDebug);
 METRIC_DEFINE_counter(tablet, rows_upserted, "Rows Upserted",
     kudu::MetricUnit::kRows,
     "Number of rows upserted into this tablet since service start",
@@ -146,6 +151,12 @@ METRIC_DEFINE_counter(tablet, undo_delta_block_gc_bytes_deleted,
                       "Does not include bytes garbage collected during compactions.",
                       kudu::MetricLevel::kDebug);
 
+METRIC_DEFINE_counter(tablet, deleted_rowset_gc_bytes_deleted,
+                      "Deleted Rowsets GC Bytes Deleted",
+                      kudu::MetricUnit::kBytes,
+                      "Number of bytes deleted by garbage-collecting deleted rowsets.",
+                      kudu::MetricLevel::kDebug);
+
 METRIC_DEFINE_histogram(tablet, bloom_lookups_per_op, "Bloom Lookups per Operation",
                         kudu::MetricUnit::kProbes,
                         "Tracks the number of bloom filter lookups performed by each "
@@ -244,6 +255,18 @@ METRIC_DEFINE_gauge_int64(tablet, undo_delta_block_estimated_retained_bytes,
   "May be an overestimate.",
   kudu::MetricLevel::kDebug);
 
+METRIC_DEFINE_gauge_uint32(tablet, deleted_rowset_gc_running,
+  "Deleted Rowset GC Running",
+  kudu::MetricUnit::kMaintenanceOperations,
+  "Number of deleted rowset GC operations currently running.",
+  kudu::MetricLevel::kDebug);
+
+METRIC_DEFINE_gauge_int64(tablet, deleted_rowset_estimated_retained_bytes,
+  "Estimated Deletable Bytes Retained in Deleted Rowsets",
+  kudu::MetricUnit::kBytes,
+  "Estimated bytes of deletable data in deleted rowsets for this tablet.",
+  kudu::MetricLevel::kDebug);
+
 METRIC_DEFINE_histogram(tablet, flush_dms_duration,
   "DeltaMemStore Flush Duration",
   kudu::MetricUnit::kMilliseconds,
@@ -300,6 +323,13 @@ METRIC_DEFINE_histogram(tablet, undo_delta_block_gc_perform_duration,
   kudu::MetricLevel::kInfo,
   60000LU, 1);
 
+METRIC_DEFINE_histogram(tablet, deleted_rowset_gc_duration,
+  "Deleted Rowset GC Duration",
+  kudu::MetricUnit::kMilliseconds,
+  "Time spent running the maintenance operation to GC deleted rowsets.",
+  kudu::MetricLevel::kInfo,
+  60000LU, 1);
+
 METRIC_DEFINE_counter(tablet, leader_memory_pressure_rejections,
   "Leader Memory Pressure Rejections",
   kudu::MetricUnit::kRequests,
@@ -312,6 +342,7 @@ METRIC_DEFINE_gauge_double(tablet, average_diskrowset_height, "Average DiskRowSe
                            "replica. The larger the average height, the more "
                            "uncompacted the tablet replica is.",
                            kudu::MetricLevel::kInfo);
+METRIC_DECLARE_gauge_size(merged_entities_count_of_tablet);
 
 namespace kudu {
 namespace tablet {
@@ -319,11 +350,13 @@ namespace tablet {
 #define MINIT(x) x(METRIC_##x.Instantiate(entity))
 #define GINIT(x) x(METRIC_##x.Instantiate(entity, 0))
 #define MEANINIT(x) x(METRIC_##x.InstantiateMeanGauge(entity))
+#define HIDEINIT(x, v) x(METRIC_##x.InstantiateHidden(entity, v))
 TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
   : MINIT(rows_inserted),
     MINIT(rows_upserted),
     MINIT(rows_updated),
     MINIT(rows_deleted),
+    MINIT(insert_ignore_errors),
     MINIT(insertions_failed_dup_key),
     MINIT(upserts_as_updates),
     MINIT(scanner_rows_returned),
@@ -339,6 +372,7 @@ TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
     MINIT(delta_file_lookups),
     MINIT(mrs_lookups),
     MINIT(bytes_flushed),
+    MINIT(deleted_rowset_gc_bytes_deleted),
     MINIT(undo_delta_block_gc_bytes_deleted),
     MINIT(bloom_lookups_per_op),
     MINIT(key_file_lookups_per_op),
@@ -350,6 +384,8 @@ TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
     GINIT(flush_dms_running),
     GINIT(flush_mrs_running),
     GINIT(compact_rs_running),
+    GINIT(deleted_rowset_estimated_retained_bytes),
+    GINIT(deleted_rowset_gc_running),
     GINIT(delta_minor_compact_rs_running),
     GINIT(delta_major_compact_rs_running),
     GINIT(undo_delta_block_gc_running),
@@ -357,17 +393,20 @@ TabletMetrics::TabletMetrics(const scoped_refptr<MetricEntity>& entity)
     MINIT(flush_dms_duration),
     MINIT(flush_mrs_duration),
     MINIT(compact_rs_duration),
+    MINIT(deleted_rowset_gc_duration),
     MINIT(delta_minor_compact_rs_duration),
     MINIT(delta_major_compact_rs_duration),
     MINIT(undo_delta_block_gc_init_duration),
     MINIT(undo_delta_block_gc_delete_duration),
     MINIT(undo_delta_block_gc_perform_duration),
     MINIT(leader_memory_pressure_rejections),
-    MEANINIT(average_diskrowset_height) {
+    MEANINIT(average_diskrowset_height),
+    HIDEINIT(merged_entities_count_of_tablet, 1) {
 }
 #undef MINIT
 #undef GINIT
 #undef MEANINIT
+#undef HIDEINIT
 
 void TabletMetrics::AddProbeStats(const ProbeStats* stats_array, int len,
                                   Arena* work_arena) {

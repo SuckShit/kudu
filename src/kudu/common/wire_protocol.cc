@@ -19,11 +19,11 @@
 
 #include <time.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <ostream>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -47,15 +47,19 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/util/bitmap.h"
+#include "kudu/util/block_bloom_filter.h"
 #include "kudu/util/compression/compression.pb.h"
 #include "kudu/util/faststring.h"
-#include "kudu/util/hash.pb.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/safe_math.h"
 #include "kudu/util/slice.h"
+
+namespace kudu {
+class BlockBloomFilterPB;
+}  // namespace kudu
 
 using google::protobuf::Map;
 using google::protobuf::RepeatedPtrField;
@@ -181,21 +185,22 @@ Status StatusFromPB(const AppStatusPB& pb) {
   }
 }
 
-Status HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb) {
-  host_port_pb->set_host(host_port.host());
-  host_port_pb->set_port(host_port.port());
-  return Status::OK();
+HostPortPB HostPortToPB(const HostPort& host_port) {
+  HostPortPB ret;
+  ret.set_host(host_port.host());
+  ret.set_port(host_port.port());
+  return ret;
 }
 
-Status HostPortFromPB(const HostPortPB& host_port_pb, HostPort* host_port) {
-  host_port->set_host(host_port_pb.host());
-  host_port->set_port(host_port_pb.port());
-  return Status::OK();
+HostPort HostPortFromPB(const HostPortPB& host_port_pb) {
+  return HostPort(host_port_pb.host(), host_port_pb.port());
 }
 
 Status AddHostPortPBs(const vector<Sockaddr>& addrs,
                       RepeatedPtrField<HostPortPB>* pbs) {
   for (const Sockaddr& addr : addrs) {
+    // Don't add unix domain sockets to the list of HostPorts.
+    if (!addr.is_ip()) continue;
     HostPortPB* pb = pbs->Add();
     if (addr.IsWildcard()) {
       RETURN_NOT_OK(GetFQDN(pb->mutable_host()));
@@ -391,7 +396,7 @@ Status ColumnPBsToSchema(const RepeatedPtrField<ColumnSchemaPB>& column_pbs,
   for (const ColumnSchemaPB& pb : column_pbs) {
     boost::optional<ColumnSchema> column;
     RETURN_NOT_OK(ColumnSchemaFromPB(pb, &column));
-    columns.push_back(*column);
+    columns.emplace_back(std::move(*column));
     if (pb.is_key()) {
       if (!is_handling_key) {
         return Status::InvalidArgument(
@@ -408,10 +413,7 @@ Status ColumnPBsToSchema(const RepeatedPtrField<ColumnSchemaPB>& column_pbs,
 
   DCHECK_LE(num_key_columns, columns.size());
 
-  // TODO(perf): could make the following faster by adding a
-  // Reset() variant which actually takes ownership of the column
-  // vector.
-  return schema->Reset(columns, column_ids, num_key_columns);
+  return schema->Reset(std::move(columns), std::move(column_ids), num_key_columns);
 }
 
 Status SchemaToColumnPBs(const Schema& schema,
@@ -451,16 +453,6 @@ void CopyPredicateBoundToPB(const ColumnSchema& col, const void* bound_src, stri
   bound_dst->assign(reinterpret_cast<const char*>(src), size);
 }
 
-// Copies a predicate bloom filter data from 'bf_src' into 'bf_dst'.
-void CopyPredicateBloomFilterToPB(const ColumnPredicate::BloomFilterInner& bf_src,
-                                  ColumnPredicatePB::BloomFilter* bf_dst) {
-  bf_dst->set_nhash(bf_src.nhash());
-  const void* src = bf_src.bloom_data().data();
-  size_t size = bf_src.bloom_data().size();
-  bf_dst->mutable_bloom_data()->assign(reinterpret_cast<const char*>(src), size);
-  bf_dst->set_hash_algorithm(bf_src.hash_algorithm());
-}
-
 // Extract a void* pointer suitable for use in a ColumnRangePredicate from the
 // string protobuf bound. This validates that the pb_value has the correct
 // length, copies the data into 'arena', and sets *result to point to it.
@@ -489,20 +481,6 @@ Status CopyPredicateBoundFromPB(const ColumnSchema& schema,
     *result = data_copy;
   }
 
-  return Status::OK();
-}
-
-// Extract BloomFilterInner from bloom data for ColumnBloomFilterPredicate.
-Status CopyPredicateBloomFilterFromPB(const ColumnPredicatePB::BloomFilter& bf_src,
-                                      ColumnPredicate::BloomFilterInner* dst_src,
-                                      Arena* arena) {
-  size_t bloom_data_size = bf_src.bloom_data().size();
-  dst_src->set_nhash(bf_src.nhash());
-  // Copy the data from the protobuf into the Arena.
-  uint8_t* data_copy = static_cast<uint8_t*>(arena->AllocateBytes(bloom_data_size));
-  memcpy(data_copy, bf_src.bloom_data().data(), bloom_data_size);
-  dst_src->set_bloom_data(Slice(data_copy, bloom_data_size));
-  dst_src->set_hash_algorithm(bf_src.hash_algorithm());
   return Status::OK();
 }
 
@@ -550,9 +528,9 @@ void ColumnPredicateToPB(const ColumnPredicate& predicate,
     case PredicateType::None: LOG(FATAL) << "None predicate may not be converted to protobuf";
     case PredicateType::InBloomFilter: {
       auto* bloom_filter_pred = pb->mutable_in_bloom_filter();
-      for (const auto& bf : predicate.bloom_filters()) {
-        ColumnPredicatePB::BloomFilter* bloom_filter = bloom_filter_pred->add_bloom_filters();
-        CopyPredicateBloomFilterToPB(bf, bloom_filter);
+      for (const auto* bf_src : predicate.bloom_filters()) {
+        BlockBloomFilterPB* bf_dst = bloom_filter_pred->add_bloom_filters();
+        bf_src->CopyToPB(bf_dst);
       }
       // Form the optional lower and upper bound.
       if (predicate.raw_lower() != nullptr) {
@@ -637,22 +615,19 @@ Status ColumnPredicateFromPB(const Schema& schema,
     };
     case ColumnPredicatePB::kInBloomFilter: {
       const auto& in_bloom_filter = pb.in_bloom_filter();
-      vector<ColumnPredicate::BloomFilterInner> bloom_filters;
+      vector<BlockBloomFilter*> bloom_filters;
       if (in_bloom_filter.bloom_filters_size() == 0) {
-        return Status::InvalidArgument("Invalid in bloom filter predicate on column: "
-                                       "no bloom filter contained", col.name());
+        return Status::InvalidArgument(
+            Substitute("Invalid bloom filter predicate on column: $0. "
+                       "No bloom filters supplied", col.name()));
       }
-      for (const auto& bf : in_bloom_filter.bloom_filters()) {
-        if (!bf.has_nhash()
-            || !bf.has_bloom_data()
-            || !bf.has_hash_algorithm()
-            || bf.hash_algorithm() == UNKNOWN_HASH) {
-          return Status::InvalidArgument("Invalid in bloom filter predicate on column: "
-                                         "missing bloom filter details", col.name());
-        }
-        ColumnPredicate::BloomFilterInner bloom_filter;
-        RETURN_NOT_OK(CopyPredicateBloomFilterFromPB(bf, &bloom_filter, arena));
-        bloom_filters.emplace_back(bloom_filter);
+      auto* allocator = arena->NewObject<ArenaBlockBloomFilterBufferAllocator>(arena);
+      for (const auto& bf_src : in_bloom_filter.bloom_filters()) {
+        auto* block_bloom_filter = arena->NewObject<BlockBloomFilter>(allocator);
+        RETURN_NOT_OK_PREPEND(
+            block_bloom_filter->InitFromPB(bf_src),
+            Substitute("Failed to initialize bloom filter predicate on column: $0", col.name()));
+        bloom_filters.emplace_back(block_bloom_filter);
       }
       // Extract the optional lower and upper bound.
       const void* lower = nullptr;
@@ -663,7 +638,8 @@ Status ColumnPredicateFromPB(const Schema& schema,
       if (in_bloom_filter.has_upper()) {
         RETURN_NOT_OK(CopyPredicateBoundFromPB(col, in_bloom_filter.upper(), arena, &upper));
       }
-      *predicate = ColumnPredicate::InBloomFilter(col, &bloom_filters, lower, upper);
+      *predicate = ColumnPredicate::InBloomFilter(col, std::move(bloom_filters), lower,
+                                                  upper);
       break;
     };
     default: return Status::InvalidArgument("Unknown predicate type for column", col.name());
@@ -758,7 +734,7 @@ Status RewriteRowBlockPointers(const Schema& schema, const RowwiseRowBlockPB& ro
   uint8_t* row_data = row_data_slice->mutable_data();
   const uint8_t* indir_data = indirect_data_slice.data();
   const size_t expected_data_size = rowblock_pb.num_rows() * row_stride;
-  const size_t null_bitmap_offset = schema.byte_size() + total_padding;
+  const size_t non_null_bitmap_offset = schema.byte_size() + total_padding;
 
   if (PREDICT_FALSE(row_data_slice->size() != expected_data_size)) {
     return Status::Corruption(
@@ -804,7 +780,7 @@ Status RewriteRowBlockPointers(const Schema& schema, const RowwiseRowBlockPB& ro
     for (const auto& t : to_rewrite) {
       uint8_t* cell_ptr = row_ptr + t.col_offset;
 
-      if (t.nullable && BitmapTest(row_ptr + null_bitmap_offset, t.col_idx)) {
+      if (t.nullable && BitmapTest(row_ptr + non_null_bitmap_offset, t.col_idx)) {
         // No need to rewrite null values.
         continue;
       }
@@ -874,7 +850,8 @@ Status FindLeaderHostPort(const RepeatedPtrField<ServerEntryPB>& entries,
                               SecureShortDebugString(entry)));
     }
     if (entry.role() == consensus::RaftPeerPB::LEADER) {
-      return HostPortFromPB(entry.registration().rpc_addresses(0), leader_hostport);
+      *leader_hostport = HostPortFromPB(entry.registration().rpc_addresses(0));
+      return Status::OK();
     }
   }
   return Status::NotFound("No leader found.");
@@ -916,10 +893,10 @@ static void CopyColumn(
     const ColumnBlock& column_block, int dst_col_idx, uint8_t* __restrict__ dst_base,
     faststring* indirect_data, const Schema* dst_schema, size_t row_stride,
     size_t schema_byte_size, size_t column_offset,
-    const vector<int>& row_idx_select) {
+    const vector<uint16_t>& row_idx_select) {
   DCHECK(dst_schema);
   uint8_t* dst = dst_base + column_offset;
-  size_t offset_to_null_bitmap = schema_byte_size - column_offset;
+  size_t offset_to_non_null_bitmap = schema_byte_size - column_offset;
 
   size_t cell_size = column_block.stride();
   const uint8_t* src = column_block.cell_ptr(0);
@@ -927,7 +904,7 @@ static void CopyColumn(
   for (auto index : row_idx_select) {
     src = column_block.cell_ptr(index);
     if (IS_NULLABLE && column_block.is_null(index)) {
-      BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, true);
+      BitmapChange(dst + offset_to_non_null_bitmap, dst_col_idx, true);
     } else if (IS_VARLEN) {
       const Slice* slice = reinterpret_cast<const Slice *>(src);
       size_t offset_in_indirect = indirect_data->size();
@@ -937,12 +914,12 @@ static void CopyColumn(
       *dst_slice = Slice(reinterpret_cast<const uint8_t*>(offset_in_indirect),
                          slice->size());
       if (IS_NULLABLE) {
-        BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, false);
+        BitmapChange(dst + offset_to_non_null_bitmap, dst_col_idx, false);
       }
     } else { // non-string, non-null
       strings::memcpy_inlined(dst, src, cell_size);
       if (IS_NULLABLE) {
-        BitmapChange(dst + offset_to_null_bitmap, dst_col_idx, false);
+        BitmapChange(dst + offset_to_non_null_bitmap, dst_col_idx, false);
       }
     }
     dst += row_stride;
@@ -952,13 +929,22 @@ static void CopyColumn(
 // Because we use a faststring here, ASAN tests become unbearably slow
 // with the extra verifications.
 ATTRIBUTE_NO_ADDRESS_SAFETY_ANALYSIS
-void SerializeRowBlock(const RowBlock& block,
-                       RowwiseRowBlockPB* rowblock_pb,
-                       const Schema* projection_schema,
-                       faststring* data_buf,
-                       faststring* indirect_data,
-                       bool pad_unixtime_micros_to_16_bytes) {
+int SerializeRowBlock(const RowBlock& block,
+                      const Schema* projection_schema,
+                      faststring* data_buf,
+                      faststring* indirect_data,
+                      bool pad_unixtime_micros_to_16_bytes) {
   DCHECK_GT(block.nrows(), 0);
+
+  vector<uint16_t> selected_row_indexes =
+      block.selection_vector()->GetSelectedRows().ToRowIndexes();
+
+  size_t num_rows = selected_row_indexes.size();
+
+  // Fast-path empty blocks (eg because the predicate didn't match any rows or
+  // all rows in the block were deleted)
+  if (num_rows == 0) return 0;
+
   const Schema* tablet_schema = block.schema();
 
   if (projection_schema == nullptr) {
@@ -983,7 +969,6 @@ void SerializeRowBlock(const RowBlock& block,
 
   size_t old_size = data_buf->size();
   size_t row_stride = ContiguousRowHelper::row_size(*projection_schema) + total_padding;
-  size_t num_rows = block.selection_vector()->CountSelected();
   size_t schema_byte_size = projection_schema->byte_size() + total_padding;
   size_t additional_size = row_stride * num_rows;
 
@@ -996,8 +981,6 @@ void SerializeRowBlock(const RowBlock& block,
     memset(base, 0, additional_size);
   }
 
-  vector<int> selected_row_indexes;
-  block.selection_vector()->GetSelectedRows(&selected_row_indexes);
   size_t t_schema_idx = 0;
   size_t padding_so_far = 0;
   for (int p_schema_idx = 0; p_schema_idx < projection_schema->num_columns(); p_schema_idx++) {
@@ -1034,7 +1017,7 @@ void SerializeRowBlock(const RowBlock& block,
       padding_so_far += 8;
     }
   }
-  rowblock_pb->set_num_rows(rowblock_pb->num_rows() + num_rows);
+  return num_rows;
 }
 
 string StartTimeToString(const ServerRegistrationPB& reg) {

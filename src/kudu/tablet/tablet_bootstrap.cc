@@ -18,6 +18,7 @@
 #include "kudu/tablet/tablet_bootstrap.h"
 
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -29,7 +30,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/clock/clock.h"
@@ -55,8 +55,6 @@
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/io_context.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
@@ -194,10 +192,11 @@ class TabletBootstrap {
  public:
   TabletBootstrap(scoped_refptr<TabletMetadata> tablet_meta,
                   RaftConfigPB committed_raft_config,
-                  scoped_refptr<Clock> clock,
+                  Clock* clock,
                   shared_ptr<MemTracker> mem_tracker,
                   scoped_refptr<ResultTracker> result_tracker,
                   MetricRegistry* metric_registry,
+                  FileCache* file_cache,
                   scoped_refptr<TabletReplica> tablet_replica,
                   scoped_refptr<LogAnchorRegistry> log_anchor_registry);
 
@@ -374,10 +373,11 @@ class TabletBootstrap {
 
   const scoped_refptr<TabletMetadata> tablet_meta_;
   const RaftConfigPB committed_raft_config_;
-  const scoped_refptr<Clock> clock_;
+  Clock* clock_;
   shared_ptr<MemTracker> mem_tracker_;
   scoped_refptr<rpc::ResultTracker> result_tracker_;
   MetricRegistry* metric_registry_;
+  FileCache* file_cache_;
   scoped_refptr<TabletReplica> tablet_replica_;
   unique_ptr<tablet::Tablet> tablet_;
   const scoped_refptr<log::LogAnchorRegistry> log_anchor_registry_;
@@ -420,7 +420,8 @@ class TabletBootstrap {
     // Number of REPLICATE messages for which a matching COMMIT was found.
     int ops_committed;
 
-    // Number inserts/mutations seen and ignored.
+    // Number inserts/mutations seen and ignored. Note inserts_ignored does not refer
+    // to the INSERT_IGNORE operation. It refers to inserts ignored during log replay.
     int inserts_seen, inserts_ignored;
     int mutations_seen, mutations_ignored;
 
@@ -442,23 +443,25 @@ void TabletBootstrap::SetStatusMessage(const string& status) {
 
 Status BootstrapTablet(scoped_refptr<TabletMetadata> tablet_meta,
                        RaftConfigPB committed_raft_config,
-                       scoped_refptr<Clock> clock,
+                       Clock* clock,
                        shared_ptr<MemTracker> mem_tracker,
                        scoped_refptr<ResultTracker> result_tracker,
                        MetricRegistry* metric_registry,
+                       FileCache* file_cache,
                        scoped_refptr<TabletReplica> tablet_replica,
+                       scoped_refptr<log::LogAnchorRegistry> log_anchor_registry,
                        shared_ptr<tablet::Tablet>* rebuilt_tablet,
                        scoped_refptr<log::Log>* rebuilt_log,
-                       scoped_refptr<log::LogAnchorRegistry> log_anchor_registry,
                        ConsensusBootstrapInfo* consensus_info) {
   TRACE_EVENT1("tablet", "BootstrapTablet",
                "tablet_id", tablet_meta->tablet_id());
   TabletBootstrap bootstrap(std::move(tablet_meta),
                             std::move(committed_raft_config),
-                            std::move(clock),
+                            clock,
                             std::move(mem_tracker),
                             std::move(result_tracker),
                             metric_registry,
+                            file_cache,
                             std::move(tablet_replica),
                             std::move(log_anchor_registry));
   RETURN_NOT_OK(bootstrap.Bootstrap(rebuilt_tablet, rebuilt_log, consensus_info));
@@ -491,17 +494,20 @@ static string DebugInfo(const string& tablet_id,
 TabletBootstrap::TabletBootstrap(
     scoped_refptr<TabletMetadata> tablet_meta,
     RaftConfigPB committed_raft_config,
-    scoped_refptr<Clock> clock, shared_ptr<MemTracker> mem_tracker,
+    Clock* clock,
+    shared_ptr<MemTracker> mem_tracker,
     scoped_refptr<ResultTracker> result_tracker,
     MetricRegistry* metric_registry,
+    FileCache* file_cache,
     scoped_refptr<TabletReplica> tablet_replica,
     scoped_refptr<LogAnchorRegistry> log_anchor_registry)
     : tablet_meta_(std::move(tablet_meta)),
       committed_raft_config_(std::move(committed_raft_config)),
-      clock_(std::move(clock)),
+      clock_(clock),
       mem_tracker_(std::move(mem_tracker)),
       result_tracker_(std::move(result_tracker)),
       metric_registry_(metric_registry),
+      file_cache_(file_cache),
       tablet_replica_(std::move(tablet_replica)),
       log_anchor_registry_(std::move(log_anchor_registry)) {}
 
@@ -523,10 +529,10 @@ Status TabletBootstrap::Bootstrap(shared_ptr<Tablet>* rebuilt_tablet,
   CHECK((*rebuilt_tablet && *rebuilt_log) || !bootstrap_status.ok())
       << "Tablet and Log not initialized";
   if (bootstrap_status.ok()) {
+    auto cb = make_scoped_refptr(new FlushInflightsToLogCallback(
+        rebuilt_tablet->get(), *rebuilt_log));
     tablet_meta_->SetPreFlushCallback(
-        Bind(&FlushInflightsToLogCallback::WaitForInflightsAndFlushLog,
-             make_scoped_refptr(new FlushInflightsToLogCallback(
-                 rebuilt_tablet->get(), *rebuilt_log))));
+        [cb]() { return cb->WaitForInflightsAndFlushLog(); });
   }
 
   // This will cause any pending TabletMetadata flush to be executed.
@@ -720,17 +726,16 @@ Status TabletBootstrap::OpenLogReaderInRecoveryDir() {
   const string recovery_dir = fs_manager->GetTabletWalRecoveryDir(tablet_id);
   RETURN_NOT_OK_PREPEND(LogReader::Open(fs_manager->env(), recovery_dir, log_index, tablet_id,
                                         tablet_->GetMetricEntity().get(),
+                                        file_cache_,
                                         &log_reader_),
                         "Could not open LogReader. Reason");
   return Status::OK();
 }
 
 Status TabletBootstrap::OpenNewLog() {
-  OpId init;
-  init.set_term(0);
-  init.set_index(0);
   RETURN_NOT_OK(Log::Open(LogOptions(),
                           tablet_->metadata()->fs_manager(),
+                          file_cache_,
                           tablet_->tablet_id(),
                           *tablet_->schema(),
                           tablet_->metadata()->schema_version(),
@@ -1111,31 +1116,32 @@ Status TabletBootstrap::HandleEntryPair(const IOContext* io_context, LogEntryPB*
     return Status::OK();
   }
 
-  // Handle safe time advancement:
+  // Handle advancement of our new timestamp lower bound watermark.
   //
-  // If this message is a Raft election no-op, or is a transaction op that
-  // has an external consistency mode other than COMMIT_WAIT, we know that no
+  // If this message is a Raft election no-op, or is a transaction op that has
+  // an external consistency mode other than COMMIT_WAIT, we know that no
   // future transaction will have a timestamp that is lower than it, so we can
   // just advance the safe timestamp to the message's timestamp.
   //
   // If the hybrid clock is disabled, all transactions will fall into this
   // category.
-  Timestamp safe_time;
+  Timestamp new_lower_bound;
   if (replicate->op_type() != consensus::WRITE_OP ||
       replicate->write_request().external_consistency_mode() != COMMIT_WAIT) {
-    safe_time = Timestamp(replicate->timestamp());
-  // ... else we set the safe timestamp to be the transaction's timestamp minus the maximum clock
-  // error. This opens the door for problems if the flags changed across reboots, but this is
-  // unlikely and the problem would manifest itself immediately and clearly (mvcc would complain
-  // the operation is already committed, with a CHECK failure).
+    new_lower_bound = Timestamp(replicate->timestamp());
+  // ... else we set the new timestamp lower bound to be the transaction's
+  // timestamp minus the maximum clock error. This opens the door for problems
+  // if the flags changed across reboots, but this is unlikely and the problem
+  // would manifest itself immediately and clearly (mvcc would complain the
+  // operation is already committed, with a CHECK failure).
   } else {
     DCHECK(clock_->SupportsExternalConsistencyMode(COMMIT_WAIT)) << "The provided clock does not"
         "support COMMIT_WAIT external consistency mode.";
-    safe_time = clock::HybridClock::AddPhysicalTimeToTimestamp(
+    new_lower_bound = clock::HybridClock::AddPhysicalTimeToTimestamp(
         Timestamp(replicate->timestamp()),
         MonoDelta::FromMicroseconds(-FLAGS_max_clock_sync_error_usec));
   }
-  tablet_->mvcc_manager()->AdjustSafeTime(safe_time);
+  tablet_->mvcc_manager()->AdjustNewTransactionLowerBound(new_lower_bound);
 
   return Status::OK();
 }
@@ -1548,8 +1554,9 @@ Status TabletBootstrap::ApplyOperations(const IOContext* io_context,
     // Increment the seen/ignored stats.
     switch (op->decoded_op.type) {
       case RowOperationsPB::INSERT:
+      case RowOperationsPB::INSERT_IGNORE:
       case RowOperationsPB::UPSERT: {
-        // TODO: should we have a separate counter for upserts?
+        // TODO(unknown): should we have a separate counter for upserts?
         stats_.inserts_seen++;
         if (op->has_result()) {
           stats_.inserts_ignored++;
@@ -1656,9 +1663,7 @@ Status TabletBootstrap::FilterOperation(const OperationResultPB& op_result,
 }
 
 Status TabletBootstrap::UpdateClock(uint64_t timestamp) {
-  Timestamp ts(timestamp);
-  RETURN_NOT_OK(clock_->Update(ts));
-  return Status::OK();
+  return clock_->Update(Timestamp(timestamp));
 }
 
 string TabletBootstrap::LogPrefix() const {
@@ -1701,13 +1706,17 @@ bool FlushedStoresSnapshot::IsMemStoreActive(const MemStoreTargetPB& target) con
       // If we have no data about this DRS, then there are two cases:
       //
       // 1) The DRS has already been flushed, but then later got removed because
-      // it got compacted away. Since it was flushed, we don't need to replay it.
+      //    it got compacted away or culled because it was empty. In the former
+      //    case, the deltas should have been reflected in the new compaction
+      //    output, and in the latter, all the rows in the rowset have been
+      //    deleted and there's nothing to replay.
       //
-      // 2) The DRS was in the process of being written, but haven't yet flushed the
-      // TabletMetadata update that includes it. We only write to an in-progress DRS like
-      // this when we are in the 'duplicating' phase of a compaction. In that case,
-      // the other duplicated 'target' should still be present in the metadata, and we
-      // can base our decision based on that one.
+      // 2) The DRS was in the process of being written, but haven't yet
+      //    flushed the TabletMetadata update that includes it. We only write
+      //    to an in-progress DRS like this when we are in the 'duplicating'
+      //    phase of a compaction. In that case, the other duplicated 'target'
+      //    should still be present in the metadata, and we can base our
+      //    decision based on that one.
       return false;
     }
 

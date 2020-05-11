@@ -14,9 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_CFILE_TEST_BASE_H
-#define KUDU_CFILE_TEST_BASE_H
+#pragma once
 
 #include <algorithm>
 #include <cstdlib>
@@ -54,7 +52,7 @@ namespace cfile {
 //        StringDataGenerator<true> datagen;
 //        datagen.Build(10);
 //        for (int i = 0; i < datagen.block_entries(); ++i) {
-//          bool is_null = BitmpTest(datagen.null_bitmap(), i);
+//          bool is_null = !BitmapTest(datagen.non_null_bitmap(), i);
 //          Slice& v = datagen[i];
 //        }
 template<DataType DATA_TYPE, bool HAS_NULLS>
@@ -69,8 +67,6 @@ class DataGenerator {
   typedef typename DataTypeTraits<DATA_TYPE>::cpp_type cpp_type;
 
   DataGenerator() :
-    values_(NULL),
-    null_bitmap_(NULL),
     block_entries_(0),
     total_entries_(0)
   {}
@@ -86,14 +82,14 @@ class DataGenerator {
   }
 
   // Build "num_entries" using (offset + i) as value
-  // You can get the data values and the null bitmap using values() and null_bitmap()
+  // You can get the data values and the null bitmap using values() and non_null_bitmap()
   // both are valid until the class is destructed or until Build() is called again.
   void Build(size_t offset, size_t num_entries) {
     Resize(num_entries);
 
     for (size_t i = 0; i < num_entries; ++i) {
       if (HAS_NULLS) {
-        BitmapChange(null_bitmap_.get(), i, !TestValueShouldBeNull(offset + i));
+        BitmapChange(non_null_bitmap_.get(), i, !TestValueShouldBeNull(offset + i));
       }
       values_[i] = BuildTestValue(i, offset + i);
     }
@@ -133,7 +129,7 @@ class DataGenerator {
     }
 
     values_.reset(new cpp_type[num_entries]);
-    null_bitmap_.reset(new uint8_t[BitmapSize(num_entries)]);
+    non_null_bitmap_.reset(new uint8_t[BitmapSize(num_entries)]);
     block_entries_ = num_entries;
   }
 
@@ -141,7 +137,7 @@ class DataGenerator {
   size_t total_entries() const { return total_entries_; }
 
   const cpp_type *values() const { return values_.get(); }
-  const uint8_t *null_bitmap() const { return null_bitmap_.get(); }
+  const uint8_t *non_null_bitmap() const { return non_null_bitmap_.get(); }
 
   const cpp_type& operator[](size_t index) const {
     return values_[index];
@@ -150,8 +146,8 @@ class DataGenerator {
   virtual ~DataGenerator() {}
 
  private:
-  gscoped_array<cpp_type> values_;
-  gscoped_array<uint8_t> null_bitmap_;
+  std::unique_ptr<cpp_type[]> values_;
+  std::unique_ptr<uint8_t[]> non_null_bitmap_;
   size_t block_entries_;
   size_t total_entries_;
 };
@@ -325,7 +321,7 @@ class DuplicateStringDataGenerator : public DataGenerator<STRING, HAS_NULLS> {
     char data[kItemBufferSize];
   };
 
-  gscoped_array<Buffer> data_buffer_;
+  std::unique_ptr<Buffer[]> data_buffer_;
   const char* format_;
   int num_;
 };
@@ -343,7 +339,7 @@ class CFileTestBase : public KuduTest {
   void SetUp() OVERRIDE {
     KuduTest::SetUp();
 
-    fs_manager_.reset(new FsManager(env_, GetTestPath("fs_root")));
+    fs_manager_.reset(new FsManager(env_, FsManagerOpts(GetTestPath("fs_root"))));
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
     ASSERT_OK(fs_manager_->Open());
   }
@@ -400,7 +396,7 @@ class CFileTestBase : public KuduTest {
       DCHECK_EQ(towrite, data_generator->block_entries());
 
       if (DataGeneratorType::has_nulls()) {
-        ASSERT_OK_FAST(w.AppendNullableEntries(data_generator->null_bitmap(),
+        ASSERT_OK_FAST(w.AppendNullableEntries(data_generator->non_null_bitmap(),
                                                       data_generator->values(),
                                                       towrite));
       } else {
@@ -412,7 +408,7 @@ class CFileTestBase : public KuduTest {
     ASSERT_OK(w.Finish());
   }
 
-  gscoped_ptr<FsManager> fs_manager_;
+  std::unique_ptr<FsManager> fs_manager_;
 
 };
 
@@ -567,5 +563,3 @@ void TimeReadFile(FsManager* fs_manager, const BlockId& block_id, size_t *count_
 
 } // namespace cfile
 } // namespace kudu
-
-#endif

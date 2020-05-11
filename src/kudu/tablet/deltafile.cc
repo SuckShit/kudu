@@ -17,6 +17,7 @@
 
 #include "kudu/tablet/deltafile.h"
 
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -24,7 +25,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 
 #include "kudu/cfile/binary_plain_block.h"
 #include "kudu/cfile/cfile_reader.h"
@@ -41,7 +41,7 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/delta_relevancy.h"
@@ -196,13 +196,14 @@ Status DeltaFileWriter::AppendDelta<UNDO>(
   return DoAppendDelta(key, delta);
 }
 
-void DeltaFileWriter::WriteDeltaStats(const DeltaStats& stats) {
+void DeltaFileWriter::WriteDeltaStats(std::unique_ptr<DeltaStats> stats) {
   DeltaStatsPB delta_stats_pb;
-  stats.ToPB(&delta_stats_pb);
+  stats->ToPB(&delta_stats_pb);
 
   faststring buf;
   pb_util::SerializeToString(delta_stats_pb, &buf);
   writer_->AddMetadataPair(DeltaFileReader::kDeltaStatsEntryName, buf.ToString());
+  delta_stats_ = std::move(stats);
 }
 
 
@@ -219,6 +220,7 @@ Status DeltaFileReader::Open(unique_ptr<ReadableBlock> block,
   RETURN_NOT_OK(DeltaFileReader::OpenNoInit(std::move(block),
                                             delta_type,
                                             std::move(options),
+                                            /*delta_stats*/nullptr,
                                             &df_reader));
   RETURN_NOT_OK(df_reader->Init(io_context));
 
@@ -229,14 +231,15 @@ Status DeltaFileReader::Open(unique_ptr<ReadableBlock> block,
 Status DeltaFileReader::OpenNoInit(unique_ptr<ReadableBlock> block,
                                    DeltaType delta_type,
                                    ReaderOptions options,
+                                   unique_ptr<DeltaStats> delta_stats,
                                    shared_ptr<DeltaFileReader>* reader_out) {
   unique_ptr<CFileReader> cf_reader;
   const IOContext* io_context = options.io_context;
   RETURN_NOT_OK(CFileReader::OpenNoInit(std::move(block),
                                         std::move(options),
                                         &cf_reader));
-  gscoped_ptr<DeltaFileReader> df_reader(
-      new DeltaFileReader(std::move(cf_reader), delta_type));
+  unique_ptr<DeltaFileReader> df_reader(
+      new DeltaFileReader(std::move(cf_reader), std::move(delta_stats), delta_type));
   if (!FLAGS_cfile_lazy_open) {
     RETURN_NOT_OK(df_reader->Init(io_context));
   }
@@ -247,8 +250,10 @@ Status DeltaFileReader::OpenNoInit(unique_ptr<ReadableBlock> block,
 }
 
 DeltaFileReader::DeltaFileReader(unique_ptr<CFileReader> cf_reader,
+                                 unique_ptr<DeltaStats> delta_stats,
                                  DeltaType delta_type)
     : reader_(cf_reader.release()),
+      delta_stats_(std::move(delta_stats)),
       delta_type_(delta_type) {}
 
 Status DeltaFileReader::Init(const IOContext* io_context) {
@@ -266,7 +271,9 @@ Status DeltaFileReader::InitOnce(const IOContext* io_context) {
   }
 
   // Initialize delta file stats
-  RETURN_NOT_OK(ReadDeltaStats());
+  if (!has_delta_stats()) {
+    RETURN_NOT_OK(ReadDeltaStats());
+  }
   return Status::OK();
 }
 
@@ -280,9 +287,10 @@ Status DeltaFileReader::ReadDeltaStats() {
   if (!deltastats_pb.ParseFromString(filestats_pb_buf)) {
     return Status::Corruption("unable to parse the delta stats protobuf");
   }
-  gscoped_ptr<DeltaStats>stats(new DeltaStats());
+  unique_ptr<DeltaStats> stats(new DeltaStats());
   RETURN_NOT_OK(stats->InitFromPB(deltastats_pb));
-  delta_stats_.swap(stats);
+  std::lock_guard<simple_spinlock> l(stats_lock_);
+  delta_stats_ = std::move(stats);
   return Status::OK();
 }
 
@@ -319,7 +327,8 @@ Status DeltaFileReader::CloneForDebugging(FsManager* fs_manager,
   RETURN_NOT_OK(fs_manager->OpenBlock(reader_->block_id(), &block));
   ReaderOptions options;
   options.parent_mem_tracker = parent_mem_tracker;
-  return DeltaFileReader::OpenNoInit(std::move(block), delta_type_, options, out);
+  return DeltaFileReader::OpenNoInit(std::move(block), delta_type_, options,
+                                     /*delta_stats*/nullptr, out);
 }
 
 Status DeltaFileReader::NewDeltaIterator(const RowIteratorOptions& opts,

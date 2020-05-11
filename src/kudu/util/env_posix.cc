@@ -9,6 +9,7 @@
 #include <glob.h>
 #include <pthread.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
@@ -18,18 +19,20 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <ostream>
 #include <string>
 #include <type_traits>
-#include <utility>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -37,9 +40,6 @@
 
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/once.h"
@@ -125,7 +125,7 @@ typedef struct xfs_flock64 {
 #define MAYBE_RETURN_EIO(filename_expr, error_expr) do { \
   const string& f_ = (filename_expr); \
   MAYBE_RETURN_FAILURE(FLAGS_env_inject_eio, \
-      ShouldInject(f_, FLAGS_env_inject_eio_globs) ? (error_expr) : Status::OK()) \
+      ShouldInject(f_, FLAGS_env_inject_eio_globs) ? (error_expr) : Status::OK()); \
 } while (0)
 
 bool ShouldInject(const string& candidate, const string& glob_patterns) {
@@ -206,6 +206,12 @@ const char* const Env::kInjectedFailureStatusMsg = "INJECTED FAILURE";
 
 namespace {
 
+struct FreeDeleter {
+  inline void operator()(void* ptr) const {
+    free(ptr);
+  }
+};
+
 #if defined(__APPLE__)
 // Simulates Linux's fallocate file preallocation API on OS X.
 int fallocate(int fd, int mode, off_t offset, off_t len) {
@@ -279,6 +285,13 @@ ssize_t pwritev(int fd, const struct iovec* iovec, int count, off_t offset) {
 }
 #endif
 
+void DoClose(int fd) {
+  int err;
+  RETRY_ON_EINTR(err, close(fd));
+  if (PREDICT_FALSE(err != 0)) {
+    PLOG(WARNING) << "Failed to close fd " << fd;
+  }
+}
 
 // Close file descriptor when object goes out of scope.
 class ScopedFdCloser {
@@ -289,11 +302,7 @@ class ScopedFdCloser {
 
   ~ScopedFdCloser() {
     ThreadRestrictions::AssertIOAllowed();
-    int err;
-    RETRY_ON_EINTR(err, ::close(fd_));
-    if (PREDICT_FALSE(err != 0)) {
-      PLOG(WARNING) << "Failed to close fd " << fd_;
-    }
+    DoClose(fd_);
   }
 
  private:
@@ -338,6 +347,16 @@ Status DoSync(int fd, const string& filename) {
       return IOError(filename, errno);
     }
   }
+  return Status::OK();
+}
+
+Status DoOpen(const string& filename, int flags, const string& reason, int* fd) {
+  int f;
+  RETRY_ON_EINTR(f, open(filename.c_str(), flags));
+  if (f == -1) {
+    return IOError(Substitute("Error opening for $0: $1", reason, filename), errno);
+  }
+  *fd = f;
   return Status::OK();
 }
 
@@ -524,6 +543,7 @@ const char* ResourceLimitTypeToString(Env::ResourceLimitType t) {
       return "running threads per effective uid";
     default: LOG(FATAL) << "Unknown resource limit type";
   }
+  __builtin_unreachable();
 }
 
 int ResourceLimitTypeToUnixRlimit(Env::ResourceLimitType t) {
@@ -532,6 +552,7 @@ int ResourceLimitTypeToUnixRlimit(Env::ResourceLimitType t) {
     case Env::ResourceLimitType::RUNNING_THREADS_PER_EUID: return RLIMIT_NPROC;
     default: LOG(FATAL) << "Unknown resource limit type: " << t;
   }
+  __builtin_unreachable();
 }
 
 #ifdef __APPLE__
@@ -543,8 +564,52 @@ const char* ResourceLimitTypeToMacosRlimit(Env::ResourceLimitType t) {
       return "kern.maxprocperuid";
     default: LOG(FATAL) << "Unknown resource limit type: " << t;
   }
+  __builtin_unreachable();
 }
 #endif
+
+class PosixFifo : public Fifo {
+ public:
+  explicit PosixFifo(string fname) : filename_(std::move(fname)) {}
+
+  const string& filename() const override {
+    return filename_;
+  }
+
+  Status OpenForReads() override {
+    CHECK_EQ(-1, read_fd_);
+    return DoOpen(filename_, O_RDONLY, "reads", &read_fd_);
+  }
+
+  Status OpenForWrites() override {
+    CHECK_EQ(-1, write_fd_);
+    return DoOpen(filename_, O_WRONLY, "writes", &write_fd_);
+  }
+
+  int read_fd() const override {
+    CHECK_NE(-1, read_fd_);
+    return read_fd_;
+  }
+
+  int write_fd() const override {
+    CHECK_NE(-1, write_fd_);
+    return write_fd_;
+  }
+
+  ~PosixFifo() {
+    if (read_fd_ != -1) {
+      DoClose(read_fd_);
+    }
+    if (write_fd_ != -1) {
+      DoClose(write_fd_);
+    }
+  }
+
+ private:
+  const string filename_;
+  int read_fd_ = -1;
+  int write_fd_ = -1;
+};
 
 class PosixSequentialFile: public SequentialFile {
  private:
@@ -554,7 +619,7 @@ class PosixSequentialFile: public SequentialFile {
  public:
   PosixSequentialFile(string fname, FILE* f)
       : filename_(std::move(fname)), file_(f) {}
-  virtual ~PosixSequentialFile() {
+  ~PosixSequentialFile() {
     int err;
     RETRY_ON_EINTR(err, fclose(file_));
     if (PREDICT_FALSE(err != 0)) {
@@ -603,12 +668,8 @@ class PosixRandomAccessFile: public RandomAccessFile {
  public:
   PosixRandomAccessFile(string fname, int fd)
       : filename_(std::move(fname)), fd_(fd) {}
-  virtual ~PosixRandomAccessFile() {
-    int err;
-    RETRY_ON_EINTR(err, close(fd_));
-    if (PREDICT_FALSE(err != 0)) {
-      PLOG(WARNING) << "Failed to close " << filename_;
-    }
+  ~PosixRandomAccessFile() {
+    DoClose(fd_);
   }
 
   virtual Status Read(uint64_t offset, Slice result) const OVERRIDE {
@@ -1070,8 +1131,7 @@ class PosixFileLock : public FileLock {
 
 class PosixEnv : public Env {
  public:
-  PosixEnv();
-  virtual ~PosixEnv() {
+  ~PosixEnv() {
     fprintf(stderr, "Destroying Env::Default()\n");
     exit(1);
   }
@@ -1162,6 +1222,16 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
+  virtual Status NewFifo(const string& fname, unique_ptr<Fifo>* fifo) override {
+    TRACE_EVENT1("io", "PosixEnv::NewFifo", "path", fname);
+    int m = mkfifo(fname.c_str(), 0666);
+    if (m != 0) {
+      return IOError(Substitute("Error creating fifo $0", fname), errno);
+    }
+    fifo->reset(new PosixFifo(fname));
+    return Status::OK();
+  }
+
   virtual bool FileExists(const string& fname) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::FileExists", "path", fname);
     ThreadRestrictions::AssertIOAllowed();
@@ -1222,7 +1292,7 @@ class PosixEnv : public Env {
   Status GetCurrentWorkingDir(string* cwd) const override {
     TRACE_EVENT0("io", "PosixEnv::GetCurrentWorkingDir");
     ThreadRestrictions::AssertIOAllowed();
-    unique_ptr<char, FreeDeleter> wd(getcwd(NULL, 0));
+    unique_ptr<char[], FreeDeleter> wd(getcwd(nullptr, 0));
     if (!wd) {
       return IOError("getcwd()", errno);
     }
@@ -1261,8 +1331,11 @@ class PosixEnv : public Env {
   }
 
   virtual Status DeleteRecursively(const string &name) OVERRIDE {
-    return Walk(name, POST_ORDER, Bind(&PosixEnv::DeleteRecursivelyCb,
-                                       Unretained(this)));
+    return Walk(
+        name, POST_ORDER,
+        [this](FileType type, const string& dirname, const string& basename) {
+          return this->DeleteRecursivelyCb(type, dirname, basename);
+        });
   }
 
   virtual Status GetFileSize(const string& fname, uint64_t* size) OVERRIDE {
@@ -1302,9 +1375,11 @@ class PosixEnv : public Env {
                                               uint64_t* bytes_used) OVERRIDE {
     TRACE_EVENT1("io", "PosixEnv::GetFileSizeOnDiskRecursively", "path", root);
     uint64_t total = 0;
-    RETURN_NOT_OK(Walk(root, Env::PRE_ORDER,
-                       Bind(&PosixEnv::GetFileSizeOnDiskRecursivelyCb,
-                            Unretained(this), &total)));
+    RETURN_NOT_OK(Walk(
+        root, PRE_ORDER,
+        [this, &total](FileType type, const string& dirname, const string& basename) {
+          return this->GetFileSizeOnDiskRecursivelyCb(&total, type, dirname, basename);
+        }));
     *bytes_used = total;
     return Status::OK();
   }
@@ -1388,11 +1463,7 @@ class PosixEnv : public Env {
       result = IOError(fname, errno);
     } else if (LockOrUnlock(fd, true) == -1) {
       result = IOError("lock " + fname, errno);
-      int err;
-      RETRY_ON_EINTR(err, close(fd));
-      if (PREDICT_FALSE(err != 0)) {
-        PLOG(WARNING) << "Failed to close fd " << fd;
-      }
+      DoClose(fd);
     } else {
       auto my_lock = new PosixFileLock;
       my_lock->fd_ = fd;
@@ -1409,11 +1480,7 @@ class PosixEnv : public Env {
     if (LockOrUnlock(my_lock->fd_, false) == -1) {
       result = IOError("unlock", errno);
     }
-    int err;
-    RETRY_ON_EINTR(err, close(my_lock->fd_));
-    if (PREDICT_FALSE(err != 0)) {
-      PLOG(WARNING) << "Failed to close fd " << my_lock->fd_;
-    }
+    DoClose(my_lock->fd_);
     return result;
   }
 
@@ -1512,8 +1579,8 @@ class PosixEnv : public Env {
 
     // FTS requires a non-const copy of the name. strdup it and free() when
     // we leave scope.
-    unique_ptr<char, FreeDeleter> name_dup(strdup(root.c_str()));
-    char *(paths[]) = { name_dup.get(), nullptr };
+    unique_ptr<char[], FreeDeleter> name_dup(strdup(root.c_str()));
+    char* paths[] = { name_dup.get(), nullptr };
 
     // FTS_NOCHDIR is important here to make this thread-safe.
     FTS* ret;
@@ -1524,7 +1591,7 @@ class PosixEnv : public Env {
     }
     unique_ptr<FTS, FtsCloser> tree(ret);
 
-    FTSENT *ent = nullptr;
+    FTSENT* ent = nullptr;
     bool had_errors = false;
     while ((ent = fts_read(tree.get())) != nullptr) {
       bool doCb = false;
@@ -1562,7 +1629,7 @@ class PosixEnv : public Env {
           break;
       }
       if (doCb) {
-        if (!cb.Run(type, DirName(ent->fts_path), ent->fts_name).ok()) {
+        if (!cb(type, DirName(ent->fts_path), ent->fts_name).ok()) {
           had_errors = true;
         }
       }
@@ -1750,6 +1817,17 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
+  virtual Status CreateSymLink(const string& src, const string& dst) override {
+    ThreadRestrictions::AssertIOAllowed();
+    TRACE_EVENT2("io", "PosixEnv::CreateSymLink", "src", src, "dst", dst);
+    MAYBE_RETURN_EIO(dst, IOError(Env::kInjectedFailureStatusMsg, EIO));
+    Status result;
+    if (symlink(src.c_str(), dst.c_str()) != 0) {
+      result = IOError(dst, errno);
+    }
+    return result;
+  }
+
  private:
   // unique_ptr Deleter implementation for fts_close
   struct FtsCloser {
@@ -1817,7 +1895,7 @@ class PosixEnv : public Env {
   }
 
   Status GetFileSizeOnDiskRecursivelyCb(uint64_t* bytes_used,
-                                        Env::FileType type,
+                                        FileType type,
                                         const string& dirname,
                                         const string& basename) {
     uint64_t file_bytes_used = 0;
@@ -1837,8 +1915,6 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 };
-
-PosixEnv::PosixEnv() {}
 
 }  // namespace
 

@@ -20,7 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <iosfwd>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -31,7 +31,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp> // IWYU pragma: keep
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 
@@ -498,10 +497,14 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
 
   const TableMetrics* table_metrics = table->GetMetrics();
   if (table_metrics) {
-    // If the table doesn't support live row counts, the value will be negative.
-    // But the value of disk size will never be negative.
-    (*output)["table_disk_size"] =
-        HumanReadableNumBytes::ToString(table_metrics->on_disk_size->value());
+    // If the table doesn't support 'on disk size' and 'live row count',
+    // we need to show their values as "N/A".
+    if (table_metrics->TableSupportsOnDiskSize()) {
+      (*output)["table_disk_size"] =
+          HumanReadableNumBytes::ToString(table_metrics->on_disk_size->value());
+    } else {
+      (*output)["table_disk_size"] = "N/A";
+    }
     if (table_metrics->TableSupportsLiveRowCount()) {
       (*output)["table_live_row_count"] = table_metrics->live_row_count->value();
     } else {
@@ -777,23 +780,33 @@ Status MasterPathHandlers::Register(Webserver* server) {
   bool is_on_nav_bar = true;
   server->RegisterPathHandler(
       "/tablet-servers", "Tablet Servers",
-      boost::bind(&MasterPathHandlers::HandleTabletServers, this, _1, _2),
+      [this](const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+        this->HandleTabletServers(req, resp);
+      },
       is_styled, is_on_nav_bar);
   server->RegisterPathHandler(
       "/tables", "Tables",
-      boost::bind(&MasterPathHandlers::HandleCatalogManager, this, _1, _2),
+      [this](const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+        this->HandleCatalogManager(req, resp);
+      },
       is_styled, is_on_nav_bar);
   server->RegisterPathHandler(
       "/table", "",
-      boost::bind(&MasterPathHandlers::HandleTablePage, this, _1, _2),
+      [this](const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+        this->HandleTablePage(req, resp);
+      },
       is_styled, false);
   server->RegisterPathHandler(
       "/masters", "Masters",
-      boost::bind(&MasterPathHandlers::HandleMasters, this, _1, _2),
+      [this](const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+        this->HandleMasters(req, resp);
+      },
       is_styled, is_on_nav_bar);
   server->RegisterPrerenderedPathHandler(
       "/dump-entities", "Dump Entities",
-      boost::bind(&MasterPathHandlers::HandleDumpEntities, this, _1, _2),
+      [this](const Webserver::WebRequest& req, Webserver::PrerenderedWebResponse* resp) {
+        this->HandleDumpEntities(req, resp);
+      },
       false, false);
   return Status::OK();
 }

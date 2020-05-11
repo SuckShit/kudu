@@ -56,11 +56,22 @@ tasks.withType(Test) {
       jvmArgs += "--add-opens=$module=ALL-UNNAMED"
     }
   }
+  // Enable paranoid Netty leak detection during tests.
+  // https://netty.io/wiki/reference-counted-objects.html#leak-detection-levels
+  if (propertyExists("nettyLeakDetection")) {
+    jvmArgs += "-Dio.netty.leakDetection.level=paranoid"
+  }
 
   // Set a few system properties.
   systemProperty "java.awt.headless", true
   systemProperty "java.net.preferIPv4Stack", true
   systemProperty "java.security.egd", "file:/dev/urandom" // Improve RNG generation speed.
+
+  if (propertyExists("securityDebug")) {
+    systemProperty "sun.security.krb5.debug", true
+    systemProperty "sun.security.spnego.debug", true
+    systemProperty "javax.net.debug", "all"
+  }
 
   // Only use the local KuduBinDir if we are not using the kudu-binary jar.
   if (!propertyExists("useBinJar")) {
@@ -73,13 +84,6 @@ tasks.withType(Test) {
   // reproduce a test failure for a test that uses the PRNG to generate state.
   if (propertyExists("testRandomSeed")) {
     systemProperty "testRandomSeed", propertyWithDefault("testRandomSeed", null)
-  }
-
-  // Don't fail the build if a --tests filter doesn't match any tests.
-  // This is useful for filtering tests from the top of the project where some
-  // subprojects won't match the filter. Without this, those subprojects would fail.
-  filter {
-    failOnNoMatchingTests = false
   }
 
   // Force the tests to be rerun if the rerunTests property is set.

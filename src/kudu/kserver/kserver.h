@@ -17,11 +17,14 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/server/server_base.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/threadpool.h"
 
 namespace kudu {
@@ -48,17 +51,18 @@ class KuduServer : public server::ServerBase {
 
   // Finalizes the initialization of a KuduServer by performing any member
   // initializations that may fail.
-  virtual Status Init() override;
+  Status Init() override;
 
   // Exposes an initialized KuduServer to the network or filesystem.
-  virtual Status Start() override;
+  Status Start() override;
 
   // Shuts down a KuduServer instance.
-  virtual void Shutdown() override;
+  void Shutdown() override;
 
   ThreadPool* tablet_prepare_pool() const { return tablet_prepare_pool_.get(); }
   ThreadPool* tablet_apply_pool() const { return tablet_apply_pool_.get(); }
   ThreadPool* raft_pool() const { return raft_pool_.get(); }
+  scoped_refptr<AtomicGauge<int32_t>> num_raft_leaders() const { return num_raft_leaders_; }
 
  private:
 
@@ -70,6 +74,9 @@ class KuduServer : public server::ServerBase {
 
   // Thread pool for Raft-related operations, shared between all tablets.
   std::unique_ptr<ThreadPool> raft_pool_;
+
+  // Gauge counting the number of Raft instances that in leaders mode.
+  scoped_refptr<AtomicGauge<int32_t>> num_raft_leaders_;
 
   DISALLOW_COPY_AND_ASSIGN(KuduServer);
 };

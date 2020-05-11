@@ -20,13 +20,12 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include <boost/bind.hpp> // IWYU pragma: keep
 #include <boost/optional/optional.hpp>
 #include <boost/optional/optional_io.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -38,9 +37,7 @@
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.pb.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/tablet/key_value_test_schema.h"
 #include "kudu/tablet/local_tablet_writer.h"
 #include "kudu/tablet/rowset.h"
@@ -49,11 +46,11 @@
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 DEFINE_int32(keyspace_size, 3000, "number of unique row keys to insert/mutate");
 DEFINE_int32(runtime_seconds, 1, "number of seconds to run the test");
@@ -65,6 +62,7 @@ DECLARE_int32(deltafile_default_block_size);
 
 using boost::optional;
 using std::string;
+using std::thread;
 using std::unique_ptr;
 using std::vector;
 
@@ -119,23 +117,34 @@ class TestRandomAccess : public KuduTabletTest {
     vector<LocalTabletWriter::Op> pending;
     for (int i = 0; i < 3; i++) {
       int new_val = rand();
+      int r = rand() % 3;
       if (cur_val == boost::none) {
         // If there is no row, then randomly insert or upsert.
-        if (rand() % 2 == 1) {
-          cur_val = InsertRow(key, new_val, &pending);
-        } else {
-          cur_val = UpsertRow(key, new_val, cur_val, &pending);
+        switch (r) {
+          case 1:
+            cur_val = InsertRow(key, new_val, &pending);
+            break;
+          case 2:
+            cur_val = InsertIgnoreRow(key, new_val, &pending);
+            break;
+          default:
+            cur_val = UpsertRow(key, new_val, cur_val, &pending);
         }
       } else {
         if (new_val % (FLAGS_update_delete_ratio + 1) == 0) {
           cur_val = DeleteRow(key, &pending);
         } else {
-          // If we are meant to update an existing row, randomly choose
-          // between update and upsert.
-          if (rand() % 2 == 1) {
-            cur_val = MutateRow(key, new_val, cur_val, &pending);
-          } else {
-            cur_val = UpsertRow(key, new_val, cur_val, &pending);
+          // If row already exists, randomly choose between an update,
+          // upsert, and insert ignore.
+          switch (r) {
+            case 1:
+              cur_val = MutateRow(key, new_val, cur_val, &pending);
+              break;
+            case 2:
+              InsertIgnoreRow(key, new_val, &pending); // won't change existing value
+              break;
+            default:
+              cur_val = UpsertRow(key, new_val, cur_val, &pending);
           }
         }
       }
@@ -186,10 +195,14 @@ class TestRandomAccess : public KuduTabletTest {
     }
   }
 
-  // Adds an insert for the given key/value pair to 'ops', returning the new stringified
-  // value of the row.
+  // Adds an insert for the given key/value pair to 'ops', returning the expected value
   optional<ExpectedKeyValueRow> InsertRow(int key, int val, vector<LocalTabletWriter::Op>* ops) {
     return DoRowOp(RowOperationsPB::INSERT, key, val, boost::none, ops);
+  }
+
+  optional<ExpectedKeyValueRow> InsertIgnoreRow(int key, int val,
+                                                vector<LocalTabletWriter::Op>* ops) {
+    return DoRowOp(RowOperationsPB::INSERT_IGNORE, key, val, boost::none, ops);
   }
 
   optional<ExpectedKeyValueRow> UpsertRow(int key,
@@ -199,8 +212,7 @@ class TestRandomAccess : public KuduTabletTest {
     return DoRowOp(RowOperationsPB::UPSERT, key, val, old_row, ops);
   }
 
-  // Adds an update of the given key/value pair to 'ops', returning the new stringified
-  // value of the row.
+  // Adds an update of the given key/value pair to 'ops', returning the expected value
   optional<ExpectedKeyValueRow> MutateRow(int key,
                                           uint32_t new_val,
                                           const optional<ExpectedKeyValueRow>& old_row,
@@ -214,7 +226,7 @@ class TestRandomAccess : public KuduTabletTest {
                                         const optional<ExpectedKeyValueRow>& old_row,
                                         vector<LocalTabletWriter::Op>* ops) {
 
-    gscoped_ptr<KuduPartialRow> row(new KuduPartialRow(&client_schema_));
+    unique_ptr<KuduPartialRow> row(new KuduPartialRow(&client_schema_));
     CHECK_OK(row->SetInt32(0, key));
     optional<ExpectedKeyValueRow> ret = ExpectedKeyValueRow();
     ret->key = key;
@@ -223,6 +235,7 @@ class TestRandomAccess : public KuduTabletTest {
       case RowOperationsPB::UPSERT:
       case RowOperationsPB::UPDATE:
       case RowOperationsPB::INSERT:
+      case RowOperationsPB::INSERT_IGNORE:
         switch (val % 2) {
           case 0:
             CHECK_OK(row->SetNull(1));
@@ -261,7 +274,7 @@ class TestRandomAccess : public KuduTabletTest {
   // Adds a delete of the given row to 'ops', returning an empty string (indicating that
   // the row no longer exists).
   optional<ExpectedKeyValueRow> DeleteRow(int key, vector<LocalTabletWriter::Op>* ops) {
-    gscoped_ptr<KuduPartialRow> row(new KuduPartialRow(&client_schema_));
+    unique_ptr<KuduPartialRow> row(new KuduPartialRow(&client_schema_));
     CHECK_OK(row->SetInt32(0, key));
     ops->push_back(LocalTabletWriter::Op(RowOperationsPB::DELETE, row.release()));
     return boost::none;
@@ -316,18 +329,16 @@ class TestRandomAccess : public KuduTabletTest {
   // operations. This stops the compact/flush thread.
   CountDownLatch done_;
 
-  gscoped_ptr<LocalTabletWriter> writer_;
+  unique_ptr<LocalTabletWriter> writer_;
 };
 
 TEST_F(TestRandomAccess, Test) {
-  scoped_refptr<Thread> flush_thread;
-  CHECK_OK(Thread::Create("test", "flush",
-                          boost::bind(&TestRandomAccess::BackgroundOpThread, this),
-                          &flush_thread));
-
-  DoRandomBatches();
-  done_.CountDown();
-  flush_thread->Join();
+  thread flush_thread([this]() { this->BackgroundOpThread(); });
+  SCOPED_CLEANUP({
+    done_.CountDown();
+    flush_thread.join();
+  });
+  NO_FATALS(DoRandomBatches());
 }
 
 

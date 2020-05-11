@@ -26,7 +26,6 @@
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/common/common.pb.h"
@@ -38,7 +37,6 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/hms/hms_catalog.h"
-#include "kudu/master/authz_provider.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/location_cache.h"
 #include "kudu/master/master.h"
@@ -630,14 +628,10 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
 
   // Set the info about the other masters, so that the client can verify
   // it has the full set of info.
-  {
-    vector<HostPortPB> hostports;
-    WARN_NOT_OK(server_->GetMasterHostPorts(&hostports),
-                "unable to get HostPorts for masters");
-    resp->mutable_master_addrs()->Reserve(hostports.size());
-    for (auto& hp : hostports) {
-      *resp->add_master_addrs() = std::move(hp);
-    }
+  const auto& addresses = server_->catalog_manager()->master_addresses();
+  resp->mutable_master_addrs()->Reserve(addresses.size());
+  for (const auto& hp : addresses) {
+    *resp->add_master_addrs() = HostPortToPB(hp);
   }
 
   const bool is_leader = l.leader_status().ok();
@@ -680,7 +674,7 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
     metastore_config->set_hms_uris(FLAGS_hive_metastore_uris);
     metastore_config->set_hms_sasl_enabled(FLAGS_hive_metastore_sasl_enabled);
     string uuid;
-    if (server_->catalog_manager()->HmsCatalog()->GetUuid(&uuid).ok()) {
+    if (server_->catalog_manager()->hms_catalog()->GetUuid(&uuid).ok()) {
       metastore_config->set_hms_uuid(std::move(uuid));
     }
   }
@@ -723,17 +717,6 @@ void MasterServiceImpl::ReplaceTablet(const ReplaceTabletRequestPB* req,
 
   Status s = server_->catalog_manager()->ReplaceTablet(req->tablet_id(), resp);
   CheckRespErrorOrSetUnknown(s, resp);
-  rpc->RespondSuccess();
-}
-
-void MasterServiceImpl::ResetAuthzCache(
-    const ResetAuthzCacheRequestPB* /* req */,
-    ResetAuthzCacheResponsePB* resp,
-    rpc::RpcContext* rpc) {
-  LOG(INFO) << Substitute("request to reset authz privileges cache from $0",
-                          rpc->requestor_string());
-  CheckRespErrorOrSetUnknown(
-      server_->catalog_manager()->authz_provider()->ResetCache(), resp);
   rpc->RespondSuccess();
 }
 

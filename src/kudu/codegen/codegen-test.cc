@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -35,7 +36,6 @@
 #include "kudu/common/row.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/common/schema.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/singleton.h"
 #include "kudu/util/logging_test_util.h"
@@ -48,6 +48,7 @@
 #include "kudu/util/test_util.h"
 
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 DECLARE_bool(codegen_dump_mc);
@@ -114,7 +115,7 @@ class CodegenTest : public KuduTest {
   template<bool READ>
   void TestProjection(const Schema* proj);
   // Generates a new row projector for the given projection schema.
-  Status Generate(const Schema* proj, gscoped_ptr<CodegenRP>* out);
+  Status Generate(const Schema* proj, unique_ptr<CodegenRP>* out);
 
   enum {
     // Base schema column indices
@@ -151,9 +152,9 @@ class CodegenTest : public KuduTest {
 
   codegen::CodeGenerator generator_;
   Random random_;
-  gscoped_ptr<ConstContiguousRow> test_rows_[kNumTestRows];
+  unique_ptr<ConstContiguousRow> test_rows_[kNumTestRows];
   Arena projections_arena_;
-  gscoped_ptr<Arena> test_rows_arena_;
+  unique_ptr<Arena> test_rows_arena_;
 };
 
 namespace {
@@ -211,7 +212,7 @@ void CodegenTest::ProjectTestRows(RowProjectorType* rp, RowBlock* rb) {
 
 template<bool READ>
 void CodegenTest::TestProjection(const Schema* proj) {
-  gscoped_ptr<CodegenRP> with;
+  unique_ptr<CodegenRP> with;
   ASSERT_OK(Generate(proj, &with));
   NoCodegenRP without(&base_, proj);
   ASSERT_OK(without.Init());
@@ -228,7 +229,7 @@ void CodegenTest::TestProjection(const Schema* proj) {
   CheckRowBlocksEqual(&rb_with, &rb_without, "Codegen", "Expected");
 }
 
-Status CodegenTest::Generate(const Schema* proj, gscoped_ptr<CodegenRP>* out) {
+Status CodegenTest::Generate(const Schema* proj, unique_ptr<CodegenRP>* out) {
   scoped_refptr<codegen::RowProjectorFunctions> functions;
   RETURN_NOT_OK(generator_.CompileRowProjector(base_, *proj, &functions));
   out->reset(new CodegenRP(&base_, proj, functions));
@@ -247,7 +248,7 @@ Status CodegenTest::CreatePartialSchema(const vector<size_t>& col_indexes,
 TEST_F(CodegenTest, ObservablesTest) {
   // Test when not identity
   Schema proj = base_.CreateKeyProjection();
-  gscoped_ptr<CodegenRP> with;
+  unique_ptr<CodegenRP> with;
   CHECK_OK(Generate(&proj, &with));
   NoCodegenRP without(&base_, &proj);
   ASSERT_OK(without.Init());
@@ -258,7 +259,7 @@ TEST_F(CodegenTest, ObservablesTest) {
 
   // Test when identity
   Schema iproj = *&base_;
-  gscoped_ptr<CodegenRP> iwith;
+  unique_ptr<CodegenRP> iwith;
   CHECK_OK(Generate(&iproj, &iwith));
   NoCodegenRP iwithout(&base_, &iproj);
   ASSERT_OK(iwithout.Init());
@@ -401,7 +402,7 @@ TEST_F(CodegenTest, TestCodeCache) {
       Schema projection;
       ASSERT_OK(CreatePartialSchema(perm, &projection));
 
-      gscoped_ptr<CodegenRP> projector;
+      unique_ptr<CodegenRP> projector;
       if (cm->RequestRowProjector(&base_, &projection, &projector)) {
         num_hits++;
       }

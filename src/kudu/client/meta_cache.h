@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
@@ -124,6 +125,12 @@ class RemoteTabletServer {
   std::string location_;
 
   std::vector<HostPort> rpc_hostports_;
+
+  // The path on which this server is listening for unix domain socket connections.
+  // This should only be used in the case that it can be determined that the tablet
+  // server is local to the client.
+  boost::optional<std::string> unix_domain_socket_path_;
+
   std::shared_ptr<tserver::TabletServerServiceProxy> proxy_;
 
   DISALLOW_COPY_AND_ASSIGN(RemoteTabletServer);
@@ -164,9 +171,9 @@ class MetaCacheServerPicker : public rpc::ServerPicker<RemoteTabletServer> {
                       const Status& status);
 
   // Called when the proxy is initialized.
-  void InitProxyCb(const ServerPickedCallback& callback,
-                   RemoteTabletServer* replica,
-                   const Status& status);
+  static void InitProxyCb(const ServerPickedCallback& callback,
+                          RemoteTabletServer* replica,
+                          const Status& status);
 
   // Lock protecting accesses/updates to 'followers_'.
   mutable simple_spinlock lock_;

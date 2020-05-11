@@ -22,13 +22,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <tuple>  // IWYU pragma: keep
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -48,7 +49,7 @@
 #include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/value.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
@@ -326,11 +327,11 @@ class ToolTest : public KuduTest {
     ASSERT_TRUE(stdout.empty());
     ASSERT_FALSE(stderr.empty());
 
-    // If it was an invalid command, the usage string is on the third line.
-    int usage_idx = 1;
+    // If it was an invalid command, the usage string is on the second line.
+    int usage_idx = 0;
     if (!expected_status.ok()) {
-      ASSERT_EQ(expected_status.ToString(), stderr[1]);
-      usage_idx = 2;
+      ASSERT_EQ(expected_status.ToString(), stderr[0]);
+      usage_idx = 1;
     }
     ASSERT_EQ(0, stderr[usage_idx].find("Usage: "));
 
@@ -353,8 +354,8 @@ class ToolTest : public KuduTest {
     vector<string> err_lines;
     RunTool(arg_str, nullptr, nullptr, nullptr, /* stderr_lines = */ &err_lines);
     ASSERT_GE(err_lines.size(), 3) << err_lines;
-    ASSERT_EQ(expected_status.ToString(), err_lines[1]);
-    ASSERT_STR_MATCHES(err_lines[3], "Usage: kudu.*");
+    ASSERT_EQ(expected_status.ToString(), err_lines[0]);
+    ASSERT_STR_MATCHES(err_lines[2], "Usage: .*kudu.*");
   }
 
   void RunFsCheck(const string& arg_str,
@@ -429,7 +430,7 @@ class ToolTest : public KuduTest {
     vector<pair<string, string>> expected_columns;
     if (columns.empty()) {
       // If we ran with an empty projection, we'll actually get all the columns.
-      expected_columns = {{ "int32", "key" },
+      expected_columns = {{ "int.*", "key" },
                           { "int32", "int_val" },
                           { "string", "string_val" }};
     } else {
@@ -1068,7 +1069,6 @@ TEST_F(ToolTest, TestModeHelp) {
   }
   {
     const vector<string> kMasterModeRegexes = {
-        "authz_cache.*Operate on the authz cache of a Kudu Master",
         "dump_memtrackers.*Dump the memtrackers",
         "get_flags.*Get the gflags",
         "set_flag.*Change a gflag value",
@@ -1077,12 +1077,6 @@ TEST_F(ToolTest, TestModeHelp) {
         "list.*List masters in a Kudu cluster",
     };
     NO_FATALS(RunTestHelp("master", kMasterModeRegexes));
-  }
-  {
-    const vector<string> kMasterAuthzCacheModeRegexes = {
-        "reset.*Reset the privileges cache",
-    };
-    NO_FATALS(RunTestHelp("master authz_cache", kMasterAuthzCacheModeRegexes));
   }
   {
     const vector<string> kPbcModeRegexes = {
@@ -1164,6 +1158,7 @@ TEST_F(ToolTest, TestModeHelp) {
         "set_flag.*Change a gflag value",
         "state.*Operate on the state",
         "status.*Get the status",
+        "quiesce.*Operate on the quiescing state",
         "timestamp.*Get the current timestamp",
         "list.*List tablet servers"
     };
@@ -1175,6 +1170,14 @@ TEST_F(ToolTest, TestModeHelp) {
         "exit_maintenance.*End maintenance of the Tablet Server",
     };
     NO_FATALS(RunTestHelp("tserver state", kTServerSetStateModeRegexes));
+  }
+  {
+    const vector<string> kTServerQuiesceModeRegexes = {
+        "status.*Output information about the quiescing state",
+        "start.*Start quiescing the given Tablet Server",
+        "stop.*Stop quiescing a Tablet Server",
+    };
+    NO_FATALS(RunTestHelp("tserver quiesce", kTServerQuiesceModeRegexes));
   }
   {
     const vector<string> kWalModeRegexes = {
@@ -1243,7 +1246,7 @@ TEST_F(ToolTest, TestFsCheck) {
   // the other half are deemed missing.
   vector<BlockId> missing_ids;
   {
-    FsManager fs(env_, kTestDir);
+    FsManager fs(env_, FsManagerOpts(kTestDir));
     FsReport report;
     ASSERT_OK(fs.Open(&report));
     std::shared_ptr<BlockDeletionTransaction> deletion_transaction =
@@ -1265,7 +1268,7 @@ TEST_F(ToolTest, TestFsCheck) {
   // Here we check twice to show that if --repair isn't provided, there should
   // be no effect.
   {
-    FsManager fs(env_, kTestDir);
+    FsManager fs(env_, FsManagerOpts(kTestDir));
     FsReport report;
     ASSERT_OK(fs.Open(&report));
     ASSERT_OK(env_->DeleteFile(fs.GetTabletMetadataPath(kTabletId)));
@@ -1303,7 +1306,7 @@ TEST_F(ToolTest, TestFsCheckLiveServer) {
 TEST_F(ToolTest, TestFsFormat) {
   const string kTestDir = GetTestPath("test");
   NO_FATALS(RunActionStdoutNone(Substitute("fs format --fs_wal_dir=$0", kTestDir)));
-  FsManager fs(env_, kTestDir);
+  FsManager fs(env_, FsManagerOpts(kTestDir));
   ASSERT_OK(fs.Open());
 
   ObjectIdGenerator generator;
@@ -1318,7 +1321,7 @@ TEST_F(ToolTest, TestFsFormatWithUuid) {
   string original_uuid = generator.Next();
   NO_FATALS(RunActionStdoutNone(Substitute(
       "fs format --fs_wal_dir=$0 --uuid=$1", kTestDir, original_uuid)));
-  FsManager fs(env_, kTestDir);
+  FsManager fs(env_, FsManagerOpts(kTestDir));
   ASSERT_OK(fs.Open());
 
   string canonicalized_uuid;
@@ -1331,7 +1334,7 @@ TEST_F(ToolTest, TestFsDumpUuid) {
   const string kTestDir = GetTestPath("test");
   string uuid;
   {
-    FsManager fs(env_, kTestDir);
+    FsManager fs(env_, FsManagerOpts(kTestDir));
     ASSERT_OK(fs.CreateInitialFileSystemLayout());
     ASSERT_OK(fs.Open());
     uuid = fs.uuid();
@@ -1349,7 +1352,7 @@ TEST_F(ToolTest, TestPbcTools) {
   string instance_path;
   {
     ObjectIdGenerator generator;
-    FsManager fs(env_, kTestDir);
+    FsManager fs(env_, FsManagerOpts(kTestDir));
     ASSERT_OK(fs.CreateInitialFileSystemLayout(generator.Next()));
     ASSERT_OK(fs.Open());
     uuid = fs.uuid();
@@ -1500,7 +1503,7 @@ TEST_F(ToolTest, TestPbcTools) {
 TEST_F(ToolTest, TestFsDumpCFile) {
   const int kNumEntries = 8192;
   const string kTestDir = GetTestPath("test");
-  FsManager fs(env_, kTestDir);
+  FsManager fs(env_, FsManagerOpts(kTestDir));
   ASSERT_OK(fs.CreateInitialFileSystemLayout());
   ASSERT_OK(fs.Open());
 
@@ -1552,7 +1555,7 @@ TEST_F(ToolTest, TestFsDumpCFile) {
 
 TEST_F(ToolTest, TestFsDumpBlock) {
   const string kTestDir = GetTestPath("test");
-  FsManager fs(env_, kTestDir);
+  FsManager fs(env_, FsManagerOpts(kTestDir));
   ASSERT_OK(fs.CreateInitialFileSystemLayout());
   ASSERT_OK(fs.Open());
 
@@ -1577,7 +1580,7 @@ TEST_F(ToolTest, TestWalDump) {
   const Schema kSchema(GetSimpleTestSchema());
   const Schema kSchemaWithIds(SchemaBuilder(kSchema).Build());
 
-  FsManager fs(env_, kTestDir);
+  FsManager fs(env_, FsManagerOpts(kTestDir));
   ASSERT_OK(fs.CreateInitialFileSystemLayout());
   ASSERT_OK(fs.Open());
 
@@ -1585,10 +1588,11 @@ TEST_F(ToolTest, TestWalDump) {
     scoped_refptr<Log> log;
     ASSERT_OK(Log::Open(LogOptions(),
                         &fs,
+                        /*file_cache*/nullptr,
                         kTestTablet,
                         kSchemaWithIds,
                         0, // schema_version
-                        scoped_refptr<MetricEntity>(),
+                        /*metric_entity*/nullptr,
                         &log));
 
     OpId opid = consensus::MakeOpId(1, 1);
@@ -1739,7 +1743,7 @@ TEST_F(ToolTest, TestLocalReplicaDumpMeta) {
   const Schema kSchema(GetSimpleTestSchema());
   const Schema kSchemaWithIds(SchemaBuilder(kSchema).Build());
 
-  FsManager fs(env_, kTestDir);
+  FsManager fs(env_, FsManagerOpts(kTestDir));
   ASSERT_OK(fs.CreateInitialFileSystemLayout());
   ASSERT_OK(fs.Open());
 
@@ -1789,7 +1793,7 @@ TEST_F(ToolTest, TestFsDumpTree) {
   const Schema kSchema(GetSimpleTestSchema());
   const Schema kSchemaWithIds(SchemaBuilder(kSchema).Build());
 
-  FsManager fs(env_, kTestDir);
+  FsManager fs(env_, FsManagerOpts(kTestDir));
   ASSERT_OK(fs.CreateInitialFileSystemLayout());
   ASSERT_OK(fs.Open());
 
@@ -2257,6 +2261,55 @@ TEST_F(ToolTest, TestLoadgenDatabaseName) {
   ASSERT_STR_CONTAINS(out, "foo.loadgen_auto_");
 }
 
+TEST_F(ToolTest, TestLoadgenKeepAutoTableAndData) {
+  // Run 'perf loadgen' and keep data.
+  // Create a single tablet by setting table_num_hash_partitions and table_num_range_partitions
+  // to 1, then we can easily check sequential rows in the tablet by RunScanTableCheck.
+  NO_FATALS(RunLoadgen(1, { "--keep_auto_table=true",
+                            "--table_num_hash_partitions=1",
+                            "--table_num_range_partitions=1" }));
+  string auto_table_name;
+  NO_FATALS(RunActionStdoutString(Substitute("table list $0",
+      HostPort::ToCommaSeparatedString(cluster_->master_rpc_addrs())), &auto_table_name));
+
+  // Data is kept.
+  NO_FATALS(RunScanTableCheck(auto_table_name, "", 0, 1999, {}));
+
+  // Run 'perf loadgen' again with sequential mode and delete new generated data.
+  {
+    const vector<string> args = {
+      "perf",
+      "loadgen",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      Substitute("--table_name=$0", auto_table_name),
+      "--seq_start=2000",
+      "--use_random=false",
+      "--run_cleanup=true",
+    };
+    ASSERT_OK(RunKuduTool(args));
+  }
+
+  // Old data is kept and new data is deleted.
+  NO_FATALS(RunScanTableCheck(auto_table_name, "", 0, 1999, {}));
+
+  // Run 'perf loadgen' again with random mode and delete new generated data.
+  {
+    const vector<string> args = {
+      "perf",
+      "loadgen",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      Substitute("--table_name=$0", auto_table_name),
+      "--seq_start=2000",
+      "--use_random=true",
+      "--run_cleanup=true",
+    };
+    ASSERT_OK(RunKuduTool(args));
+  }
+
+  // Old data is kept and new data is deleted.
+  NO_FATALS(RunScanTableCheck(auto_table_name, "", 0, 1999, {}));
+}
+
 TEST_F(ToolTest, TestLoadgenHmsEnabled) {
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
@@ -2298,21 +2351,20 @@ TEST_F(ToolTest, TestLoadgenAutoGenTablePartitioning) {
   const MonoDelta kTimeout = MonoDelta::FromMilliseconds(10);
   TServerDetails* ts = ts_map_[cluster_->tablet_server(0)->uuid()];
 
-  // Test with misconfigured partitioning. This should fail because we disallow
-  // creating tables with "no" partitioning.
+  // Now let's try running with a single partition.
   vector<string> args(base_args);
   args.emplace_back("--table_num_range_partitions=1");
   args.emplace_back("--table_num_hash_partitions=1");
-  Status s = RunKuduTool(args);
-  ASSERT_FALSE(s.ok());
+  int expected_tablets = 1;
+  ASSERT_OK(RunKuduTool(args));
+  ASSERT_OK(WaitForNumTabletsOnTS(ts, expected_tablets, kTimeout));
 
   // Now let's try running with a couple range partitions.
   args = base_args;
   args.emplace_back("--table_num_range_partitions=2");
   args.emplace_back("--table_num_hash_partitions=1");
-  int expected_tablets = 2;
+  expected_tablets += 2;
   ASSERT_OK(RunKuduTool(args));
-  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
   ASSERT_OK(WaitForNumTabletsOnTS(ts, expected_tablets, kTimeout));
 
   // Now let's try running with only hash partitions.
@@ -4645,8 +4697,7 @@ TEST_P(ControlShellToolTest, TestControlShell) {
   {
     KuduClientBuilder client_builder;
     for (const auto& e : masters) {
-      HostPort hp;
-      ASSERT_OK(HostPortFromPB(e.bound_rpc_address(), &hp));
+      HostPort hp = HostPortFromPB(e.bound_rpc_address());
       client_builder.add_master_server_addr(hp.ToString());
     }
     shared_ptr<KuduClient> client;
@@ -4927,7 +4978,7 @@ TEST_F(ToolTest, TestFsSwappingDirectoriesFailsGracefully) {
   Status s = RunTool(Substitute(
       "fs update_dirs --fs_wal_dir=$0 --fs_data_dirs=$1",
       wal_root, new_data_root_no_wal), nullptr, &stderr);
-  ASSERT_STR_CONTAINS(stderr, "no healthy data directories found");
+  ASSERT_STR_CONTAINS(stderr, "no healthy directories found");
 
   // If we instead try to add the directory to the existing list of
   // directories, Kudu should allow it.
@@ -5274,7 +5325,7 @@ TEST_F(ToolTest, TestReplaceTablet) {
       ts = ts_map_[cluster_->tablet_server(i)->uuid()];
       ASSERT_OK(ListRunningTabletIds(ts, kTimeout, &tablet_ids));
       ASSERT_TRUE(std::none_of(tablet_ids.begin(), tablet_ids.end(),
-            [&](const string& tablet_id) -> bool { return tablet_id == old_tablet_id; }));
+            [&](const string& tablet_id) { return tablet_id == old_tablet_id; }));
     }
   });
 
@@ -5668,9 +5719,11 @@ TEST_F(ToolTest, TestFailedTableCopy) {
   ASSERT_STR_CONTAINS(stderr, "Timed out");
 }
 
-TEST_F(ToolTest, TestGetTableStatisticsLiveRowCountNotSupported) {
+TEST_F(ToolTest, TestGetTableStatisticsNotSupported) {
   ExternalMiniClusterOptions opts;
   opts.extra_master_flags = { "--mock_table_metrics_for_testing=true",
+                              "--on_disk_size_for_testing=77",
+                              "--catalog_manager_support_on_disk_size=false",
                               "--live_row_count_for_testing=99",
                               "--catalog_manager_support_live_row_count=false" };
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
@@ -5686,6 +5739,7 @@ TEST_F(ToolTest, TestGetTableStatisticsLiveRowCountNotSupported) {
                  cluster_->master()->bound_rpc_addr().ToString(),
                  TestWorkload::kDefaultTableName),
       &stdout));
+  ASSERT_STR_CONTAINS(stdout, "on disk size: N/A");
   ASSERT_STR_CONTAINS(stdout, "live row count: N/A");
 }
 

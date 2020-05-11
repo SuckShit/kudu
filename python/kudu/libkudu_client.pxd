@@ -125,6 +125,8 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         KUDU_BINARY " kudu::client::KuduColumnSchema::BINARY"
         KUDU_UNIXTIME_MICROS " kudu::client::KuduColumnSchema::UNIXTIME_MICROS"
         KUDU_DECIMAL " kudu::client::KuduColumnSchema::DECIMAL"
+        KUDU_VARCHAR " kudu::client::KuduColumnSchema::VARCHAR"
+        KUDU_DATE " kudu::client::KuduColumnSchema::DATE"
 
     enum EncodingType" kudu::client::KuduColumnStorageAttributes::EncodingType":
         EncodingType_AUTO " kudu::client::KuduColumnStorageAttributes::AUTO_ENCODING"
@@ -152,9 +154,11 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         KuduColumnTypeAttributes()
         KuduColumnTypeAttributes(const KuduColumnTypeAttributes& other)
         KuduColumnTypeAttributes(int8_t precision, int8_t scale)
+        KuduColumnTypeAttributes(uint16_t length)
 
         int8_t precision()
         int8_t scale()
+        uint16_t length()
 
         c_bool Equals(KuduColumnTypeAttributes& other)
         void CopyFrom(KuduColumnTypeAttributes& other)
@@ -203,6 +207,7 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
 
          KuduColumnSpec* Precision(int8_t precision);
          KuduColumnSpec* Scale(int8_t scale);
+         KuduColumnSpec* Length(uint16_t length);
 
          KuduColumnSpec* RenameTo(const string& new_name)
 
@@ -263,6 +268,12 @@ cdef extern from "kudu/client/scan_batch.h" namespace "kudu::client" nogil:
 
         Status GetBinary(const Slice& col_name, Slice* val)
         Status GetBinary(int col_idx, Slice* val)
+
+        Status GetVarchar(const Slice& col_name, Slice* val)
+        Status GetVarchar(int col_idx, Slice* val)
+
+        Status GetDate(Slice& col_name, int32_t* val)
+        Status GetDate(int col_idx, int32_t* val)
 
         const void* cell(int col_idx)
         string ToString()
@@ -359,6 +370,12 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
         Status SetBinaryCopy(const Slice& col_name, const Slice& val)
         Status SetBinaryCopy(int col_idx, const Slice& val)
 
+        Status SetVarchar(Slice& col_name, Slice& val)
+        Status SetVarchar(int col_idx, Slice& val)
+
+        Status SetDate(Slice& col_name, int32_t val)
+        Status SetDate(int col_idx, int32_t val)
+
         Status SetNull(Slice& col_name)
         Status SetNull(int col_idx)
 
@@ -410,6 +427,9 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
         Status GetBinary(const Slice& col_name, Slice* val)
         Status GetBinary(int col_idx, Slice* val)
 
+        Status GetVarchar(Slice& col_name, Slice* val)
+        Status GetVarchar(int col_idx, Slice* val)
+
         Status EncodeRowKey(string* encoded_key)
         string ToEncodedRowKeyOrDie()
 
@@ -443,6 +463,9 @@ cdef extern from "kudu/client/write_op.h" namespace "kudu::client" nogil:
         WriteType type()
 
     cdef cppclass KuduInsert(KuduWriteOperation):
+        pass
+
+    cdef cppclass KuduInsertIgnore(KuduWriteOperation):
         pass
 
     cdef cppclass KuduUpsert(KuduWriteOperation):
@@ -600,6 +623,7 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         int num_replicas()
 
         KuduInsert* NewInsert()
+        KuduInsertIgnore* NewInsertIgnore()
         KuduUpsert* NewUpsert()
         KuduUpdate* NewUpdate()
         KuduDelete* NewDelete()
@@ -635,6 +659,7 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
         Status Apply(KuduWriteOperation* write_op)
         Status Apply(KuduInsert* write_op)
+        Status Apply(KuduInsertIgnore* write_op)
         Status Apply(KuduUpsert* write_op)
         Status Apply(KuduUpdate* write_op)
         Status Apply(KuduDelete* write_op)

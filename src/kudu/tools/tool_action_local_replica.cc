@@ -18,10 +18,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -50,6 +52,7 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/data_dirs.h"
+#include "kudu/fs/dir_manager.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/io_context.h"
 #include "kudu/gutil/map-util.h"
@@ -152,9 +155,10 @@ string Indent(int indent) {
   return string(indent, ' ');
 }
 
-Status FsInit(unique_ptr<FsManager>* fs_manager) {
+Status FsInit(bool skip_block_manager, unique_ptr<FsManager>* fs_manager) {
   FsManagerOpts fs_opts;
   fs_opts.read_only = true;
+  fs_opts.skip_block_manager = skip_block_manager;
   fs_opts.update_instances = fs::UpdateInstanceBehavior::DONT_UPDATE;
   unique_ptr<FsManager> fs_ptr(new FsManager(Env::Default(), fs_opts));
   RETURN_NOT_OK(fs_ptr->Open());
@@ -186,8 +190,12 @@ Status ParseHostPortString(const string& hostport_str, HostPort* hostport) {
 Status FindLastLoggedOpId(FsManager* fs, const string& tablet_id,
                           OpId* last_logged_opid) {
   shared_ptr<LogReader> reader;
-  RETURN_NOT_OK(LogReader::Open(fs, scoped_refptr<log::LogIndex>(), tablet_id,
-                                scoped_refptr<MetricEntity>(), &reader));
+  RETURN_NOT_OK(LogReader::Open(fs,
+                                /*index*/nullptr,
+                                tablet_id,
+                                /*metric_entity*/nullptr,
+                                /*file_cache*/nullptr,
+                                &reader));
   SegmentSequence segs;
   reader->GetSegmentsSnapshot(&segs);
   // Reverse iterate the segments to find the 'last replicated' entry quickly.
@@ -231,7 +239,7 @@ Status ParsePeerString(const string& peer_str,
 
 Status PrintReplicaUuids(const RunnerContext& context) {
   unique_ptr<FsManager> fs_manager;
-  RETURN_NOT_OK(FsInit(&fs_manager));
+  RETURN_NOT_OK(FsInit(/*skip_block_manager*/true, &fs_manager));
   scoped_refptr<ConsensusMetadataManager> cmeta_manager(
       new ConsensusMetadataManager(fs_manager.get()));
 
@@ -279,7 +287,9 @@ Status RewriteRaftConfig(const RunnerContext& context) {
 
   // Make a copy of the old file before rewriting it.
   Env* env = Env::Default();
-  FsManager fs_manager(env, FsManagerOpts());
+  FsManagerOpts fs_opts = FsManagerOpts();
+  fs_opts.skip_block_manager = true;
+  FsManager fs_manager(env, std::move(fs_opts));
   RETURN_NOT_OK(fs_manager.Open());
   RETURN_NOT_OK(BackupConsensusMetadata(&fs_manager, tablet_id));
 
@@ -294,8 +304,7 @@ Status RewriteRaftConfig(const RunnerContext& context) {
     RaftPeerPB new_peer;
     new_peer.set_member_type(RaftPeerPB::VOTER);
     new_peer.set_permanent_uuid(p.first);
-    HostPortPB new_peer_host_port_pb;
-    RETURN_NOT_OK(HostPortToPB(p.second, &new_peer_host_port_pb));
+    HostPortPB new_peer_host_port_pb = HostPortToPB(p.second);
     new_peer.mutable_last_known_addr()->CopyFrom(new_peer_host_port_pb);
     new_config.add_peers()->CopyFrom(new_peer);
   }
@@ -314,7 +323,9 @@ Status SetRaftTerm(const RunnerContext& context) {
 
   // Load the current metadata from disk and verify that the intended operation is safe.
   Env* env = Env::Default();
-  FsManager fs_manager(env, FsManagerOpts());
+  FsManagerOpts fs_opts = FsManagerOpts();
+  fs_opts.skip_block_manager = true;
+  FsManager fs_manager(env, fs_opts);
   RETURN_NOT_OK(fs_manager.Open());
   // Load the cmeta file and rewrite the raft config.
   scoped_refptr<ConsensusMetadataManager> cmeta_manager(new ConsensusMetadataManager(&fs_manager));
@@ -459,7 +470,7 @@ struct TabletSizeStats {
 Status SummarizeDataSize(const RunnerContext& context) {
   const string& tablet_id_pattern = FindOrDie(context.required_args, kTabletIdGlobArg);
   unique_ptr<FsManager> fs;
-  RETURN_NOT_OK(FsInit(&fs));
+  RETURN_NOT_OK(FsInit(/*skip_block_manager*/false, &fs));
 
   vector<string> tablets;
   RETURN_NOT_OK(fs->ListTabletIds(&tablets));
@@ -516,14 +527,15 @@ Status SummarizeDataSize(const RunnerContext& context) {
 
 Status DumpWals(const RunnerContext& context) {
   unique_ptr<FsManager> fs_manager;
-  RETURN_NOT_OK(FsInit(&fs_manager));
+  RETURN_NOT_OK(FsInit(/*skip_block_manager*/true, &fs_manager));
   const string& tablet_id = FindOrDie(context.required_args, kTabletIdArg);
 
   shared_ptr<LogReader> reader;
   RETURN_NOT_OK(LogReader::Open(fs_manager.get(),
-                                scoped_refptr<LogIndex>(),
+                                /*index*/nullptr,
                                 tablet_id,
-                                scoped_refptr<MetricEntity>(),
+                                /*metric_entity*/nullptr,
+                                /*file_cache*/nullptr,
                                 &reader));
 
   SegmentSequence segments;
@@ -566,7 +578,7 @@ Status ListBlocksInRowSet(const Schema& schema,
 
 Status DumpBlockIdsForLocalReplica(const RunnerContext& context) {
   unique_ptr<FsManager> fs_manager;
-  RETURN_NOT_OK(FsInit(&fs_manager));
+  RETURN_NOT_OK(FsInit(/*skip_block_manager*/false, &fs_manager));
   const string& tablet_id = FindOrDie(context.required_args, kTabletIdArg);
 
   scoped_refptr<TabletMetadata> meta;
@@ -618,7 +630,7 @@ Status DumpTabletMeta(FsManager* fs_manager,
 
 Status ListLocalReplicas(const RunnerContext& context) {
   unique_ptr<FsManager> fs_manager;
-  RETURN_NOT_OK(FsInit(&fs_manager));
+  RETURN_NOT_OK(FsInit(/*skip_block_manager*/true, &fs_manager));
 
   vector<string> tablets;
   RETURN_NOT_OK(fs_manager->ListTabletIds(&tablets));
@@ -692,7 +704,7 @@ Status DumpRowSetInternal(const IOContext& ctx,
 Status DumpRowSet(const RunnerContext& context) {
   const int kIndent = 2;
   unique_ptr<FsManager> fs_manager;
-  RETURN_NOT_OK(FsInit(&fs_manager));
+  RETURN_NOT_OK(FsInit(/*skip_block_manager*/false, &fs_manager));
   const string& tablet_id = FindOrDie(context.required_args, kTabletIdArg);
 
   scoped_refptr<TabletMetadata> meta;
@@ -730,14 +742,14 @@ Status DumpRowSet(const RunnerContext& context) {
 
 Status DumpMeta(const RunnerContext& context) {
   unique_ptr<FsManager> fs_manager;
-  RETURN_NOT_OK(FsInit(&fs_manager));
+  RETURN_NOT_OK(FsInit(/*skip_block_manager*/false, &fs_manager));
   const string& tablet_id = FindOrDie(context.required_args, kTabletIdArg);
   return DumpTabletMeta(fs_manager.get(), tablet_id, 0);
 }
 
 Status DumpDataDirs(const RunnerContext& context) {
   unique_ptr<FsManager> fs_manager;
-  RETURN_NOT_OK(FsInit(&fs_manager));
+  RETURN_NOT_OK(FsInit(/*skip_block_manager*/false, &fs_manager));
   const string& tablet_id = FindOrDie(context.required_args, kTabletIdArg);
   // Load the tablet meta to make sure the tablet's data directories are loaded
   // into the manager.

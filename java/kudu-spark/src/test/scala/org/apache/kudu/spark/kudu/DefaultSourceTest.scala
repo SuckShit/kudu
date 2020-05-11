@@ -17,8 +17,11 @@
 
 package org.apache.kudu.spark.kudu
 
+import java.nio.charset.StandardCharsets
+
 import scala.collection.JavaConverters._
 import scala.collection.immutable.IndexedSeq
+import org.apache.spark.SparkException
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.SQLContext
 import org.apache.spark.sql.SaveMode
@@ -558,6 +561,62 @@ class DefaultSourceTest extends KuduTestSuite with Matchers {
   }
 
   @Test
+  def testSchemaDrift() {
+    val nonNullDF =
+      sqlContext.createDataFrame(Seq((0, "foo"))).toDF("key", "val")
+    kuduContext.insertRows(nonNullDF, simpleTableName)
+
+    val tableOptions = Map(
+      "kudu.master" -> harness.getMasterAddressesAsString,
+      "kudu.table" -> simpleTableName
+    )
+    val df = sqlContext.read.options(tableOptions).format("kudu").load
+    assertEquals(2, df.schema.fields.length)
+
+    // Add a column not in the table schema by duplicating the val column.
+    val newDf = df.withColumn("val2", col("val"))
+
+    // Insert with handleSchemaDrift = false. Note that a new column was not created.
+    kuduContext.upsertRows(newDf, simpleTableName, KuduWriteOptions(handleSchemaDrift = false))
+    assertEquals(2, harness.getClient.openTable(simpleTableName).getSchema.getColumns.size())
+
+    // Insert with handleSchemaDrift = true. Note that a new column was created.
+    kuduContext.upsertRows(newDf, simpleTableName, KuduWriteOptions(handleSchemaDrift = true))
+    assertEquals(3, harness.getClient.openTable(simpleTableName).getSchema.getColumns.size())
+
+    val afterDf = sqlContext.read.options(tableOptions).format("kudu").load
+    assertEquals(3, afterDf.schema.fields.length)
+    assertEquals("val2", afterDf.schema.fieldNames.last)
+    assertTrue(afterDf.collect().forall(r => r.getString(1) == r.getString(2)))
+  }
+
+  @Test
+  def testInsertWrongType() {
+    val nonNullDF =
+      sqlContext.createDataFrame(Seq((0, "foo"))).toDF("key", "val")
+    kuduContext.insertRows(nonNullDF, simpleTableName)
+
+    val tableOptions = Map(
+      "kudu.master" -> harness.getMasterAddressesAsString,
+      "kudu.table" -> simpleTableName
+    )
+    val df = sqlContext.read.options(tableOptions).format("kudu").load
+    // Convert the val column to a bytes instead of string.
+    val toBytes = udf[Array[Byte], String](_.getBytes(StandardCharsets.UTF_8))
+    val newDf = df
+      .withColumn("valTmp", toBytes(col("val")))
+      .drop("val")
+      .withColumnRenamed("valTmp", "val")
+
+    try {
+      kuduContext.insertRows(newDf, simpleTableName, KuduWriteOptions())
+    } catch {
+      case e: SparkException =>
+        assertTrue(e.getMessage.contains("val isn't [Type: binary], it's string"))
+    }
+  }
+
+  @Test
   def testCreateRelationWithSchema() {
     // user-supplied schema that is compatible with actual schema, but with the key at the end
     val userSchema: StructType = StructType(
@@ -567,7 +626,7 @@ class DefaultSourceTest extends KuduTestSuite with Matchers {
       ))
 
     val dfDefaultSchema = sqlContext.read.options(kuduOptions).format("kudu").load
-    assertEquals(15, dfDefaultSchema.schema.fields.length)
+    assertEquals(16, dfDefaultSchema.schema.fields.length)
 
     val dfWithUserSchema =
       sqlContext.read.options(kuduOptions).schema(userSchema).format("kudu").load

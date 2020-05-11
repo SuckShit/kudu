@@ -14,18 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 #pragma once
 
+#include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include <glog/logging.h>
 
-#include "kudu/fs/data_dirs.h"
+#include "kudu/fs/dir_manager.h"
 #include "kudu/fs/dir_util.h"
-#include "kudu/fs/fs.pb.h"
-#include "kudu/gutil/callback.h"
 #include "kudu/gutil/port.h"
 #include "kudu/util/mutex.h"
 
@@ -37,7 +36,7 @@ namespace fs {
 //
 // e.g. the ErrorNotificationCb for disk failure handling takes the UUID of a
 // directory, marks it failed, and shuts down the tablets in that directory.
-typedef Callback<void(const std::string&)> ErrorNotificationCb;
+typedef std::function<void(const std::string&)> ErrorNotificationCb;
 
 // Evaluates the expression and handles it if it results in an error.
 // Returns if the status is an error.
@@ -147,7 +146,7 @@ class FsErrorManager {
   void RunErrorNotificationCb(ErrorHandlerType e, const std::string& uuid) const;
 
   // Runs the error notification callback with the UUID of 'dir'.
-  void RunErrorNotificationCb(ErrorHandlerType e, const DataDir* dir) const {
+  void RunErrorNotificationCb(ErrorHandlerType e, const Dir* dir) const {
     DCHECK_EQ(e, ErrorHandlerType::DISK_ERROR);
     RunErrorNotificationCb(e, dir->instance()->uuid());
   }

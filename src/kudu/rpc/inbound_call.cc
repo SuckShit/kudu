@@ -21,6 +21,7 @@
 #include <memory>
 #include <ostream>
 
+#include <boost/container/vector.hpp>
 #include <glog/logging.h>
 #include <google/protobuf/message.h>
 #include <google/protobuf/message_lite.h>
@@ -66,7 +67,7 @@ InboundCall::InboundCall(Connection* conn)
 
 InboundCall::~InboundCall() {}
 
-Status InboundCall::ParseFrom(gscoped_ptr<InboundTransfer> transfer) {
+Status InboundCall::ParseFrom(unique_ptr<InboundTransfer> transfer) {
   TRACE_EVENT_FLOW_BEGIN0("rpc", "InboundCall", this);
   TRACE_EVENT0("rpc", "InboundCall::ParseFrom");
   RETURN_NOT_OK(serialization::ParseMessage(transfer->data(), &header_, &serialized_request_));
@@ -93,7 +94,7 @@ Status InboundCall::ParseFrom(gscoped_ptr<InboundTransfer> transfer) {
   }
 
   RETURN_NOT_OK(RpcSidecar::ParseSidecars(
-          header_.sidecar_offsets(), serialized_request_, inbound_sidecar_slices_));
+          header_.sidecar_offsets(), serialized_request_, &inbound_sidecar_slices_));
   if (header_.sidecar_offsets_size() > 0) {
     // Trim the request to just the message
     serialized_request_ = Slice(serialized_request_.data(), header_.sidecar_offsets(0));
@@ -162,7 +163,7 @@ void InboundCall::Respond(const MessageLite& response,
   TRACE_TO(trace_, "Queueing $0 response", is_success ? "success" : "failure");
   RecordHandlingCompleted();
   conn_->rpcz_store()->AddCall(this);
-  conn_->QueueResponseForCall(gscoped_ptr<InboundCall>(this));
+  conn_->QueueResponseForCall(unique_ptr<InboundCall>(this));
 }
 
 void InboundCall::SerializeResponseBuffer(const MessageLite& response,
@@ -185,7 +186,7 @@ void InboundCall::SerializeResponseBuffer(const MessageLite& response,
   int32_t sidecar_byte_size = 0;
   for (const unique_ptr<RpcSidecar>& car : outbound_sidecars_) {
     resp_hdr.add_sidecar_offsets(sidecar_byte_size + protobuf_msg_size);
-    int32_t sidecar_bytes = car->AsSlice().size();
+    size_t sidecar_bytes = car->TotalSize();
     DCHECK_LE(sidecar_byte_size, TransferLimits::kMaxTotalSidecarBytes - sidecar_bytes);
     sidecar_byte_size += sidecar_bytes;
   }
@@ -197,20 +198,15 @@ void InboundCall::SerializeResponseBuffer(const MessageLite& response,
                                  &response_hdr_buf_);
 }
 
-size_t InboundCall::SerializeResponseTo(TransferPayload* slices) const {
+void InboundCall::SerializeResponseTo(TransferPayload* slices) const {
   TRACE_EVENT0("rpc", "InboundCall::SerializeResponseTo");
   DCHECK_GT(response_hdr_buf_.size(), 0);
   DCHECK_GT(response_msg_buf_.size(), 0);
-  size_t n_slices = 2 + outbound_sidecars_.size();
-  DCHECK_LE(n_slices, slices->size());
-  auto slice_iter = slices->begin();
-  *slice_iter++ = Slice(response_hdr_buf_);
-  *slice_iter++ = Slice(response_msg_buf_);
+  slices->push_back(Slice(response_hdr_buf_));
+  slices->push_back(Slice(response_msg_buf_));
   for (auto& sidecar : outbound_sidecars_) {
-    *slice_iter++ = sidecar->AsSlice();
+    sidecar->AppendSlices(slices);
   }
-  DCHECK_EQ(slice_iter - slices->begin(), n_slices);
-  return n_slices;
 }
 
 Status InboundCall::AddOutboundSidecar(unique_ptr<RpcSidecar> car, int* idx) {
@@ -220,7 +216,7 @@ Status InboundCall::AddOutboundSidecar(unique_ptr<RpcSidecar> car, int* idx) {
   if (outbound_sidecars_.size() > TransferLimits::kMaxSidecars) {
     return Status::ServiceUnavailable("All available sidecars already used");
   }
-  int64_t sidecar_bytes = car->AsSlice().size();
+  size_t sidecar_bytes = car->TotalSize();
   if (outbound_sidecars_total_bytes_ >
       TransferLimits::kMaxTotalSidecarBytes - sidecar_bytes) {
     return Status::RuntimeError(Substitute("Total size of sidecars $0 would exceed limit $1",

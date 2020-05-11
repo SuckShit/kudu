@@ -18,13 +18,14 @@
 #define KUDU_CLIENT_TABLE_INTERNAL_H
 
 #include <map>
+#include <memory>
 #include <string>
 
 #include "kudu/client/client.h"
-#include "kudu/client/scan_predicate.h"
 #include "kudu/client/scan_predicate-internal.h"
+#include "kudu/client/scan_predicate.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/common/partition.h"
 #include "kudu/common/schema.h"
 #include "kudu/gutil/macros.h"

@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -33,7 +34,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/clock/logical_clock.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/common/common.pb.h"
@@ -48,8 +48,6 @@
 #include "kudu/consensus/opid_util.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/delta_key.h"
 #include "kudu/tablet/delta_stats.h"
@@ -92,9 +90,9 @@ using fs::WritableBlock;
 class TestDeltaMemStore : public KuduTest {
  public:
   TestDeltaMemStore()
-    : op_id_(consensus::MaximumOpId()),
-      schema_(CreateSchema()),
-      clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
+      : op_id_(consensus::MaximumOpId()),
+        schema_(CreateSchema()),
+        clock_(Timestamp::kInitialTimestamp) {
     CHECK_OK(DeltaMemStore::Create(0, 0,
                                    new log::LogAnchorRegistry(),
                                    MemTracker::GetRootTracker(), &dms_));
@@ -115,7 +113,7 @@ class TestDeltaMemStore : public KuduTest {
     RowChangeListEncoder update(&buf);
 
     for (uint32_t idx_to_update : indexes_to_update) {
-      ScopedTransaction tx(&mvcc_, clock_->Now());
+      ScopedTransaction tx(&mvcc_, clock_.Now());
       tx.StartApplying();
       update.Reset();
       uint32_t new_val = idx_to_update * 10;
@@ -161,7 +159,7 @@ class TestDeltaMemStore : public KuduTest {
 
   const Schema schema_;
   shared_ptr<DeltaMemStore> dms_;
-  scoped_refptr<clock::Clock> clock_;
+  clock::LogicalClock clock_;
   MvccManager mvcc_;
 };
 
@@ -193,7 +191,7 @@ TEST_F(TestDeltaMemStore, TestUpdateCount) {
                              schema_.column_id(kStringColumn), &s);
     }
     if (idx % 2 == 0) {
-      ScopedTransaction tx(&mvcc_, clock_->Now());
+      ScopedTransaction tx(&mvcc_, clock_.Now());
       tx.StartApplying();
       uint32_t new_val = idx * 10;
       update.AddColumnUpdate(schema_.column(kIntColumn),
@@ -206,15 +204,15 @@ TEST_F(TestDeltaMemStore, TestUpdateCount) {
 
   // Flush the delta file so that the stats get updated.
 
-  FsManager fs(env_, GetTestPath("fs_root"));
+  FsManager fs(env_, FsManagerOpts(GetTestPath("fs_root")));
   ASSERT_OK(fs.CreateInitialFileSystemLayout());
   ASSERT_OK(fs.Open());
   unique_ptr<WritableBlock> block;
   ASSERT_OK(fs.CreateNewBlock({}, &block));
   DeltaFileWriter dfw(std::move(block));
   ASSERT_OK(dfw.Start());
-  gscoped_ptr<DeltaStats> stats;
-  dms_->FlushToFile(&dfw, &stats);
+  dms_->FlushToFile(&dfw);
+  unique_ptr<DeltaStats> stats = dfw.release_delta_stats();
 
   ASSERT_EQ(n_rows / 2, stats->update_count_for_col_id(schema_.column_id(kIntColumn)));
   ASSERT_EQ(n_rows / 4, stats->update_count_for_col_id(schema_.column_id(kStringColumn)));
@@ -267,7 +265,7 @@ TEST_F(TestDeltaMemStore, BenchmarkManyUpdatesToOneRow) {
     faststring buf;
     RowChangeListEncoder update(&buf);
 
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
     string str(kStringDataSize, 'x');
     Slice s(str);
@@ -276,7 +274,7 @@ TEST_F(TestDeltaMemStore, BenchmarkManyUpdatesToOneRow) {
     CHECK_OK(dms_->Update(tx.timestamp(), kIdxToUpdate, RowChangeList(buf), op_id_));
     tx.Commit();
   }
-  mvcc_.AdjustSafeTime(clock_->Now());
+  mvcc_.AdjustNewTransactionLowerBound(clock_.Now());
 
   MvccSnapshot snap(mvcc_);
   LOG_TIMING(INFO, "Applying updates") {
@@ -390,7 +388,7 @@ TEST_F(TestDeltaMemStore, TestReUpdateSlice) {
   // the update gets cleared after usage. This ensures that the
   // underlying data is properly copied into the DMS arena.
   {
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
     char buf[256] = "update 1";
     Slice s(buf);
@@ -404,7 +402,7 @@ TEST_F(TestDeltaMemStore, TestReUpdateSlice) {
 
   // Update the same cell again with a different value
   {
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
     char buf[256] = "update 2";
     Slice s(buf);
@@ -441,8 +439,8 @@ TEST_F(TestDeltaMemStore, TestOutOfOrderTxns) {
   RowChangeListEncoder update(&update_buf);
 
   {
-    ScopedTransaction tx1(&mvcc_, clock_->Now());
-    ScopedTransaction tx2(&mvcc_, clock_->Now());
+    ScopedTransaction tx1(&mvcc_, clock_.Now());
+    ScopedTransaction tx2(&mvcc_, clock_.Now());
 
     tx2.StartApplying();
     Slice s("update 2");
@@ -476,7 +474,7 @@ TEST_F(TestDeltaMemStore, TestDMSBasic) {
 
   char buf[256];
   for (uint32_t i = 0; i < 1000; i++) {
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
     update.Reset();
 
@@ -520,7 +518,7 @@ TEST_F(TestDeltaMemStore, TestDMSBasic) {
   // these are separate transactions and we need to maintain the
   // old ones for snapshot consistency purposes.
   for (uint32_t i = 0; i < 1000; i++) {
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
     update.Reset();
 

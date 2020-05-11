@@ -14,22 +14,23 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_DELTATRACKER_H
-#define KUDU_TABLET_DELTATRACKER_H
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest_prod.h>
 
 #include "kudu/common/rowid.h"
-#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/fs/block_id.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/tablet/cfile_set.h"
 #include "kudu/tablet/delta_key.h"
+#include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/delta_store.h"
 #include "kudu/tablet/tablet_mem_trackers.h"
 #include "kudu/util/atomic.h"
@@ -39,7 +40,6 @@
 
 namespace kudu {
 
-class BlockId;
 class ColumnwiseIterator;
 class MonoTime;
 class RowChangeList;
@@ -70,6 +70,8 @@ class RowSetMetadataUpdate;
 struct ProbeStats;
 struct RowIteratorOptions;
 
+typedef std::pair<BlockId, std::unique_ptr<DeltaStats>> DeltaBlockIdAndStats;
+
 // The DeltaTracker is the part of a DiskRowSet which is responsible for
 // tracking modifications against the base data. It consists of a set of
 // DeltaStores which each contain a set of mutations against the base data.
@@ -87,7 +89,7 @@ class DeltaTracker {
                      log::LogAnchorRegistry* log_anchor_registry,
                      const TabletMemTrackers& mem_trackers,
                      const fs::IOContext* io_context,
-                     gscoped_ptr<DeltaTracker>* delta_tracker);
+                     std::unique_ptr<DeltaTracker>* delta_tracker);
 
   Status WrapIterator(const std::shared_ptr<CFileSet::Iterator> &base,
                       const RowIteratorOptions& opts,
@@ -162,7 +164,7 @@ class DeltaTracker {
   // The 'compact_flush_lock_' should be acquired before calling this method.
   Status CommitDeltaStoreMetadataUpdate(const RowSetMetadataUpdate& update,
                                         const SharedDeltaStoreVector& to_remove,
-                                        const std::vector<BlockId>& new_delta_blocks,
+                                        std::vector<DeltaBlockIdAndStats> new_delta_blocks,
                                         const fs::IOContext* io_context,
                                         DeltaType type,
                                         MetadataFlushType flush_type);
@@ -177,6 +179,12 @@ class DeltaTracker {
   Status EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp ancient_history_mark,
                                                      int64_t* bytes);
 
+  // Returns whether all redo (DMS and newest redo delta file) are ancient
+  // (i.e. that the redo with the highest timestamp is older than the AHM).
+  // This is an estimate, since if the newest redo file has not yet been
+  // initted, this will return a false negative.
+  bool EstimateAllRedosAreAncient(Timestamp ancient_history_mark);
+
   // See RowSet::InitUndoDeltas().
   Status InitUndoDeltas(Timestamp ancient_history_mark,
                         MonoTime deadline,
@@ -190,7 +198,7 @@ class DeltaTracker {
 
   // Opens the input 'blocks' of type 'type' and returns the opened delta file
   // readers in 'stores'.
-  Status OpenDeltaReaders(const std::vector<BlockId>& blocks,
+  Status OpenDeltaReaders(std::vector<DeltaBlockIdAndStats> blocks,
                           const fs::IOContext* io_context,
                           std::vector<std::shared_ptr<DeltaStore>>* stores,
                           DeltaType type);
@@ -292,16 +300,18 @@ class DeltaTracker {
   void CollectStores(std::vector<std::shared_ptr<DeltaStore>>* stores,
                      WhichStores which) const;
 
-  // Performs the actual compaction. Results of compaction are written to "block",
-  // while delta stores that underwent compaction are appended to "compacted_stores", while
-  // their corresponding block ids are appended to "compacted_blocks".
+  // Performs the actual compaction. Results of compaction are written with
+  // 'block' and stats for are populated in 'output_stats'. Delta stores that
+  // underwent compaction are appended to 'compacted_stores', and their
+  // corresponding block ids are appended to 'compacted_blocks'.
   //
   // NOTE: the caller of this method should acquire or already hold an
-  // exclusive lock on 'compact_flush_lock_' before calling this
-  // method in order to protect 'redo_delta_stores_'.
+  // exclusive lock on 'compact_flush_lock_' before calling this method in
+  // order to protect 'redo_delta_stores_'.
   Status DoCompactStores(const fs::IOContext* io_context,
                          size_t start_idx, size_t end_idx,
                          std::unique_ptr<fs::WritableBlock> block,
+                         std::unique_ptr<DeltaStats>* output_stats,
                          std::vector<std::shared_ptr<DeltaStore>>* compacted_stores,
                          std::vector<BlockId>* compacted_blocks);
 
@@ -384,5 +394,3 @@ class DeltaTracker {
 
 } // namespace tablet
 } // namespace kudu
-
-#endif

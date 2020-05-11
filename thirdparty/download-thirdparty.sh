@@ -104,6 +104,9 @@ fetch_and_expand() {
         rm "$FILENAME"
         continue
       fi
+    elif [[ "$FILENAME" =~ \.jar$ ]]; then
+      mkdir ${FILENAME%.jar}
+      cp $FILENAME ${FILENAME%.jar}/
     else
       echo "Error: unknown file format: $FILENAME"
       exit 1
@@ -167,7 +170,7 @@ fetch_and_patch() {
 mkdir -p $TP_SOURCE_DIR
 cd $TP_SOURCE_DIR
 
-GLOG_PATCHLEVEL=3
+GLOG_PATCHLEVEL=4
 fetch_and_patch \
  glog-${GLOG_VERSION}.tar.gz \
  $GLOG_SOURCE \
@@ -175,6 +178,7 @@ fetch_and_patch \
  "patch -p0 < $TP_DIR/patches/glog-issue-198-fix-unused-warnings.patch" \
  "patch -p0 < $TP_DIR/patches/glog-issue-54-dont-build-tests.patch" \
  "patch -p1 < $TP_DIR/patches/glog-fix-symbolization.patch" \
+ "patch -p1 < $TP_DIR/patches/glog-support-stacktrace-for-aarch64.patch" \
  "autoreconf -fvi"
 
 GMOCK_PATCHLEVEL=0
@@ -297,12 +301,11 @@ fetch_and_patch \
  $CURL_PATCHLEVEL \
  "autoreconf -fvi"
 
-CRCUTIL_PATCHLEVEL=1
+CRCUTIL_PATCHLEVEL=0
 fetch_and_patch \
  crcutil-${CRCUTIL_VERSION}.tar.gz \
  $CRCUTIL_SOURCE \
- $CRCUTIL_PATCHLEVEL \
- "patch -p0 < $TP_DIR/patches/crcutil-fix-libtoolize-on-osx.patch"
+ $CRCUTIL_PATCHLEVEL
 
 LIBUNWIND_PATCHLEVEL=1
 fetch_and_patch \
@@ -317,13 +320,14 @@ fetch_and_patch \
  $PYTHON_SOURCE \
  $PYTHON_PATCHLEVEL
 
-LLVM_PATCHLEVEL=4
+LLVM_PATCHLEVEL=5
 fetch_and_patch \
  llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz \
  $LLVM_SOURCE \
  $LLVM_PATCHLEVEL \
   "patch -p1 < $TP_DIR/patches/llvm-add-iwyu.patch" \
-  "patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch"
+  "patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch" \
+  "patch -p0 < $TP_DIR/patches/llvm-iwyu-sized-deallocation.patch"
 
 LZ4_PATCHLEVEL=0
 fetch_and_patch \
@@ -343,12 +347,13 @@ fetch_and_patch \
  $TRACE_VIEWER_SOURCE \
  $TRACE_VIEWER_PATCHLEVEL
 
-BOOST_PATCHLEVEL=1
+BOOST_PATCHLEVEL=2
 fetch_and_patch \
  boost_${BOOST_VERSION}.tar.gz \
  $BOOST_SOURCE \
  $BOOST_PATCHLEVEL \
- "patch -p0 < $TP_DIR/patches/boost-issue-12179-fix-compilation-errors.patch"
+ "patch -p0 < $TP_DIR/patches/boost-issue-12179-fix-compilation-errors.patch" \
+ "patch -p0 < $TP_DIR/patches/boost-issue-440-darwin-version.patch"
 
 # Return 0 if the current system appears to be el6 (either CentOS or proper RHEL)
 needs_openssl_workaround() {
@@ -363,19 +368,21 @@ if needs_openssl_workaround && [ ! -d "$OPENSSL_WORKAROUND_DIR" ] ; then
   $TP_DIR/install-openssl-el6-workaround.sh
 fi
 
-BREAKPAD_PATCHLEVEL=1
+BREAKPAD_PATCHLEVEL=2
 fetch_and_patch \
  breakpad-${BREAKPAD_VERSION}.tar.gz \
  $BREAKPAD_SOURCE \
  $BREAKPAD_PATCHLEVEL \
- "patch -p1 < $TP_DIR/patches/breakpad-add-basic-support-for-dwz-dwarf-extension.patch"
+ "patch -p1 < $TP_DIR/patches/breakpad-add-basic-support-for-dwz-dwarf-extension.patch" \
+ "patch -p1 < $TP_DIR/patches/breakpad-syscall-rsp-clobber-fix.patch"
 
-SPARSEHASH_PATCHLEVEL=2
+SPARSEHASH_PATCHLEVEL=3
 fetch_and_patch \
  sparsehash-c11-${SPARSEHASH_VERSION}.tar.gz \
  $SPARSEHASH_SOURCE \
  $SPARSEHASH_PATCHLEVEL \
- "patch -p1 < $TP_DIR/patches/sparsehash-0001-Add-compatibily-for-gcc-4.x-in-traits.patch"
+ "patch -p1 < $TP_DIR/patches/sparsehash-0001-Add-compatibily-for-gcc-4.x-in-traits.patch" \
+ "patch -p1 < $TP_DIR/patches/sparsehash-0002-Add-workaround-for-dense_hashtable-move-constructor-.patch"
 
 SPARSEPP_PATCHLEVEL=0
 fetch_and_patch \
@@ -409,12 +416,6 @@ fetch_and_patch \
  $HADOOP_SOURCE \
  $HADOOP_PATCHLEVEL
 
-SENTRY_PATCHLEVEL=0
-fetch_and_patch \
- $SENTRY_NAME.tar.gz \
- $SENTRY_SOURCE \
- $SENTRY_PATCHLEVEL
-
 YAML_PATCHLEVEL=0
 fetch_and_patch \
  $YAML_NAME.tar.gz \
@@ -443,6 +444,28 @@ fetch_and_patch \
  $GUMBO_QUERY_SOURCE \
  $GUMBO_QUERY_PATCHLEVEL \
  "patch -p1 < $TP_DIR/patches/gumbo-query-namespace.patch"
+
+POSTGRES_PATCHLEVEL=1
+fetch_and_patch \
+ $POSTGRES_NAME.tar.gz \
+ $POSTGRES_SOURCE \
+ $POSTGRES_PATCHLEVEL \
+ "patch -p0 < $TP_DIR/patches/postgres-root-can-run-initdb.patch" \
+ "patch -p0 < $TP_DIR/patches/postgres-no-check-root.patch"
+
+POSTGRES_JDBC_PATCHLEVEL=0
+fetch_and_patch \
+ $POSTGRES_JDBC_NAME.jar \
+ $POSTGRES_JDBC_SOURCE \
+ $POSTGRES_JDBC_PATCHLEVEL
+
+RANGER_PATCHLEVEL=2
+fetch_and_patch \
+ $RANGER_NAME.tar.gz \
+ $RANGER_SOURCE \
+ $RANGER_PATCHLEVEL \
+ "patch -p1 < $TP_DIR/patches/ranger-python3.patch" \
+ "patch -p0 < $TP_DIR/patches/ranger-fixscripts.patch"
 
 echo "---------------"
 echo "Thirdparty dependencies downloaded successfully"

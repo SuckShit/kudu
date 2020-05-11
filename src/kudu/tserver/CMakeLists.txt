@@ -112,6 +112,7 @@ set(TSERVER_SRCS
   tablet_copy_source_session.cc
   tablet_server.cc
   tablet_server_options.cc
+  tablet_server_runner.cc
   tablet_service.cc
   ts_tablet_manager.cc
   tserver_path_handlers.cc
@@ -182,7 +183,7 @@ ADD_KUDU_TEST(mini_tablet_server-test)
 ADD_KUDU_TEST(tablet_copy_client-test)
 ADD_KUDU_TEST(tablet_copy_source_session-test)
 ADD_KUDU_TEST(tablet_copy_service-test)
-ADD_KUDU_TEST(tablet_server-test PROCESSORS 3)
+ADD_KUDU_TEST(tablet_server-test PROCESSORS 3 NUM_SHARDS 4)
 ADD_KUDU_TEST(tablet_server-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(tablet_server_authorization-test NUM_SHARDS 2)
 ADD_KUDU_TEST(scanners-test)

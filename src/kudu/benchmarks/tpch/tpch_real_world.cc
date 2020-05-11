@@ -46,14 +46,14 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <string>
-#include <type_traits>
+#include <thread>
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
-#include <boost/function.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -63,8 +63,6 @@
 #include "kudu/client/row_result.h"
 #include "kudu/client/schema.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/join.h"
@@ -81,7 +79,6 @@
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/subprocess.h"
-#include "kudu/util/thread.h"
 
 DEFINE_bool(tpch_use_mini_cluster, true,
             "Create a mini cluster for the work to be performed against");
@@ -122,16 +119,17 @@ DEFINE_string(tpch_partition_strategy, "range",
               "tablets. This is less ideal, but more faithfully represents a lot of write "
               "workloads.");
 
+using kudu::client::KuduRowResult;
+using kudu::client::KuduSchema;
+using kudu::cluster::ExternalMiniCluster;
+using kudu::cluster::ExternalMiniClusterOptions;
 using std::string;
+using std::thread;
+using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
-
-using client::KuduRowResult;
-using client::KuduSchema;
-using cluster::ExternalMiniCluster;
-using cluster::ExternalMiniClusterOptions;
-using strings::Substitute;
 
 class TpchRealWorld {
  public:
@@ -147,7 +145,7 @@ class TpchRealWorld {
 
   Status Init();
 
-  gscoped_ptr<RpcLineItemDAO> GetInittedDAO();
+  unique_ptr<RpcLineItemDAO> GetInittedDAO();
 
   void LoadLineItemsThread(int i);
 
@@ -157,7 +155,7 @@ class TpchRealWorld {
 
   void WaitForRowCount(int64_t row_count);
 
-  Status Run();
+  void Run();
 
  private:
   static const char* kLineItemBase;
@@ -170,7 +168,7 @@ class TpchRealWorld {
         ? Substitute("$0.$1", kLineItemBase, i + 1) : kLineItemBase;
   }
 
-  gscoped_ptr<ExternalMiniCluster> cluster_;
+  unique_ptr<ExternalMiniCluster> cluster_;
   AtomicInt<int64_t> rows_inserted_;
   string master_addresses_;
   AtomicBool stop_threads_;
@@ -259,7 +257,7 @@ Status TpchRealWorld::StartDbgens() {
       argv.emplace_back("-S");
       argv.push_back(Substitute("$0", i));
     }
-    gscoped_ptr<Subprocess> dbgen_proc(new Subprocess(argv));
+    unique_ptr<Subprocess> dbgen_proc(new Subprocess(argv));
     LOG(INFO) << "Running " << JoinStrings(argv, " ");
     RETURN_NOT_OK(dbgen_proc->Start());
     dbgen_processes_.push_back(dbgen_proc.release());
@@ -267,7 +265,7 @@ Status TpchRealWorld::StartDbgens() {
   return Status::OK();
 }
 
-gscoped_ptr<RpcLineItemDAO> TpchRealWorld::GetInittedDAO() {
+unique_ptr<RpcLineItemDAO> TpchRealWorld::GetInittedDAO() {
   // When chunking, dbgen will begin the nth chunk on the order key:
   //
   //   6000000 * SF * n / num_chunks
@@ -295,7 +293,7 @@ gscoped_ptr<RpcLineItemDAO> TpchRealWorld::GetInittedDAO() {
     LOG(FATAL) << "Unknown partition strategy: " << FLAGS_tpch_partition_strategy;
   }
 
-  gscoped_ptr<RpcLineItemDAO> dao(
+  unique_ptr<RpcLineItemDAO> dao(
         new RpcLineItemDAO(master_addresses_,
                            FLAGS_tpch_table_name,
                            FLAGS_tpch_max_batch_size,
@@ -304,16 +302,15 @@ gscoped_ptr<RpcLineItemDAO> TpchRealWorld::GetInittedDAO() {
                            FLAGS_tpch_num_inserters,
                            split_rows));
   dao->Init();
-  return std::move(dao);
+  return dao;
 }
 
 void TpchRealWorld::LoadLineItemsThread(int i) {
   LOG(INFO) << "Connecting to cluster at " << master_addresses_;
-  gscoped_ptr<RpcLineItemDAO> dao = GetInittedDAO();
+  unique_ptr<RpcLineItemDAO> dao = GetInittedDAO();
   LineItemTsvImporter importer(GetNthLineItemFileName(i));
 
-  boost::function<void(KuduPartialRow*)> f =
-      boost::bind(&LineItemTsvImporter::GetNextLine, &importer, _1);
+  auto f = [&importer](KuduPartialRow* row) { importer.GetNextLine(row); };
   const string time_spent_msg = Substitute(
         "by thread $0 to load generated data into the database", i);
   LOG_TIMING(INFO, time_spent_msg) {
@@ -359,7 +356,7 @@ void TpchRealWorld::MonitorDbgenThread(int i) {
 }
 
 void TpchRealWorld::RunQueriesThread() {
-  gscoped_ptr<RpcLineItemDAO> dao = GetInittedDAO();
+  unique_ptr<RpcLineItemDAO> dao = GetInittedDAO();
   while (!stop_threads_.Load()) {
     string log;
     if (FLAGS_tpch_load_data) {
@@ -368,7 +365,7 @@ void TpchRealWorld::RunQueriesThread() {
       log = "querying data in cluster";
     }
     LOG_TIMING(INFO, log) {
-      gscoped_ptr<RpcLineItemDAO::Scanner> scanner;
+      unique_ptr<RpcLineItemDAO::Scanner> scanner;
       dao->OpenTpch1Scanner(&scanner);
       vector<KuduRowResult> rows;
       // We check stop_threads_ even while scanning since it can takes tens of seconds to query.
@@ -386,19 +383,12 @@ void TpchRealWorld::WaitForRowCount(int64_t row_count) {
   }
 }
 
-Status TpchRealWorld::Run() {
-  vector<scoped_refptr<Thread> > threads;
+void TpchRealWorld::Run() {
+  vector<thread> threads;
   if (FLAGS_tpch_load_data) {
     for (int i = 0; i < FLAGS_tpch_num_inserters; i++) {
-      scoped_refptr<kudu::Thread> thr;
-      RETURN_NOT_OK(kudu::Thread::Create("test", Substitute("lineitem-gen$0", i),
-                                         &TpchRealWorld::MonitorDbgenThread, this, i,
-                                         &thr));
-      threads.push_back(thr);
-      RETURN_NOT_OK(kudu::Thread::Create("test", Substitute("lineitem-load$0", i),
-                                         &TpchRealWorld::LoadLineItemsThread, this, i,
-                                         &thr));
-      threads.push_back(thr);
+      threads.emplace_back([this, i]() { this->MonitorDbgenThread(i); });
+      threads.emplace_back([this, i]() { this->LoadLineItemsThread(i); });
     }
 
     // It takes some time for dbgen to start outputting rows so there's no need to query yet.
@@ -407,11 +397,7 @@ Status TpchRealWorld::Run() {
   }
 
   if (FLAGS_tpch_run_queries) {
-    scoped_refptr<kudu::Thread> thr;
-    RETURN_NOT_OK(kudu::Thread::Create("test", "lineitem-query",
-                                       &TpchRealWorld::RunQueriesThread, this,
-                                       &thr));
-    threads.push_back(thr);
+    threads.emplace_back([this]() { this->RunQueriesThread(); });
   }
 
   // We'll wait until all the dbgens finish or after tpch_test_runtime_sec,
@@ -432,10 +418,9 @@ Status TpchRealWorld::Run() {
 
   stop_threads_.Store(true);
 
-  for (const auto& thr : threads) {
-    RETURN_NOT_OK(ThreadJoiner(thr.get()).Join());
+  for (auto& t : threads) {
+    t.join();
   }
-  return Status::OK();
 }
 
 } // namespace kudu
@@ -450,10 +435,6 @@ int main(int argc, char* argv[]) {
     std::cerr << "Couldn't initialize the benchmarking tool, reason: "<< s.ToString() << std::endl;
     return 1;
   }
-  s = benchmarker.Run();
-  if (!s.ok()) {
-    std::cerr << "Couldn't run the benchmarking tool, reason: "<< s.ToString() << std::endl;
-    return 1;
-  }
+  benchmarker.Run();
   return 0;
 }

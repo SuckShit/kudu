@@ -16,6 +16,7 @@
 // under the License.
 
 #include <fstream>  // IWYU pragma: keep
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -27,7 +28,7 @@
 #include <gflags/gflags.h>
 
 #include "kudu/client/client.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"

@@ -69,10 +69,10 @@ void StatusToPB(const Status& status, AppStatusPB* pb);
 Status StatusFromPB(const AppStatusPB& pb);
 
 // Convert the specified HostPort to protobuf.
-Status HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb);
+HostPortPB HostPortToPB(const HostPort& host_port);
 
 // Returns the HostPort created from the specified protobuf.
-Status HostPortFromPB(const HostPortPB& host_port_pb, HostPort* host_port);
+HostPort HostPortFromPB(const HostPortPB& host_port_pb);
 
 // Convert the column schema delta `col_delta` to protobuf.
 void ColumnSchemaDeltaToPB(const ColumnSchemaDelta& col_delta, ColumnSchemaDeltaPB *pb);
@@ -158,24 +158,26 @@ Status ParseInt32Config(const std::string& name, const std::string& value, int32
 Status ExtraConfigPBToPBMap(const TableExtraConfigPB& pb,
                             google::protobuf::Map<std::string, std::string>* configs);
 
-// Encode the given row block into the provided protobuf and data buffers.
+// Encode the given row block into the provided data buffers.
 //
 // All data (both direct and indirect) for each selected row in the RowBlock is
 // copied into the protobuf and faststrings.
 // The original data may be destroyed safely after this returns.
 //
 // This only converts those rows whose selection vector entry is true.
-// If 'client_projection_schema' is not NULL, then only columns specified in
-// 'client_projection_schema' will be projected to 'data_buf'.
+// If 'projection_schema' is not NULL, then only columns specified in
+// 'projection_schema' will be projected to 'data_buf'.
 //
 // If 'pad_unixtime_micros_to_16_bytes' is true, UNIXTIME_MICROS slots in the projection
 // schema will be padded to the right by 8 (zero'd) bytes for a total of 16 bytes.
 //
 // Requires that block.nrows() > 0
-void SerializeRowBlock(const RowBlock& block, RowwiseRowBlockPB* rowblock_pb,
-                       const Schema* projection_schema,
-                       faststring* data_buf, faststring* indirect_data,
-                       bool pad_unixtime_micros_to_16_bytes = false);
+//
+// Returns the number of rows serialized.
+int SerializeRowBlock(const RowBlock& block,
+                      const Schema* projection_schema,
+                      faststring* data_buf, faststring* indirect_data,
+                      bool pad_unixtime_micros_to_16_bytes = false);
 
 // Rewrites the data pointed-to by row data slice 'row_data_slice' by replacing
 // relative indirect data pointers with absolute ones in 'indirect_data_slice'.

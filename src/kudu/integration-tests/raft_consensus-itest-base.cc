@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <unordered_map>
@@ -26,19 +27,17 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/opid.pb.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stringprintf.h"
@@ -63,10 +62,10 @@
 
 DEFINE_int32(num_client_threads, 8,
              "Number of client threads to launch");
-DEFINE_int64(client_inserts_per_thread, 50,
+DEFINE_int32(client_inserts_per_thread, 50,
              "Number of rows inserted by each client thread");
 DECLARE_int32(consensus_rpc_timeout_ms);
-DEFINE_int64(client_num_batches_per_thread, 5,
+DEFINE_int32(client_num_batches_per_thread, 5,
              "In how many batches to group the rows, for each client");
 
 METRIC_DECLARE_entity(tablet);
@@ -84,6 +83,7 @@ using kudu::itest::TServerDetails;
 using kudu::pb_util::SecureDebugString;
 using kudu::rpc::RpcController;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -136,10 +136,8 @@ void RaftConsensusITestBase::ScanReplica(TabletServerServiceProxy* replica_proxy
 }
 
 void RaftConsensusITestBase::InsertTestRowsRemoteThread(
-    uint64_t first_row,
-    uint64_t count,
-    uint64_t num_batches,
-    const vector<CountDownLatch*>& latches) {
+    int first_row, int count, int num_batches,
+    const vector<unique_ptr<CountDownLatch>>& latches) {
   shared_ptr<KuduTable> table;
   CHECK_OK(client_->OpenTable(kTableId, &table));
 
@@ -148,11 +146,11 @@ void RaftConsensusITestBase::InsertTestRowsRemoteThread(
   CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
 
   for (int i = 0; i < num_batches; i++) {
-    uint64_t first_row_in_batch = first_row + (i * count / num_batches);
-    uint64_t last_row_in_batch = first_row_in_batch + count / num_batches;
+    int first_row_in_batch = first_row + (i * count / num_batches);
+    int last_row_in_batch = first_row_in_batch + count / num_batches;
 
     for (int j = first_row_in_batch; j < last_row_in_batch; j++) {
-      gscoped_ptr<KuduInsert> insert(table->NewInsert());
+      unique_ptr<KuduInsert> insert(table->NewInsert());
       KuduPartialRow* row = insert->mutable_row();
       CHECK_OK(row->SetInt32(0, j));
       CHECK_OK(row->SetInt32(1, j * 2));
@@ -163,7 +161,7 @@ void RaftConsensusITestBase::InsertTestRowsRemoteThread(
     FlushSessionOrDie(session);
 
     int inserted = last_row_in_batch - first_row_in_batch;
-    for (CountDownLatch* latch : latches) {
+    for (const auto& latch : latches) {
       latch->CountDown(inserted);
     }
   }
@@ -181,7 +179,7 @@ void RaftConsensusITestBase::AddFlagsForLogRolls(vector<string>* extra_tserver_f
   //
   // Additionally, we disable log compression, since these tests write a lot of
   // repetitive data to cause the rolls, and compression would make it all tiny.
-  extra_tserver_flags->push_back("--log_compression_codec=none");
+  extra_tserver_flags->push_back("--log_compression_codec=no_compression");
   extra_tserver_flags->push_back("--log_cache_size_limit_mb=1");
   extra_tserver_flags->push_back("--log_segment_size_mb=1");
   extra_tserver_flags->push_back("--log_async_preallocate_segments=false");

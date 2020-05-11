@@ -17,6 +17,7 @@
 #include "kudu/tserver/tablet_copy_service.h"
 
 #include <cstdint>
+#include <functional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -46,6 +47,7 @@
 #include "kudu/util/metrics.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random_util.h"
+#include "kudu/util/thread.h"
 
 #define RPC_RETURN_NOT_OK(expr, app_err, message, context) \
   do { \
@@ -109,7 +111,7 @@ TabletCopyServiceImpl::TabletCopyServiceImpl(
       shutdown_latch_(1),
       tablet_copy_metrics_(server->metric_entity()) {
   CHECK_OK(Thread::Create("tablet-copy", "tc-session-exp",
-                          &TabletCopyServiceImpl::EndExpiredSessions, this,
+                          [this]() { this->EndExpiredSessions(); },
                           &session_expiration_thread_));
 }
 

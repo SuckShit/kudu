@@ -17,11 +17,14 @@
 
 #include "kudu/client/scan_predicate.h"
 
+#include <memory>
 #include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 
+#include "kudu/client/hash-internal.h"
 #include "kudu/client/scan_predicate-internal.h"
 #include "kudu/client/value-internal.h"
 #include "kudu/client/value.h"
@@ -29,13 +32,15 @@
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/block_bloom_filter.h"
 #include "kudu/util/status.h"
 
 using boost::optional;
 using std::move;
+using std::shared_ptr;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
@@ -146,6 +151,152 @@ Status InListPredicateData::AddToScanSpec(ScanSpec* spec, Arena* /*arena*/) {
   spec->AddPredicate(ColumnPredicate::InList(col_, &vals_list));
 
   return Status::OK();
+}
+
+// Helper function to add Bloom filters of different types to the scan spec.
+// "func" is a functor that provides access to the underlying BlockBloomFilter ptr.
+template<typename BloomFilterType, typename BloomFilterPtrFuncType>
+static Status AddBloomFiltersToScanSpec(const ColumnSchema& col, ScanSpec* spec,
+                                        const vector<BloomFilterType>& bloom_filters,
+                                        BloomFilterPtrFuncType func) {
+  // Extract the BlockBloomFilters.
+  vector<BlockBloomFilter*> block_bloom_filters;
+  block_bloom_filters.reserve(bloom_filters.size());
+  for (const auto& bf : bloom_filters) {
+    block_bloom_filters.push_back(func(bf));
+  }
+
+  spec->AddPredicate(ColumnPredicate::InBloomFilter(col, std::move(block_bloom_filters)));
+  return Status::OK();
+}
+
+Status InBloomFilterPredicateData::AddToScanSpec(ScanSpec* spec, Arena* /*arena*/) {
+  return AddBloomFiltersToScanSpec(col_, spec, bloom_filters_,
+                                   [](const unique_ptr<KuduBloomFilter>& bf) {
+                                     return bf->data_->bloom_filter_.get();
+                                   });
+}
+
+InBloomFilterPredicateData* client::InBloomFilterPredicateData::Clone() const {
+  vector<unique_ptr<KuduBloomFilter>> bloom_filter_clones;
+  bloom_filter_clones.reserve(bloom_filters_.size());
+  for (const auto& bf : bloom_filters_) {
+    bloom_filter_clones.emplace_back(bf->Clone());
+  }
+
+  return new InBloomFilterPredicateData(col_, std::move(bloom_filter_clones));
+}
+
+Status InDirectBloomFilterPredicateData::AddToScanSpec(ScanSpec* spec, Arena* /*arena*/) {
+  return AddBloomFiltersToScanSpec(col_, spec, bloom_filters_,
+                                   [](const DirectBlockBloomFilterUniqPtr& bf) {
+                                     return bf.get();
+                                   });
+}
+
+InDirectBloomFilterPredicateData* InDirectBloomFilterPredicateData::Clone() const {
+  // In the clone case, the objects are owned by InDirectBloomFilterPredicateData
+  // and hence use the default deleter with shared_ptr.
+  shared_ptr<BlockBloomFilterBufferAllocatorIf> allocator_clone =
+      CHECK_NOTNULL(allocator_->Clone());
+
+  vector<DirectBlockBloomFilterUniqPtr> bloom_filter_clones;
+  bloom_filter_clones.reserve(bloom_filters_.size());
+  for (const auto& bf : bloom_filters_) {
+    unique_ptr<BlockBloomFilter> bf_clone;
+    CHECK_OK(bf->Clone(allocator_clone.get(), &bf_clone));
+
+    // Similarly for unique_ptr, specify that the BlockBloomFilter is owned by
+    // InDirectBloomFilterPredicateData.
+    DirectBlockBloomFilterUniqPtr direct_bf_clone(
+        bf_clone.release(), DirectBloomFilterDataDeleter<BlockBloomFilter>(true /*owned*/));
+    bloom_filter_clones.emplace_back(std::move(direct_bf_clone));
+  }
+  return new InDirectBloomFilterPredicateData(col_, std::move(allocator_clone),
+                                              std::move(bloom_filter_clones));
+}
+
+KuduBloomFilter::KuduBloomFilter()  {
+  data_ = new Data();
+}
+
+KuduBloomFilter::KuduBloomFilter(Data* other_data) :
+   data_(CHECK_NOTNULL(other_data)) {
+}
+
+KuduBloomFilter::~KuduBloomFilter() {
+  delete data_;
+}
+
+KuduBloomFilter* KuduBloomFilter::Clone() const {
+  unique_ptr<Data> data_clone = data_->Clone();
+  return new KuduBloomFilter(data_clone.release());
+}
+
+void KuduBloomFilter::Insert(const Slice& key) {
+  DCHECK_NOTNULL(data_->bloom_filter_)->Insert(key);
+}
+
+KuduBloomFilterBuilder::Data::Data() :
+    num_keys_(0),
+    false_positive_probability_(0.01),
+    hash_algorithm_(FAST_HASH),
+    hash_seed_(0) {
+}
+
+KuduBloomFilterBuilder::KuduBloomFilterBuilder(size_t num_keys) {
+  data_ = new Data;
+  data_->num_keys_ = num_keys;
+}
+
+KuduBloomFilterBuilder::~KuduBloomFilterBuilder() {
+  delete data_;
+}
+
+KuduBloomFilterBuilder& KuduBloomFilterBuilder::false_positive_probability(double fpp) {
+  data_->false_positive_probability_ = fpp;
+  return *this;
+}
+
+KuduBloomFilterBuilder& KuduBloomFilterBuilder::hash_algorithm(HashAlgorithm hash_algorithm) {
+  data_->hash_algorithm_ = hash_algorithm;
+  return *this;
+}
+
+KuduBloomFilterBuilder& KuduBloomFilterBuilder::hash_seed(uint32_t hash_seed) {
+  data_->hash_seed_ = hash_seed;
+  return *this;
+}
+
+Status KuduBloomFilterBuilder::Build(KuduBloomFilter** bloom_filter_out) {
+  unique_ptr<KuduBloomFilter> bf(new KuduBloomFilter());
+  bf->data_->allocator_ = DefaultBlockBloomFilterBufferAllocator::GetSingletonSharedPtr();
+  bf->data_->bloom_filter_ = unique_ptr<BlockBloomFilter>(
+      new BlockBloomFilter(bf->data_->allocator_.get()));
+
+  int log_space_bytes = BlockBloomFilter::MinLogSpace(data_->num_keys_,
+                                                      data_->false_positive_probability_);
+  RETURN_NOT_OK(bf->data_->bloom_filter_->Init(
+      log_space_bytes, ToInternalHashAlgorithm(data_->hash_algorithm_), data_->hash_seed_));
+
+  *bloom_filter_out = bf.release();
+  return Status::OK();
+}
+
+KuduBloomFilter::Data::Data(shared_ptr<BlockBloomFilterBufferAllocatorIf> allocator,
+                            unique_ptr<BlockBloomFilter> bloom_filter) :
+    allocator_(std::move(allocator)),
+    bloom_filter_(std::move(bloom_filter)) {
+}
+
+unique_ptr<KuduBloomFilter::Data> KuduBloomFilter::Data::Clone() const {
+  shared_ptr<BlockBloomFilterBufferAllocatorIf> allocator_clone =
+      CHECK_NOTNULL(allocator_->Clone());
+  unique_ptr<BlockBloomFilter> bloom_filter_clone;
+  CHECK_OK(bloom_filter_->Clone(allocator_clone.get(), &bloom_filter_clone));
+
+  return unique_ptr<KuduBloomFilter::Data>(
+      new Data(std::move(allocator_clone), std::move(bloom_filter_clone)));
 }
 
 } // namespace client

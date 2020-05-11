@@ -20,6 +20,9 @@
 # Script which parses a test log for 'metrics: ' lines emited by
 # TimeSeriesCollector, and constructs a graph from them
 
+# Support the print function in Python 2.
+from __future__ import print_function
+
 import os
 import re
 import simplejson
@@ -42,7 +45,7 @@ def parse_data_from(stream, scope):
     try:
       data_points = simplejson.loads(json)
     except:
-      print >>sys.stderr, "bad json:", json
+      print("bad json: " + json, file=sys.stderr)
       raise
     if data_points['scope'] != scope:
       continue
@@ -69,9 +72,9 @@ def main():
   keys = get_keys(data)
 
   with sys.stdout as f:
-    print >>f, "\t".join(keys)
+    print("\t".join(keys), file=f)
     for row in data:
-      print >>f, "\t".join([str(row.get(k, 0)) for k in keys])
+      print("\t".join([str(row.get(k, 0)) for k in keys]), file=f)
 
 
 if __name__ == "__main__":

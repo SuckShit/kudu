@@ -102,13 +102,22 @@ DEPS_FOR_ALL = \
      # Tests that require tooling require this.
      "build/latest/bin/kudu",
 
-     # The HMS and Sentry tests require the Hadoop, Hive, and Sentry libraries.
+     # The HMS tests require the Hadoop, and Hive libraries.
      # These files are just symlinks, but dist-test will copy the entire
-     # directories they point to.  The symlinks themselves won't be recreated,
+     # directories they point to. The symlinks themselves won't be recreated,
      # so we point to them with environment variables in run_dist_test.py.
      "build/latest/bin/hive-home",
      "build/latest/bin/hadoop-home",
-     "build/latest/bin/sentry-home",
+
+     # Add the Kudu echo subprocess.
+     "build/latest/bin/kudu-subprocess.jar",
+
+     # Add Postgres and Ranger. These are symlinks to directories in thirdparty.
+     "build/latest/bin/postgres",
+     "build/latest/bin/postgres-lib",
+     "build/latest/bin/postgres-share",
+     "build/latest/bin/postgresql.jar",
+     "build/latest/bin/ranger-home",
 
      # Add the Kudu HMS plugin.
      "build/latest/bin/hms-plugin.jar",
@@ -338,7 +347,7 @@ def create_archive_input(staging, execution, dep_extractor,
              '-e', 'KUDU_ALLOW_SLOW_TESTS=%s' % os.environ.get('KUDU_ALLOW_SLOW_TESTS', 1),
              '-e', 'KUDU_COMPRESS_TEST_OUTPUT=%s' % \
                     os.environ.get('KUDU_COMPRESS_TEST_OUTPUT', 0)]
-  for k, v in execution.env.iteritems():
+  for k, v in execution.env.items():
     if k == 'KUDU_TEST_TIMEOUT':
       # Currently we don't respect the test timeouts specified in ctest, since
       # we want to make sure that the dist-test task timeout and the
@@ -388,13 +397,13 @@ def create_task_json(staging,
   Alternatively, if 'retry_all_tests' is True, all tests will be retried.
   """
   tasks = []
-  with file(staging.archive_dump_path(), "r") as isolate_dump:
+  with open(staging.archive_dump_path(), "r") as isolate_dump:
     inmap = json.load(isolate_dump)
 
   # Some versions of 'isolate batcharchive' directly list the items in
   # the dumped JSON. Others list it in an 'items' dictionary.
   items = inmap.get('items', inmap)
-  for k, v in items.iteritems():
+  for k, v in items.items():
     # The key may be 'foo-test.<shard>'. So, chop off the last component
     # to get the test name.
     test_name = ".".join(k.split(".")[:-1]) if TEST_SHARD_RE.search(k) else k
@@ -415,7 +424,7 @@ def create_task_json(staging,
     sys.exit(1)
   outmap = {"tasks": tasks}
 
-  with file(staging.tasks_json_path(), "wt") as f:
+  with open(staging.tasks_json_path(), "wt") as f:
     json.dump(outmap, f)
 
 
@@ -655,7 +664,7 @@ def add_java_subparser(subparsers):
   loop.set_defaults(func=loop_java_test)
 
 def dump_base_deps(parser, options):
-  print json.dumps(get_base_deps(create_dependency_extractor()))
+  print(json.dumps(get_base_deps(create_dependency_extractor())))
 
 def add_internal_commands(subparsers):
   p = subparsers.add_parser('internal', help="[Internal commands not for users]")

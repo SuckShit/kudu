@@ -14,15 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TSERVER_TABLET_SERVER_H
-#define KUDU_TSERVER_TABLET_SERVER_H
+#pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
 
 #include "kudu/gutil/atomicops.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/kserver/kserver.h"
 #include "kudu/tserver/tablet_server_options.h"
@@ -36,8 +35,8 @@ namespace tserver {
 
 class Heartbeater;
 class ScannerManager;
-class TabletServerPathHandlers;
 class TSTabletManager;
+class TabletServerPathHandlers;
 
 class TabletServer : public kserver::KuduServer {
  public:
@@ -45,6 +44,7 @@ class TabletServer : public kserver::KuduServer {
   // this constant as well.
   static const uint16_t kDefaultPort = 7050;
   static const uint16_t kDefaultWebPort = 8050;
+  static const uint16_t kDefaultNumServiceThreads = 20;
 
   explicit TabletServer(const TabletServerOptions& opts);
   ~TabletServer();
@@ -54,13 +54,15 @@ class TabletServer : public kserver::KuduServer {
   // Some initialization tasks are asynchronous, such as the bootstrapping
   // of tablets. Caller can block, waiting for the initialization to fully
   // complete by calling WaitInited().
-  virtual Status Init() override;
+  Status Init() override;
 
   // Waits for the tablet server to complete the initialization.
   Status WaitInited();
 
-  virtual Status Start() override;
-  virtual void Shutdown() override;
+  Status Start() override;
+  void Shutdown() override {
+    ShutdownImpl();
+  }
 
   std::string ToString() const;
 
@@ -82,6 +84,14 @@ class TabletServer : public kserver::KuduServer {
     return maintenance_manager_.get();
   }
 
+  bool quiescing() const {
+    return quiescing_;
+  }
+
+  std::atomic<bool>* mutable_quiescing() {
+    return &quiescing_;
+  }
+
  private:
   friend class TabletServerTestBase;
 
@@ -91,7 +101,14 @@ class TabletServer : public kserver::KuduServer {
     kRunning
   };
 
+  // A method for internal use in the destructor. Some static code analyzers
+  // issue a warning if calling a virtual function from destructor even if it's
+  // safe in a particular case.
+  void ShutdownImpl();
+
   TabletServerState state_;
+
+  std::atomic<bool> quiescing_;
 
   // If true, all heartbeats will be seen as failed.
   Atomic32 fail_heartbeats_for_tests_;
@@ -100,18 +117,18 @@ class TabletServer : public kserver::KuduServer {
   const TabletServerOptions opts_;
 
   // Manager for tablets which are available on this server.
-  gscoped_ptr<TSTabletManager> tablet_manager_;
+  std::unique_ptr<TSTabletManager> tablet_manager_;
 
   // Manager for open scanners from clients.
   // This is always non-NULL. It is scoped only to minimize header
   // dependencies.
-  gscoped_ptr<ScannerManager> scanner_manager_;
+  std::unique_ptr<ScannerManager> scanner_manager_;
 
   // Thread responsible for heartbeating to the master.
-  gscoped_ptr<Heartbeater> heartbeater_;
+  std::unique_ptr<Heartbeater> heartbeater_;
 
-  // Webserver path handlers
-  gscoped_ptr<TabletServerPathHandlers> path_handlers_;
+  // Webserver path handlers.
+  std::unique_ptr<TabletServerPathHandlers> path_handlers_;
 
   // The maintenance manager for this tablet server
   std::shared_ptr<MaintenanceManager> maintenance_manager_;
@@ -121,4 +138,3 @@ class TabletServer : public kserver::KuduServer {
 
 } // namespace tserver
 } // namespace kudu
-#endif

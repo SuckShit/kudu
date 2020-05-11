@@ -20,9 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
-#include <memory>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -402,7 +400,7 @@ TEST_F(HmsClientTest, TestHmsConnect) {
   // client.
   options.verify_service_config = true;
 
-  auto start_client = [&options] (Sockaddr addr) -> Status {
+  auto start_client = [&options] (Sockaddr addr) {
     HmsClient client(HostPort(addr), options);
     return client.Start();
   };
@@ -410,7 +408,7 @@ TEST_F(HmsClientTest, TestHmsConnect) {
   // Listening, but not accepting socket.
   Sockaddr listening;
   Socket listening_socket;
-  ASSERT_OK(listening_socket.Init(0));
+  ASSERT_OK(listening_socket.Init(loopback.family(), 0));
   ASSERT_OK(listening_socket.BindAndListen(loopback, 1));
   listening_socket.GetSocketAddress(&listening);
   ASSERT_TRUE(start_client(listening).IsTimedOut());
@@ -418,7 +416,7 @@ TEST_F(HmsClientTest, TestHmsConnect) {
   // Bound, but not listening socket.
   Sockaddr bound;
   Socket bound_socket;
-  ASSERT_OK(bound_socket.Init(0));
+  ASSERT_OK(bound_socket.Init(loopback.family(), 0));
   ASSERT_OK(bound_socket.Bind(loopback));
   bound_socket.GetSocketAddress(&bound);
   ASSERT_TRUE(start_client(bound).IsNetworkError());
@@ -426,7 +424,7 @@ TEST_F(HmsClientTest, TestHmsConnect) {
   // Unbound socket.
   Sockaddr unbound;
   Socket unbound_socket;
-  ASSERT_OK(unbound_socket.Init(0));
+  ASSERT_OK(unbound_socket.Init(loopback.family(), 0));
   ASSERT_OK(unbound_socket.Bind(loopback));
   unbound_socket.GetSocketAddress(&unbound);
   ASSERT_OK(unbound_socket.Close());

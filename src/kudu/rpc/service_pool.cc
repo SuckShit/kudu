@@ -21,7 +21,6 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -29,7 +28,6 @@
 #include <glog/logging.h>
 
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -45,8 +43,8 @@
 #include "kudu/util/thread.h"
 #include "kudu/util/trace.h"
 
-using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
@@ -73,7 +71,7 @@ METRIC_DEFINE_counter(server, rpcs_queue_overflow,
 namespace kudu {
 namespace rpc {
 
-ServicePool::ServicePool(gscoped_ptr<ServiceIf> service,
+ServicePool::ServicePool(unique_ptr<ServiceIf> service,
                          const scoped_refptr<MetricEntity>& entity,
                          size_t service_queue_length)
   : service_(std::move(service)),
@@ -91,8 +89,10 @@ ServicePool::~ServicePool() {
 Status ServicePool::Init(int num_threads) {
   for (int i = 0; i < num_threads; i++) {
     scoped_refptr<kudu::Thread> new_thread;
-    CHECK_OK(kudu::Thread::Create("service pool", "rpc worker",
-        &ServicePool::RunThread, this, &new_thread));
+    CHECK_OK(kudu::Thread::Create(
+        Substitute("service pool $0", service_->service_name()),
+        "rpc worker",
+        [this]() { this->RunThread(); }, &new_thread));
     threads_.push_back(new_thread);
   }
   return Status::OK();
@@ -143,7 +143,7 @@ RpcMethodInfo* ServicePool::LookupMethod(const RemoteMethod& method) {
   return service_->LookupMethod(method);
 }
 
-Status ServicePool::QueueInboundCall(gscoped_ptr<InboundCall> call) {
+Status ServicePool::QueueInboundCall(unique_ptr<InboundCall> call) {
   InboundCall* c = call.release();
 
   vector<uint32_t> unsupported_features;

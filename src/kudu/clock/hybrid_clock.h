@@ -19,11 +19,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "kudu/clock/clock.h"
 #include "kudu/clock/time_service.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/timestamp.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/metrics.h"
@@ -31,6 +33,9 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
+
+class HostPort;
+
 namespace clock {
 
 // The HybridTime clock.
@@ -39,8 +44,11 @@ namespace clock {
 // since NTP clock error is not available.
 class HybridClock : public Clock {
  public:
-  HybridClock();
+  // Create an instance, registering HybridClock's metrics with the specified
+  // metric entity.
+  explicit HybridClock(const scoped_refptr<MetricEntity>& metric_entity);
 
+  // Should be called only once.
   Status Init() override;
 
   // Obtains the timestamp corresponding to the current time.
@@ -59,12 +67,15 @@ class HybridClock : public Clock {
   // Updates the clock with a timestamp originating on another machine.
   Status Update(const Timestamp& to_update) override;
 
-  void RegisterMetrics(const scoped_refptr<MetricEntity>& metric_entity) override;
-
   // HybridClock supports all external consistency modes.
-  bool SupportsExternalConsistencyMode(ExternalConsistencyMode mode) override;
+  bool SupportsExternalConsistencyMode(
+      ExternalConsistencyMode /* mode */) const override {
+    return true;
+  }
 
-  bool HasPhysicalComponent() const override;
+  bool HasPhysicalComponent() const override {
+    return true;
+  }
 
   MonoDelta GetPhysicalComponentDifference(Timestamp lhs, Timestamp rhs) const override;
 
@@ -122,10 +133,10 @@ class HybridClock : public Clock {
   std::string Stringify(Timestamp timestamp) override;
 
   // Obtains the timestamp corresponding to the current time and the associated
-  // error in micros. This may fail if the clock is unsynchronized or synchronized
-  // but the error is too high and, since we can't do anything about it,
-  // LOG(FATAL)'s in that case.
-  void NowWithError(Timestamp* timestamp, uint64_t* max_error_usec);
+  // error in micros. If the clock is unsynchronized or synchronized but the
+  // error is too high, a non-OK status is returned.
+  Status NowWithError(Timestamp* timestamp, uint64_t* max_error_usec)
+      WARN_UNUSED_RESULT;
 
   // Static encoding/decoding methods for timestamps. Public mostly
   // for testing/debugging purposes.
@@ -152,19 +163,67 @@ class HybridClock : public Clock {
   // separated.
   static std::string StringifyTimestamp(const Timestamp& timestamp);
 
-  clock::TimeService* time_service() {
+  clock::TimeService* time_service() const {
     return time_service_.get();
   }
 
  private:
+  enum class TimeSource {
+    // Internal Kudu clock synchronized by built-in NTP client.
+    NTP_SYNC_BUILTIN,
+
+    // Local machine clock synchronized by NTP.
+    NTP_SYNC_SYSTEM,
+
+    // Local machine clock with no requirement of NTP synchronization.
+    UNSYNC_SYSTEM,
+
+    // Mock clock (used for tests only).
+    MOCK,
+
+    // Unknown/invalid time source.
+    UNKNOWN,
+  };
+
+  // How many bits to left shift a microseconds clock read. The remainder
+  // of the timestamp will be reserved for logical values. Left shifting 12 bits
+  // gives us 12 bits for the logical value and should still keep accurate
+  // microseconds time until 2100+
+  static constexpr const int kBitsToShift = 12;
+
+  // Mask to extract the pure logical bits.
+  static constexpr const uint64_t kLogicalBitMask = (1 << kBitsToShift) - 1;
+
+  // Convert time source to string representation.
+  static const char* TimeSourceToString(HybridClock::TimeSource time_source);
+
+  // Select particular time source for the hybrid clock given the
+  // 'time_source_str' parameter which can be a pseudo-source such as 'auto'.
+  // On success, the 'time_source' output parameter contains time source that
+  // determines particular time service to use, and the 'builtin_ntp_servers'
+  // contains NTP servers for the built-in NTP client if the 'builtin' time
+  // source is selected.
+  static Status SelectTimeSource(const std::string& time_source_str,
+                                 TimeSource* time_source,
+                                 std::vector<HostPort>* builtin_ntp_servers);
+
+  // Initialize hybrid clock with the specified time source.
+  // The 'builtin_ntp_servers' is used in case of TimeSource::BUILTIN_NTP_SYNC.
+  Status InitWithTimeSource(TimeSource time_source,
+                            std::vector<HostPort> builtin_ntp_servers);
+
+  // Variant of NowWithError() that requires 'lock_' to be held already.
+  Status NowWithErrorUnlocked(Timestamp* timestamp, uint64_t* max_error_usec);
+
+  // Variant of NowWithError() that calls LOG(FATAL) if the clock is
+  // unsynchronized or synchronized but the error is too high.
+  void NowWithErrorOrDie(Timestamp* timestamp, uint64_t* max_error_usec);
+
   // Obtains the current wallclock time and maximum error in microseconds,
   // and checks if the clock is synchronized.
   //
   // On OS X, the error will always be 0.
   Status WalltimeWithError(uint64_t* now_usec, uint64_t* error_usec);
-
-  // Same as above, but exits with a FATAL if there is an error.
-  void WalltimeWithErrorOrDie(uint64_t* now_usec, uint64_t* error_usec);
 
   // Used to get the timestamp for metrics.
   uint64_t NowForMetrics();
@@ -176,32 +235,50 @@ class HybridClock : public Clock {
   // service.
   std::unique_ptr<clock::TimeService> time_service_;
 
-  mutable simple_spinlock lock_;
+  // Guards access to 'state_' and 'next_timestamp_'.
+  simple_spinlock lock_;
 
   // The next timestamp to be generated from this clock, assuming that
   // the physical clock hasn't advanced beyond the value stored here.
+  // Protected by 'lock_'.
   uint64_t next_timestamp_;
 
   // The last valid clock reading we got from the time source, along
-  // with the monotime that we took that reading.
-  mutable simple_spinlock last_clock_read_lock_;
+  // with the monotime that we took that reading. The 'is_extrapolating' field
+  // tracks whether extrapolated or real readings of the underlying clock are
+  // used to generate hybrid timestamps.
+  simple_spinlock last_clock_read_lock_;  // protects four fields below
   MonoTime last_clock_read_time_;
   uint64_t last_clock_read_physical_;
   uint64_t last_clock_read_error_;
+  bool is_extrapolating_ = false;
 
-  // How many bits to left shift a microseconds clock read. The remainder
-  // of the timestamp will be reserved for logical values.
-  static const int kBitsToShift;
-
-  // Mask to extract the pure logical bits.
-  static const uint64_t kLogicalBitMask;
-
+  // The state of the object. Guarded by 'lock_'.
   enum State {
     kNotInitialized,
     kInitialized
   };
-
   State state_;
+
+  // Metric entity.
+  scoped_refptr<MetricEntity> metric_entity_;
+
+  // Whether the hybrid clock is extrapolating the readings of the underlying
+  // clock instead of using the real ones. It's important to know whether
+  // the extrapolation is happening, but 'extrapolation_intervals_histogram_'
+  // metric doesn't allow for exposing this fact prior to the end of current
+  // extrapolation interval.
+  scoped_refptr<AtomicGauge<bool>> extrapolating_;
+
+  // Stats on the underlying clock's 'maximum error' metric sampled every
+  // NowWithError() call (essentially, every call when requesting a hybrid clock
+  // timestamp).
+  scoped_refptr<Histogram> max_errors_histogram_;
+
+  // Stats on time intervals when the underlying clock was extrapolated
+  // instead of using the actual readings. Extrapolation happens when an attempt
+  // to read the clock yields an error (clock might be unsynchronized, etc.).
+  scoped_refptr<Histogram> extrapolation_intervals_histogram_;
 
   // Clock metrics are set to detach to their last value. This means
   // that, during our destructor, we'll need to access other class members

@@ -17,7 +17,9 @@
 
 #include "kudu/integration-tests/cluster_verifier.h"
 
+#include <functional>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -26,7 +28,7 @@
 
 #include "kudu/client/client.h"
 #include "kudu/client/scan_batch.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/log_verifier.h"
 #include "kudu/mini-cluster/mini_cluster.h"

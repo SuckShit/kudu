@@ -17,14 +17,13 @@
 
 #include "kudu/util/zlib.h"
 
-#include <zconf.h>
-#include <zlib.h>
-
 #include <cstdint>
 #include <cstring>
-#include <string>
 #include <memory>
-#include <ostream>
+#include <string>
+
+#include <zconf.h>
+#include <zlib.h>
 
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -70,9 +69,13 @@ Status ZlibResultToStatus(int rc) {
 } // anonymous namespace
 
 Status Compress(Slice input, ostream* out) {
+  return CompressLevel(input, Z_DEFAULT_COMPRESSION, out);
+}
+
+Status CompressLevel(Slice input, int level, ostream* out) {
   z_stream zs;
   memset(&zs, 0, sizeof(zs));
-  ZRETURN_NOT_OK(deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+  ZRETURN_NOT_OK(deflateInit2(&zs, level, Z_DEFLATED,
                               15 + 16 /* 15 window bits, enable gzip */,
                               8 /* memory level, max is 9 */,
                               Z_DEFAULT_STRATEGY));

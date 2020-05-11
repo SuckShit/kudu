@@ -16,17 +16,17 @@
 // under the License.
 #include "kudu/tserver/tablet_copy_client.h"
 
+#include <stdlib.h>
+
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <ostream>
-#include <stdlib.h>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
@@ -137,8 +137,7 @@ class TabletCopyClientTest : public TabletCopyTest {
 
   // Starts the tablet copy.
   Status StartCopy() {
-    HostPort host_port;
-    RETURN_NOT_OK(HostPortFromPB(leader_.last_known_addr(), &host_port));
+    HostPort host_port = HostPortFromPB(leader_.last_known_addr());
     return client_->Start(host_port, &meta_);
   }
 
@@ -399,7 +398,7 @@ TEST_F(TabletCopyClientTest, TestFailedDiskStopsClient) {
   // metadata directory).
   while (true) {
     if (rand() % 10 == 0) {
-      dd_manager->MarkDataDirFailed(1, "injected failure in non-client thread");
+      dd_manager->MarkDirFailed(1, "injected failure in non-client thread");
       LOG(INFO) << "INJECTING FAILURE";
       break;
     }

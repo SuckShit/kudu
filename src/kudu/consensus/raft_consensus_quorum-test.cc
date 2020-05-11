@@ -17,10 +17,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -30,7 +30,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/clock/logical_clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/schema.h"
@@ -55,9 +54,7 @@
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/consensus/time_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/strcat.h"
@@ -118,9 +115,9 @@ class RaftConsensusQuorumTest : public KuduTest {
   typedef vector<unique_ptr<LogEntryPB>> LogEntries;
 
   RaftConsensusQuorumTest()
-    : clock_(clock::LogicalClock::CreateStartingAt(Timestamp(1))),
-      metric_entity_(METRIC_ENTITY_tablet.Instantiate(&metric_registry_, "raft-test")),
-      schema_(GetSimpleTestSchema()) {
+      : clock_(Timestamp(1)),
+        metric_entity_(METRIC_ENTITY_tablet.Instantiate(&metric_registry_, "raft-test")),
+        schema_(GetSimpleTestSchema()) {
     options_.tablet_id = kTestTablet;
     FLAGS_enable_leader_failure_detection = false;
     CHECK_OK(ThreadPoolBuilder("raft").Build(&raft_pool_));
@@ -153,10 +150,11 @@ class RaftConsensusQuorumTest : public KuduTest {
       scoped_refptr<Log> log;
       RETURN_NOT_OK(Log::Open(LogOptions(),
                               fs_manager.get(),
+                              /*file_cache*/nullptr,
                               kTestTablet,
                               schema_,
                               0, // schema_version
-                              nullptr,
+                              /*metric_entity*/nullptr,
                               &log));
       logs_.emplace_back(std::move(log));
       fs_managers_.push_back(std::move(fs_manager));
@@ -191,10 +189,13 @@ class RaftConsensusQuorumTest : public KuduTest {
       RETURN_NOT_OK(GetRaftConfigMember(&config_, fs->uuid(), &local_peer_pb));
 
       shared_ptr<RaftConsensus> peer;
+      ServerContext ctx({ /*quiescing*/nullptr,
+                          /*num_leaders*/nullptr,
+                          raft_pool_.get() });
       RETURN_NOT_OK(RaftConsensus::Create(options_,
                                           config_.peers(i),
                                           std::move(cmeta_manager),
-                                          raft_pool_.get(),
+                                          std::move(ctx),
                                           &peer));
       peers_->AddPeer(config_.peers(i).permanent_uuid(), peer);
     }
@@ -211,8 +212,8 @@ class RaftConsensusQuorumTest : public KuduTest {
 
       unique_ptr<PeerProxyFactory> proxy_factory(
           new LocalTestPeerProxyFactory(peers_.get()));
-      scoped_refptr<TimeManager> time_manager(
-          new TimeManager(clock_, Timestamp::kMin));
+      unique_ptr<TimeManager> time_manager(
+          new TimeManager(&clock_, Timestamp::kMin));
       unique_ptr<TestTransactionFactory> txn_factory(
           new TestTransactionFactory(logs_[i].get()));
       txn_factory->SetConsensus(peer.get());
@@ -222,10 +223,10 @@ class RaftConsensusQuorumTest : public KuduTest {
           boot_info,
           std::move(proxy_factory),
           logs_[i],
-          time_manager,
+          std::move(time_manager),
           txn_factories_.back().get(),
           metric_entity_,
-          Bind(&DoNothing)));
+          &DoNothing));
     }
     return Status::OK();
   }
@@ -245,7 +246,7 @@ class RaftConsensusQuorumTest : public KuduTest {
     const int kLeaderIdx = num - 1;
     shared_ptr<RaftConsensus> leader;
     RETURN_NOT_OK(peers_->GetPeerByIdx(kLeaderIdx, &leader));
-    RETURN_NOT_OK(leader->EmulateElection());
+    RETURN_NOT_OK(leader->EmulateElectionForTests());
     return Status::OK();
   }
 
@@ -266,17 +267,17 @@ class RaftConsensusQuorumTest : public KuduTest {
 
   Status AppendDummyMessage(int peer_idx,
                             scoped_refptr<ConsensusRound>* round) {
-    gscoped_ptr<ReplicateMsg> msg(new ReplicateMsg());
+    unique_ptr<ReplicateMsg> msg(new ReplicateMsg());
     msg->set_op_type(NO_OP);
     msg->mutable_noop_request();
-    msg->set_timestamp(clock_->Now().ToUint64());
+    msg->set_timestamp(clock_.Now().ToUint64());
 
     shared_ptr<RaftConsensus> peer;
     CHECK_OK(peers_->GetPeerByIdx(peer_idx, &peer));
 
     // Use a latch in place of a Transaction callback.
     unique_ptr<Synchronizer> sync(new Synchronizer());
-    *round = peer->NewRound(std::move(msg), sync->AsStdStatusCallback());
+    *round = peer->NewRound(std::move(msg), sync->AsStatusCallback());
     EmplaceOrDie(&syncs_, round->get(), std::move(sync));
     RETURN_NOT_OK_PREPEND(peer->Replicate(round->get()),
                           Substitute("Unable to replicate to peer $0", peer_idx));
@@ -292,13 +293,14 @@ class RaftConsensusQuorumTest : public KuduTest {
                             shared_ptr<Synchronizer>* commit_sync = nullptr) {
     StatusCallback commit_callback;
     if (commit_sync != nullptr) {
-      commit_sync->reset(new Synchronizer());
-      commit_callback = Bind(&FireSharedSynchronizer, *commit_sync);
+      shared_ptr<Synchronizer> sync(std::make_shared<Synchronizer>());
+      commit_callback = [sync](const Status& s) { FireSharedSynchronizer(sync, s); };
+      *commit_sync = std::move(sync);
     } else {
-      commit_callback = Bind(&DoNothingStatusCB);
+      commit_callback = &DoNothingStatusCB;
     }
 
-    gscoped_ptr<CommitMsg> msg(new CommitMsg());
+    unique_ptr<CommitMsg> msg(new CommitMsg());
     msg->set_op_type(NO_OP);
     msg->mutable_commited_op_id()->CopyFrom(round->id());
     CHECK_OK(logs_[peer_idx]->AsyncAppendCommit(std::move(msg), commit_callback));
@@ -431,9 +433,10 @@ class RaftConsensusQuorumTest : public KuduTest {
     log->Close();
     shared_ptr<LogReader> log_reader;
     ASSERT_OK(log::LogReader::Open(fs_managers_[idx].get(),
-                                   scoped_refptr<log::LogIndex>(),
+                                   /*index*/nullptr,
                                    kTestTablet,
                                    metric_entity_.get(),
+                                   /*file_cache*/nullptr,
                                    &log_reader));
     log::SegmentSequence segments;
     log_reader->GetSegmentsSnapshot(&segments);
@@ -578,7 +581,7 @@ class RaftConsensusQuorumTest : public KuduTest {
   unique_ptr<ThreadPool> raft_pool_;
   unique_ptr<TestPeerMapManager> peers_;
   vector<unique_ptr<TestTransactionFactory>> txn_factories_;
-  scoped_refptr<clock::Clock> clock_;
+  clock::LogicalClock clock_;
   MetricRegistry metric_registry_;
   scoped_refptr<MetricEntity> metric_entity_;
   const Schema schema_;
@@ -823,7 +826,7 @@ TEST_F(RaftConsensusQuorumTest, TestLeaderHeartbeats) {
 
   shared_ptr<RaftConsensus> leader;
   CHECK_OK(peers_->GetPeerByIdx(kLeaderIdx, &leader));
-  ASSERT_OK(leader->EmulateElection());
+  ASSERT_OK(leader->EmulateElectionForTests());
 
   // Wait for the config round to get committed and count the number
   // of update calls, calls after that will be heartbeats.
@@ -956,7 +959,7 @@ TEST_F(RaftConsensusQuorumTest, TestReplicasEnforceTheLogMatchingProperty) {
 
   // Send a request with the next index.
   ReplicateMsg* replicate = req.add_ops();
-  replicate->set_timestamp(clock_->Now().ToUint64());
+  replicate->set_timestamp(clock_.Now().ToUint64());
   OpId* id = replicate->mutable_id();
   id->set_term(last_op_id.term());
   id->set_index(last_op_id.index() + 1);

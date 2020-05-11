@@ -18,26 +18,22 @@
 #include "kudu/master/master.h"
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
-#include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
@@ -96,17 +92,17 @@ DEFINE_string(location_mapping_cmd, "",
               "using location awareness features this flag should not be set.");
 
 
-using std::min;
-using std::shared_ptr;
-using std::string;
-using std::vector;
-
 using kudu::consensus::RaftPeerPB;
 using kudu::fs::ErrorHandlerType;
 using kudu::rpc::ServiceIf;
 using kudu::security::TokenSigner;
 using kudu::tserver::ConsensusServiceImpl;
 using kudu::tserver::TabletCopyServiceImpl;
+using std::min;
+using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
@@ -127,7 +123,7 @@ Master::Master(const MasterOptions& opts)
 }
 
 Master::~Master() {
-  CHECK_NE(kRunning, state_);
+  ShutdownImpl();
 }
 
 Status Master::Init() {
@@ -171,17 +167,16 @@ Status Master::Start() {
 Status Master::StartAsync() {
   CHECK_EQ(kInitialized, state_);
   fs_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK_ERROR,
-                                      Bind(&Master::CrashMasterOnDiskError, Unretained(this)));
+                                      &CrashMasterOnDiskError);
   fs_manager_->SetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION,
-                                      Bind(&Master::CrashMasterOnCFileCorruption,
-                                           Unretained(this)));
+                                      &CrashMasterOnCFileCorruption);
 
   RETURN_NOT_OK(maintenance_manager_->Start());
 
-  gscoped_ptr<ServiceIf> impl(new MasterServiceImpl(this));
-  gscoped_ptr<ServiceIf> consensus_service(
+  unique_ptr<ServiceIf> impl(new MasterServiceImpl(this));
+  unique_ptr<ServiceIf> consensus_service(
       new ConsensusServiceImpl(this, catalog_manager_.get()));
-  gscoped_ptr<ServiceIf> tablet_copy_service(
+  unique_ptr<ServiceIf> tablet_copy_service(
       new TabletCopyServiceImpl(this, catalog_manager_.get()));
 
   RETURN_NOT_OK(RegisterService(std::move(impl)));
@@ -193,8 +188,7 @@ Status Master::StartAsync() {
   RETURN_NOT_OK(InitMasterRegistration());
 
   // Start initializing the catalog manager.
-  RETURN_NOT_OK(init_pool_->SubmitClosure(Bind(&Master::InitCatalogManagerTask,
-                                               Unretained(this))));
+  RETURN_NOT_OK(init_pool_->Submit([this]() { this->InitCatalogManagerTask(); }));
   state_ = kRunning;
 
   return Status::OK();
@@ -242,27 +236,6 @@ Status Master::WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& 
                           s.ToString());
 }
 
-void Master::Shutdown() {
-  if (state_ == kRunning) {
-    const string name = rpc_server_->ToString();
-    LOG(INFO) << "Master@" << name << " shutting down...";
-
-    // 1. Stop accepting new RPCs.
-    UnregisterAllServices();
-
-    // 2. Shut down the master's subsystems.
-    maintenance_manager_->Shutdown();
-    catalog_manager_->Shutdown();
-    fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::DISK_ERROR);
-    fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION);
-
-    // 3. Shut down generic subsystems.
-    KuduServer::Shutdown();
-    LOG(INFO) << "Master@" << name << " shutdown complete.";
-  }
-  state_ = kStopped;
-}
-
 Status Master::GetMasterRegistration(ServerRegistrationPB* reg) const {
   if (!registration_initialized_.load(std::memory_order_acquire)) {
     return Status::ServiceUnavailable("Master startup not complete");
@@ -293,6 +266,28 @@ Status Master::InitMasterRegistration() {
   registration_initialized_.store(true);
 
   return Status::OK();
+}
+
+void Master::ShutdownImpl() {
+  if (kInitialized == state_ || kRunning == state_) {
+    const string name = rpc_server_->ToString();
+    LOG(INFO) << "Master@" << name << " shutting down...";
+
+    // 1. Stop accepting new RPCs.
+    UnregisterAllServices();
+
+    // 2. Shut down the master's subsystems.
+    init_pool_->Shutdown();
+    maintenance_manager_->Shutdown();
+    catalog_manager_->Shutdown();
+    fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::DISK_ERROR);
+    fs_manager_->UnsetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION);
+
+    // 3. Shut down generic subsystems.
+    KuduServer::Shutdown();
+    LOG(INFO) << "Master@" << name << " shutdown complete.";
+  }
+  state_ = kStopped;
 }
 
 void Master::CrashMasterOnDiskError(const string& uuid) {
@@ -348,11 +343,9 @@ Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
 
   masters->clear();
   for (const auto& peer : config.peers()) {
+    HostPort hp = HostPortFromPB(peer.last_known_addr());
     ServerEntryPB peer_entry;
-    HostPort hp;
-    Status s = HostPortFromPB(peer.last_known_addr(), &hp).AndThen([&] {
-      return GetMasterEntryForHost(messenger_, hp, &peer_entry);
-    });
+    Status s = GetMasterEntryForHost(messenger_, hp, &peer_entry);
     if (!s.ok()) {
       s = s.CloneAndPrepend(
           Substitute("Unable to get registration information for peer $0 ($1)",
@@ -373,7 +366,7 @@ Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
   return Status::OK();
 }
 
-Status Master::GetMasterHostPorts(vector<HostPortPB>* hostports) const {
+Status Master::GetMasterHostPorts(vector<HostPort>* hostports) const {
   auto consensus = catalog_manager_->master_consensus();
   if (!consensus) {
     return Status::IllegalState("consensus not running");
@@ -381,7 +374,7 @@ Status Master::GetMasterHostPorts(vector<HostPortPB>* hostports) const {
 
   hostports->clear();
   consensus::RaftConfigPB config = consensus->CommittedConfig();
-  for (auto& peer : *config.mutable_peers()) {
+  for (const auto& peer : *config.mutable_peers()) {
     if (peer.member_type() == consensus::RaftPeerPB::VOTER) {
       // In non-distributed master configurations, we don't store our own
       // last known address in the Raft config. So, we'll fill it in from
@@ -389,9 +382,10 @@ Status Master::GetMasterHostPorts(vector<HostPortPB>* hostports) const {
       if (!peer.has_last_known_addr()) {
         DCHECK_EQ(config.peers_size(), 1);
         DCHECK(registration_initialized_.load());
-        hostports->emplace_back(registration_.rpc_addresses(0));
+        DCHECK_GT(registration_.rpc_addresses_size(), 0);
+        hostports->emplace_back(HostPortFromPB(registration_.rpc_addresses(0)));
       } else {
-        hostports->emplace_back(std::move(*peer.mutable_last_known_addr()));
+        hostports->emplace_back(HostPortFromPB(peer.last_known_addr()));
       }
     }
   }

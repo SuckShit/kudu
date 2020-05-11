@@ -15,20 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/benchmarks/tpch/rpc_line_item_dao.h"
+
 #include <algorithm>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/benchmarks/tpch/rpc_line_item_dao.h"
 #include "kudu/benchmarks/tpch/tpch-schemas.h"
 #include "kudu/client/row_result.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/master/mini_master.h"
@@ -38,13 +40,14 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-namespace kudu {
-
-using client::KuduRowResult;
-using cluster::InternalMiniCluster;
-using cluster::InternalMiniClusterOptions;
+using kudu::client::KuduRowResult;
+using kudu::cluster::InternalMiniCluster;
+using kudu::cluster::InternalMiniClusterOptions;
 using std::string;
+using std::unique_ptr;
 using std::vector;
+
+namespace kudu {
 
 class RpcLineItemDAOTest : public KuduTest {
 
@@ -76,8 +79,8 @@ class RpcLineItemDAOTest : public KuduTest {
   }
 
  protected:
-  gscoped_ptr<InternalMiniCluster> cluster_;
-  gscoped_ptr<RpcLineItemDAO> dao_;
+  unique_ptr<InternalMiniCluster> cluster_;
+  unique_ptr<RpcLineItemDAO> dao_;
 
   // Builds a test row to be inserted into the lineitem table.
   // The row's ship_date is set such that it matches the TPCH Q1 predicate.
@@ -107,7 +110,7 @@ class RpcLineItemDAOTest : public KuduTest {
   }
 
   int CountRows() {
-    gscoped_ptr<RpcLineItemDAO::Scanner> scanner;
+    unique_ptr<RpcLineItemDAO::Scanner> scanner;
     dao_->OpenScanner(vector<string>(), &scanner);
     vector<KuduRowResult> rows;
     int count = 0;
@@ -121,7 +124,7 @@ class RpcLineItemDAOTest : public KuduTest {
   void ScanTpch1RangeToStrings(int64_t min_orderkey, int64_t max_orderkey,
                           vector<string>* str_rows) {
     str_rows->clear();
-    gscoped_ptr<RpcLineItemDAO::Scanner> scanner;
+    unique_ptr<RpcLineItemDAO::Scanner> scanner;
     dao_->OpenTpch1ScannerForOrderKeyRange(min_orderkey, max_orderkey,
                                           &scanner);
     vector<KuduRowResult> rows;
@@ -136,12 +139,12 @@ class RpcLineItemDAOTest : public KuduTest {
 }; // class RpcLineItemDAOTest
 
 TEST_F(RpcLineItemDAOTest, TestInsert) {
-  dao_->WriteLine(boost::bind(BuildTestRow, 1, 1, _1));
+  dao_->WriteLine([](KuduPartialRow* row) { BuildTestRow(1, 1, row); });
   dao_->FinishWriting();
   ASSERT_EQ(1, CountRows());
   for (int i = 2; i < 10; i++) {
     for (int y = 0; y < 5; y++) {
-      dao_->WriteLine(boost::bind(BuildTestRow, i, y, _1));
+      dao_->WriteLine([=](KuduPartialRow* row) { BuildTestRow(i, y, row); });
     }
   }
   dao_->FinishWriting();
@@ -155,13 +158,13 @@ TEST_F(RpcLineItemDAOTest, TestInsert) {
 }
 
 TEST_F(RpcLineItemDAOTest, TestUpdate) {
-  dao_->WriteLine(boost::bind(BuildTestRow, 1, 1, _1));
+  dao_->WriteLine([](KuduPartialRow* row) { BuildTestRow(1, 1, row); });
   dao_->FinishWriting();
   ASSERT_EQ(1, CountRows());
 
-  dao_->MutateLine(boost::bind(UpdateTestRow, 1, 1, 12345, _1));
+  dao_->MutateLine([](KuduPartialRow* row) { UpdateTestRow(1, 1, 12345, row); });
   dao_->FinishWriting();
-  gscoped_ptr<RpcLineItemDAO::Scanner> scanner;
+  unique_ptr<RpcLineItemDAO::Scanner> scanner;
   dao_->OpenScanner({ tpch::kQuantityColName }, &scanner);
   vector<KuduRowResult> rows;
   while (scanner->HasMore()) {

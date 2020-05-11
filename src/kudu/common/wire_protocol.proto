@@ -96,6 +96,11 @@ message ServerRegistrationPB {
 
   // Seconds since the epoch.
   optional int64 start_time = 5;
+
+  // The path of a UNIX domain socket where the server is listening.
+  // An '@' prefix indicates the abstract namespace. May be missing
+  // if this feature is not enabled.
+  optional string unix_domain_socket_path = 6;
 }
 
 message ServerEntryPB {
@@ -151,6 +156,25 @@ message RowwiseRowBlockPB {
   optional int32 indirect_data_sidecar = 3;
 }
 
+// A block of rows in columnar layout.
+message ColumnarRowBlockPB {
+  message Column {
+    // The index of the sidecar containing cell data of the column.
+    optional int32 data_sidecar = 1;
+
+    // The index of the sidecar containing any data referred to by binary/string data.
+    // In this case, the `data` sidecar will contain an array of `num_rows + 1` uint32s
+    // pointing to offsets in this sidecar.
+    optional int32 varlen_data_sidecar = 2;
+
+    // If the column is nullable, The index of the sidecar containing a bitmap with a set
+    // bit for all non-null cells.
+    optional int32 non_null_bitmap_sidecar = 3;
+  }
+  repeated Column columns = 1;
+  optional int64 num_rows = 2;
+}
+
 // A set of operations (INSERT, UPDATE, UPSERT, or DELETE) to apply to a table,
 // or the set of split rows and range bounds when creating or altering table.
 // Range bounds determine the boundaries of range partitions during table
@@ -162,6 +186,7 @@ message RowOperationsPB {
     UPDATE = 2;
     DELETE = 3;
     UPSERT = 5;
+    INSERT_IGNORE = 10;
 
     // Used when specifying split rows on table creation.
     SPLIT_ROW = 4;

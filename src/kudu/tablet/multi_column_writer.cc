@@ -30,7 +30,6 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 
@@ -85,7 +84,7 @@ Status MultiColumnWriter::Open() {
     BlockId block_id(block->id());
 
     // Create the CFile writer itself.
-    gscoped_ptr<CFileWriter> writer(new CFileWriter(
+    unique_ptr<CFileWriter> writer(new CFileWriter(
         std::move(opts),
         col.type_info(),
         col.is_nullable(),
@@ -106,7 +105,7 @@ Status MultiColumnWriter::AppendBlock(const RowBlock& block) {
   for (int i = 0; i < schema_->num_columns(); i++) {
     ColumnBlock column = block.column_block(i);
     if (column.is_nullable()) {
-      RETURN_NOT_OK(cfile_writers_[i]->AppendNullableEntries(column.null_bitmap(),
+      RETURN_NOT_OK(cfile_writers_[i]->AppendNullableEntries(column.non_null_bitmap(),
           column.data(), column.nrows()));
     } else {
       RETURN_NOT_OK(cfile_writers_[i]->AppendEntries(column.data(), column.nrows()));

@@ -18,12 +18,10 @@
 #include "kudu/client/batcher.h"
 
 #include <cstddef>
-#include <memory>
+#include <functional>
 #include <mutex>
 #include <ostream>
-#include <set>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -37,7 +35,7 @@
 #include "kudu/client/meta_cache.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/session-internal.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op-internal.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
@@ -47,9 +45,7 @@
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/atomic_refcount.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -66,8 +62,25 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/pb_util.h"
 
-using std::pair;
-using std::set;
+namespace kudu {
+namespace rpc {
+class Messenger;
+}  // namespace rpc
+}  // namespace kudu
+
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
+using kudu::rpc::CredentialsPolicy;
+using kudu::rpc::ErrorStatusPB;
+using kudu::rpc::Messenger;
+using kudu::rpc::RequestTracker;
+using kudu::rpc::ResponseCallback;
+using kudu::rpc::RetriableRpc;
+using kudu::rpc::RetriableRpcStatus;
+using kudu::security::SignedTokenPB;
+using kudu::tserver::WriteRequestPB;
+using kudu::tserver::WriteResponsePB;
+using kudu::tserver::WriteResponsePB_PerRowErrorPB;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
@@ -78,24 +91,6 @@ using strings::Substitute;
 namespace kudu {
 
 class Schema;
-
-namespace rpc {
-class Messenger;
-}
-
-using pb_util::SecureDebugString;
-using pb_util::SecureShortDebugString;
-using rpc::CredentialsPolicy;
-using rpc::ErrorStatusPB;
-using rpc::Messenger;
-using rpc::RequestTracker;
-using rpc::ResponseCallback;
-using rpc::RetriableRpc;
-using rpc::RetriableRpcStatus;
-using security::SignedTokenPB;
-using tserver::WriteRequestPB;
-using tserver::WriteResponsePB;
-using tserver::WriteResponsePB_PerRowErrorPB;
 
 namespace client {
 
@@ -187,7 +182,7 @@ struct InFlightOp {
   State state;
 
   // The actual operation.
-  gscoped_ptr<KuduWriteOperation> write_op;
+  unique_ptr<KuduWriteOperation> write_op;
 
   // The tablet the operation is destined for.
   // This is only filled in after passing through the kLookingUpTablet state.
@@ -549,7 +544,7 @@ bool WriteRpc::GetNewAuthnTokenAndRetry() {
   KuduClient* c = batcher_->client_;
   VLOG(1) << "Retrieving new authn token from master";
   c->data_->ConnectToClusterAsync(c, retrier().deadline(),
-      Bind(&WriteRpc::GotNewAuthnTokenRetryCb, Unretained(this)),
+      [this](const Status& s) { this->GotNewAuthnTokenRetryCb(s); },
       CredentialsPolicy::PRIMARY_CREDENTIALS);
   return true;
 }
@@ -560,7 +555,7 @@ bool WriteRpc::GetNewAuthzTokenAndRetry() {
   KuduClient* c = batcher_->client_;
   VLOG(1) << "Retrieving new authz token from master";
   c->data_->RetrieveAuthzTokenAsync(table(),
-      Bind(&WriteRpc::GotNewAuthzTokenRetryCb, Unretained(this)),
+      [this](const Status& s) { this->GotNewAuthzTokenRetryCb(s); },
       retrier().deadline());
   return true;
 }
@@ -598,6 +593,8 @@ Batcher::Batcher(KuduClient* client,
     timeout_(client->default_rpc_timeout()),
     outstanding_lookups_(0),
     buffer_bytes_used_(0) {
+  ops_.set_empty_key(nullptr);
+  ops_.set_deleted_key(reinterpret_cast<InFlightOp*>(-1));
 }
 
 void Batcher::Abort() {
@@ -713,7 +710,7 @@ void Batcher::FlushAsync(KuduStatusCallback* cb) {
 Status Batcher::Add(KuduWriteOperation* write_op) {
   // As soon as we get the op, start looking up where it belongs,
   // so that when the user calls Flush, we are ready to go.
-  gscoped_ptr<InFlightOp> op(new InFlightOp());
+  unique_ptr<InFlightOp> op(new InFlightOp());
   string partition_key;
   RETURN_NOT_OK(write_op->table_->partition_schema().EncodeKey(write_op->row(), &partition_key));
   op->write_op.reset(write_op);
@@ -725,16 +722,18 @@ Status Batcher::Add(KuduWriteOperation* write_op) {
   //
   // deadline_ is set in FlushAsync(), after all Add() calls are done, so
   // here we're forced to create a new deadline.
+  auto op_raw = op.get();
   MonoTime deadline = ComputeDeadlineUnlocked();
   base::RefCountInc(&outstanding_lookups_);
+  scoped_refptr<Batcher> self(this);
   client_->data_->meta_cache_->LookupTabletByKey(
       op->write_op->table(),
       std::move(partition_key),
       deadline,
       MetaCache::LookupType::kPoint,
       &op->tablet,
-      Bind(&Batcher::TabletLookupFinished, this, op.get()));
-  IgnoreResult(op.release());
+      [self, op_raw](const Status& s) { self->TabletLookupFinished(op_raw, s); });
+  ignore_result(op.release());
 
   buffer_bytes_used_.IncrementBy(write_op->SizeInBuffer());
 
@@ -941,7 +940,7 @@ void Batcher::ProcessWriteResponse(const WriteRpc& rpc,
                  << SecureDebugString(rpc.resp());
       continue;
     }
-    gscoped_ptr<KuduWriteOperation> op = std::move(rpc.ops()[err_pb.row_index()]->write_op);
+    unique_ptr<KuduWriteOperation> op = std::move(rpc.ops()[err_pb.row_index()]->write_op);
     VLOG(2) << "Error on op " << op->ToString() << ": "
             << SecureShortDebugString(err_pb.error());
     Status op_status = StatusFromPB(err_pb.error());

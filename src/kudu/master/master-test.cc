@@ -17,12 +17,13 @@
 
 #include "kudu/master/master.h"
 
-#include <time.h>
-
 #include <algorithm>
 #include <cstdint>
+#include <ctime>
+#include <functional>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <ostream>
 #include <set>
 #include <string>
@@ -32,7 +33,7 @@
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -50,7 +51,6 @@
 #include "kudu/consensus/replica_management.pb.h"
 #include "kudu/generated/version_defines.h"
 #include "kudu/gutil/dynamic_annotations.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/split.h"
@@ -63,6 +63,7 @@
 #include "kudu/master/master_options.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/master/sys_catalog.h"
+#include "kudu/master/table_metrics.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/rpc/messenger.h"
@@ -70,6 +71,7 @@
 #include "kudu/security/tls_context.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_verifier.h"
+#include "kudu/server/monitored_task.h"
 #include "kudu/server/rpc_server.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/util/atomic.h"
@@ -77,12 +79,14 @@
 #include "kudu/util/curl_util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -94,12 +98,14 @@ using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
+using std::accumulate;
 using std::map;
 using std::multiset;
 using std::pair;
 using std::shared_ptr;
 using std::string;
 using std::thread;
+using std::unique_ptr;
 using std::unordered_map;
 using std::unordered_set;
 using std::vector;
@@ -112,9 +118,11 @@ DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_double(sys_catalog_fail_during_write);
 DECLARE_int32(diagnostics_log_stack_traces_interval_ms);
 DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
+DECLARE_int32(rpc_service_queue_length);
 DECLARE_int64(live_row_count_for_testing);
 DECLARE_int64(on_disk_size_for_testing);
 DECLARE_string(location_mapping_cmd);
+DECLARE_string(log_filename);
 
 namespace kudu {
 namespace master {
@@ -157,9 +165,9 @@ class MasterTest : public KuduTest {
                      const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds);
 
   shared_ptr<Messenger> client_messenger_;
-  gscoped_ptr<MiniMaster> mini_master_;
+  unique_ptr<MiniMaster> mini_master_;
   Master* master_;
-  gscoped_ptr<MasterServiceProxy> proxy_;
+  unique_ptr<MasterServiceProxy> proxy_;
 };
 
 TEST_F(MasterTest, TestPingServer) {
@@ -912,6 +920,7 @@ TEST_F(MasterTest, TestDumpStacksOnRpcQueueOverflow) {
   // Use a new log directory so that the tserver and master don't share the
   // same one. This allows us to isolate the diagnostics log from the master.
   FLAGS_log_dir = JoinPathSegments(GetTestDataDirectory(), "master-logs");
+  FLAGS_log_filename = "kudu-master";
   Status s = env_->CreateDir(FLAGS_log_dir);
   ASSERT_TRUE(s.ok() || s.IsAlreadyPresent()) << s.ToString();
   mini_master_->Shutdown();
@@ -929,7 +938,7 @@ TEST_F(MasterTest, TestDumpStacksOnRpcQueueOverflow) {
   CountDownLatch latch(kNumRpcs);
   for (int i = 0; i < kNumRpcs; i++) {
     proxy_->GetTableLocationsAsync(req, &resps[i], &rpcs[i],
-                                   boost::bind(&CountDownLatch::CountDown, &latch));
+                                   [&latch]() { latch.CountDown(); });
   }
   latch.Wait();
 
@@ -1050,6 +1059,161 @@ TEST_F(MasterTest, TestGetTableSchemaIsAtomicWithCreateTable) {
   done.Store(true);
   t.join();
 }
+
+class ConcurrentGetTableSchemaTest :
+    public MasterTest,
+    public ::testing::WithParamInterface<bool> {
+ protected:
+  ConcurrentGetTableSchemaTest()
+      : supports_authz_(GetParam()) {
+  }
+
+  void SetUp() override {
+    MasterTest::SetUp();
+    FLAGS_master_support_authz_tokens = supports_authz_;
+  }
+
+  const bool supports_authz_;
+  static const MonoDelta kRunInterval;
+  static const Schema kTableSchema;
+  static const string kTableNamePattern;
+};
+
+const MonoDelta ConcurrentGetTableSchemaTest::kRunInterval =
+    MonoDelta::FromSeconds(5);
+const Schema ConcurrentGetTableSchemaTest::kTableSchema = {
+    {
+      ColumnSchema("key", INT32),
+      ColumnSchema("v1", UINT64),
+      ColumnSchema("v2", STRING)
+    }, 1 };
+const string ConcurrentGetTableSchemaTest::kTableNamePattern = "test_table_$0"; // NOLINT
+
+// Send multiple GetTableSchema() RPC requests for different tables.
+TEST_P(ConcurrentGetTableSchemaTest, Rpc) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  // kNumTables corresponds to the number of threads sending GetTableSchema
+  // RPCs. If setting a bit higher than the RPC queue size limit, there is
+  // a chance of overflowing the RPC queue.
+  const int kNumTables = FLAGS_rpc_service_queue_length;
+
+  for (auto idx = 0; idx < kNumTables; ++idx) {
+    EXPECT_OK(CreateTable(Substitute(kTableNamePattern, idx), kTableSchema));
+  }
+
+  AtomicBool done(false);
+
+  // Start many threads that hammer the master with GetTableSchema() calls
+  // for various tables.
+  vector<thread> caller_threads;
+  caller_threads.reserve(kNumTables);
+  vector<uint64_t> call_counters(kNumTables, 0);
+  vector<uint64_t> error_counters(kNumTables, 0);
+  for (auto idx = 0; idx < kNumTables; ++idx) {
+    caller_threads.emplace_back([&, idx]() {
+      auto table_name = Substitute(kTableNamePattern, idx);
+      GetTableSchemaRequestPB req;
+      req.mutable_table()->set_table_name(table_name);
+      while (!done.Load()) {
+        RpcController controller;
+        GetTableSchemaResponsePB resp;
+        CHECK_OK(proxy_->GetTableSchema(req, &resp, &controller));
+        ++call_counters[idx];
+        if (resp.has_error()) {
+          LOG(WARNING) << "GetTableSchema failed: " << SecureDebugString(resp);
+          ++error_counters[idx];
+          break;
+        }
+      }
+    });
+  }
+  SCOPED_CLEANUP({
+    for (auto& t : caller_threads) {
+      t.join();
+    }
+  });
+
+  SleepFor(kRunInterval);
+  done.Store(true);
+
+  const auto errors = accumulate(error_counters.begin(), error_counters.end(), 0UL);
+  if (errors != 0) {
+    FAIL() << Substitute("detected $0 errors", errors);
+  }
+
+  const double total = accumulate(call_counters.begin(), call_counters.end(), 0UL);
+  LOG(INFO) << Substitute(
+      "GetTableSchema RPC: $0 req/sec (authz $1)",
+      total / kRunInterval.ToSeconds(), supports_authz_ ? "enabled" : "disabled");
+}
+
+// Run multiple threads calling GetTableSchema() directly to system catalog.
+TEST_P(ConcurrentGetTableSchemaTest, DirectMethodCall) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+
+  constexpr int kNumTables = 200;
+  static const string kUserName = "test-user";
+
+  for (auto idx = 0; idx < kNumTables; ++idx) {
+    EXPECT_OK(CreateTable(Substitute(kTableNamePattern, idx), kTableSchema));
+  }
+
+  AtomicBool done(false);
+  CatalogManager* cm = mini_master_->master()->catalog_manager();
+  const auto* token_signer = supports_authz_
+      ? mini_master_->master()->token_signer() : nullptr;
+  const auto username = supports_authz_
+      ? boost::make_optional<const string&>(kUserName) : boost::none;
+
+  // Start many threads that hammer the master with GetTableSchema() calls
+  // for various tables.
+  vector<thread> caller_threads;
+  caller_threads.reserve(kNumTables);
+  vector<uint64_t> call_counters(kNumTables, 0);
+  vector<uint64_t> error_counters(kNumTables, 0);
+  for (auto idx = 0; idx < kNumTables; ++idx) {
+    caller_threads.emplace_back([&, idx]() {
+      GetTableSchemaRequestPB req;
+      req.mutable_table()->set_table_name(Substitute(kTableNamePattern, idx));
+      while (!done.Load()) {
+        RpcController controller;
+        GetTableSchemaResponsePB resp;
+        {
+          CatalogManager::ScopedLeaderSharedLock l(cm);
+          CHECK_OK(cm->GetTableSchema(&req, &resp, username, token_signer));
+        }
+        ++call_counters[idx];
+        if (resp.has_error()) {
+          LOG(WARNING) << "GetTableSchema failed: " << SecureDebugString(resp);
+          ++error_counters[idx];
+          break;
+        }
+      }
+    });
+  }
+  SCOPED_CLEANUP({
+    for (auto& t : caller_threads) {
+      t.join();
+    }
+  });
+
+  SleepFor(kRunInterval);
+  done.Store(true);
+
+  const auto errors = accumulate(error_counters.begin(), error_counters.end(), 0UL);
+  if (errors != 0) {
+    FAIL() << Substitute("detected $0 errors", errors);
+  }
+
+  const double total = accumulate(call_counters.begin(), call_counters.end(), 0UL);
+  LOG(INFO) << Substitute(
+      "GetTableSchema function: $0 req/sec (authz $1)",
+      total / kRunInterval.ToSeconds(), supports_authz_ ? "enabled" : "disabled");
+}
+
+INSTANTIATE_TEST_CASE_P(SupportsAuthzTokens,
+                        ConcurrentGetTableSchemaTest, ::testing::Bool());
 
 // Verifies that on-disk master metadata is self-consistent and matches a set
 // of expected contents.
@@ -1777,29 +1941,123 @@ TEST_F(MasterTest, TestTableIdentifierWithIdAndName) {
   }
 }
 
-TEST_F(MasterTest, TestGetTableStatistics) {
-  const char *kTableName = "testtable";
+TEST_F(MasterTest, TestDuplicateRequest) {
+  const char* const kTsUUID = "my-ts-uuid";
+  TSToMasterCommonPB common;
+  common.mutable_ts_instance()->set_permanent_uuid(kTsUUID);
+  common.mutable_ts_instance()->set_instance_seqno(1);
+
+  // Register the fake TS, without sending any tablet report.
+  ServerRegistrationPB fake_reg;
+  MakeHostPortPB("localhost", 1000, fake_reg.add_rpc_addresses());
+  MakeHostPortPB("localhost", 2000, fake_reg.add_http_addresses());
+  fake_reg.set_software_version(VersionInfo::GetVersionInfo());
+  fake_reg.set_start_time(10000);
+
+  // Information on replica management scheme.
+  ReplicaManagementInfoPB rmi;
+  rmi.set_replacement_scheme(ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION);
+
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_TRUE(resp.leader_master());
+    ASSERT_FALSE(resp.needs_reregister());
+    ASSERT_FALSE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.has_tablet_report());
+  }
+
+  vector<shared_ptr<TSDescriptor> > descs;
+  master_->ts_manager()->GetAllDescriptors(&descs);
+  ASSERT_EQ(1, descs.size()) << "Should have registered the TS";
+  ServerRegistrationPB reg;
+  descs[0]->GetRegistration(&reg);
+  ASSERT_EQ(SecureDebugString(fake_reg), SecureDebugString(reg))
+      << "Master got different registration";
+  shared_ptr<TSDescriptor> ts_desc;
+  ASSERT_TRUE(master_->ts_manager()->LookupTSByUUID(kTsUUID, &ts_desc));
+  ASSERT_EQ(ts_desc, descs[0]);
+
+  // Create a table with three tablets.
+  const char *kTableName = "test_table";
   const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
   ASSERT_OK(CreateTable(kTableName, kTableSchema));
 
-  // Get table statistics with right name.
-  GetTableStatisticsRequestPB req;
-  GetTableStatisticsResponsePB resp;
-  RpcController controller;
-  req.mutable_table()->set_table_name(kTableName);
-  ASSERT_OK(proxy_->GetTableStatistics(req, &resp, &controller));
-  ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
-  ASSERT_EQ(0, resp.on_disk_size());
-  ASSERT_EQ(0, resp.live_row_count());
+  vector<scoped_refptr<TableInfo>> tables;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    ASSERT_EQ(1, tables.size());
+  }
 
-  FLAGS_mock_table_metrics_for_testing = true;
-  FLAGS_on_disk_size_for_testing = 1024;
-  FLAGS_live_row_count_for_testing = 100;
-  controller.Reset();
-  ASSERT_OK(proxy_->GetTableStatistics(req, &resp, &controller));
-  ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
-  ASSERT_EQ(FLAGS_on_disk_size_for_testing, resp.on_disk_size());
-  ASSERT_EQ(FLAGS_live_row_count_for_testing, resp.live_row_count());
+  scoped_refptr<TableInfo> table = tables[0];
+  vector<scoped_refptr<TabletInfo>> tablets;
+  table->GetAllTablets(&tablets);
+  ASSERT_EQ(tablets.size(), 3);
+
+  // Delete the table.
+  {
+    DeleteTableRequestPB req;
+    DeleteTableResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name(kTableName);
+    ASSERT_OK(proxy_->DeleteTable(req, &resp, &controller));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // The table has no pending task.
+  // The master would not send DeleteTablet requests for no consensus state for tablets.
+  vector<scoped_refptr<MonitoredTask>> task_list;
+  tables[0]->GetTaskList(&task_list);
+  ASSERT_EQ(task_list.size(), 0);
+
+  // Now the tserver send a full report with a deleted tablet.
+  // The master will process it and send 'DeleteTablet' request to the tserver.
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    TabletReportPB* tr = req.mutable_tablet_report();
+    tr->set_is_incremental(false);
+    tr->set_sequence_number(0);
+    tr->add_updated_tablets()->set_tablet_id(tablets[0]->id());
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+    ASSERT_TRUE(resp.has_tablet_report());
+  }
+
+  // The 'DeleteTablet' task is running for the master will continue
+  // retrying to connect to the fake TS.
+  tables[0]->GetTaskList(&task_list);
+  ASSERT_EQ(task_list.size(), 1);
+  ASSERT_EQ(task_list[0]->state(), MonitoredTask::kStateRunning);
+
+  // Now the tserver send a full report with two deleted tablets.
+  // The master will not send duplicate DeleteTablet request to the tserver.
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    req.mutable_common()->CopyFrom(common);
+    TabletReportPB* tr = req.mutable_tablet_report();
+    tr->set_is_incremental(true);
+    tr->set_sequence_number(0);
+    tr->add_updated_tablets()->set_tablet_id(tablets[0]->id());
+    tr->add_updated_tablets()->set_tablet_id(tablets[1]->id());
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+    ASSERT_TRUE(resp.has_tablet_report());
+  }
+
+  tables[0]->GetTaskList(&task_list);
+  ASSERT_EQ(task_list.size(), 2);
 }
 
 TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
@@ -1851,7 +2109,6 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
 
   // Trigger to cause 'live_row_count' visible.
   {
-    tables[0]->RemoveMetrics(tablets.back()->id(), tablet::ReportedTabletStatsPB());
     for (int i = 0; i < 100; ++i) {
       for (int j = 0; j < tablets.size(); ++j) {
         NO_FATALS(call_update_metrics(tablets[j], true));
@@ -1870,6 +2127,40 @@ TEST_F(MasterTest, TestHideLiveRowCountInTableMetrics) {
   }
 }
 
+TEST_F(MasterTest, TestTableStatisticsWithOldVersion) {
+  const char* kTableName = "testtable";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  vector<scoped_refptr<TableInfo>> tables;
+  {
+    CatalogManager::ScopedLeaderSharedLock l(master_->catalog_manager());
+    ASSERT_OK(master_->catalog_manager()->GetAllTables(&tables));
+    ASSERT_EQ(1, tables.size());
+  }
+  const auto& table = tables[0];
+  vector<scoped_refptr<TabletInfo>> tablets;
+  table->GetAllTablets(&tablets);
+  ASSERT_FALSE(tablets.empty());
+
+  {
+    table->InvalidateMetrics(tablets.back()->id());
+    ASSERT_FALSE(table->GetMetrics()->TableSupportsOnDiskSize());
+    ASSERT_FALSE(table->GetMetrics()->TableSupportsLiveRowCount());
+  }
+  {
+    tablet::ReportedTabletStatsPB old_stats;
+    tablet::ReportedTabletStatsPB new_stats;
+    new_stats.set_on_disk_size(1024);
+    new_stats.set_live_row_count(1000);
+    table->UpdateMetrics(tablets.back()->id(), old_stats, new_stats);
+    ASSERT_TRUE(table->GetMetrics()->TableSupportsOnDiskSize());
+    ASSERT_TRUE(table->GetMetrics()->TableSupportsLiveRowCount());
+    ASSERT_EQ(1024, table->GetMetrics()->on_disk_size->value());
+    ASSERT_EQ(1000, table->GetMetrics()->live_row_count->value());
+  }
+}
+
 class AuthzTokenMasterTest : public MasterTest,
                              public ::testing::WithParamInterface<bool> {};
 
@@ -1879,7 +2170,7 @@ TEST_P(AuthzTokenMasterTest, TestGenerateAuthzTokens) {
   FLAGS_master_support_authz_tokens = supports_authz;
   const char* kTableName = "testtb";
   const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
-  const auto send_req = [&] (GetTableSchemaResponsePB* resp) -> Status {
+  const auto send_req = [&] (GetTableSchemaResponsePB* resp) {
     RpcController rpc;
     GetTableSchemaRequestPB req;
     req.mutable_table()->set_table_name(kTableName);

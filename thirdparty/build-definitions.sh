@@ -94,7 +94,8 @@ build_cmake() {
   pushd $CMAKE_BDIR
   $CMAKE_SOURCE/bootstrap \
     --prefix=$PREFIX \
-    --parallel=$PARALLEL
+    --parallel=$PARALLEL -- \
+    -DBUILD_TESTING=OFF
   # Unfortunately, cmake's bootstrap always uses Makefiles
   # and can't be configured to build with ninja.
   make -j$PARALLEL $EXTRA_MAKEFLAGS install
@@ -106,7 +107,10 @@ build_libcxxabi() {
   mkdir -p $LIBCXXABI_BDIR
   pushd $LIBCXXABI_BDIR
   rm -Rf CMakeCache.txt CMakeFiles/
-  cmake \
+
+  # libcxxabi requires gcc5 or newer. Since we can't guarantee that universally,
+  # let's always build it with clang.
+  CC="$CLANG" CXX="$CLANGXX" cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
     -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS $EXTRA_LDFLAGS" \
@@ -120,8 +124,11 @@ build_libcxxabi() {
 build_libcxx() {
   local BUILD_TYPE=$1
   case $BUILD_TYPE in
+    "normal")
+      SANITIZER_ARG=
+      ;;
     "tsan")
-      SANITIZER_TYPE=Thread
+      SANITIZER_ARG="-DLLVM_USE_SANITIZER=Thread"
       ;;
     *)
       echo "Unknown build type: $BUILD_TYPE"
@@ -133,7 +140,9 @@ build_libcxx() {
   mkdir -p $LIBCXX_BDIR
   pushd $LIBCXX_BDIR
   rm -Rf CMakeCache.txt CMakeFiles/
-  cmake \
+  # Since libcxxabi requires gcc5 or newer, we build it with clang. As libcxx is
+  # a dependency, let's also always use clang to build it.
+  CC="$CLANG" CXX="$CLANGXX" cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
     -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS" \
@@ -144,7 +153,7 @@ build_libcxx() {
     -DLIBCXX_CXX_ABI=libcxxabi \
     -DLIBCXX_CXX_ABI_INCLUDE_PATHS=$LLVM_SOURCE/projects/libcxxabi/include \
     -DLIBCXX_CXX_ABI_LIBRARY_PATH=$PREFIX/lib \
-    -DLLVM_USE_SANITIZER=$SANITIZER_TYPE \
+    $SANITIZER_ARG \
     $EXTRA_CMAKE_FLAGS \
     $LLVM_SOURCE/projects/libcxx
   ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
@@ -157,10 +166,13 @@ build_or_find_python() {
   fi
 
   # Build Python only if necessary.
-  if [[ $(python2.7 -V 2>&1) =~ "Python 2.7." ]]; then
-    PYTHON_EXECUTABLE=$(which python2.7)
-  elif [[ $(python -V 2>&1) =~ "Python 2.7." ]]; then
+  if [[ $(python3 -V 2>&1) =~ "Python 3." ]]; then
+    PYTHON_EXECUTABLE=$(which python3)
+  elif [[ $(python -V 2>&1) =~ "Python 3." ||
+          $(python -V 2>&1) =~ "Python 2.7." ]]; then
     PYTHON_EXECUTABLE=$(which python)
+  elif [[ $(python2 -V 2>&1) =~ "Python 2.7." ]]; then
+    PYTHON_EXECUTABLE=$(which python2)
   else
     PYTHON_BDIR=$TP_BUILD_DIR/$PYTHON_NAME$MODE_SUFFIX
     mkdir -p $PYTHON_BDIR
@@ -322,7 +334,7 @@ build_llvm() {
     -DLLVM_INCLUDE_EXAMPLES=OFF \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_INCLUDE_UTILS=OFF \
-    -DLLVM_TARGETS_TO_BUILD=X86 \
+    -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
     -DLLVM_ENABLE_RTTI=ON \
     -DCMAKE_CXX_FLAGS="$CLANG_CXXFLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$CLANG_LDFLAGS" \
@@ -650,8 +662,6 @@ build_mustache() {
 }
 
 build_curl() {
-  # Configure for a fairly minimal install - we only use this for testing
-  # so we just need HTTP/HTTPS with GSSAPI support (for SPNEGO testing).
   CURL_BDIR=$TP_BUILD_DIR/$CURL_NAME$MODE_SUFFIX
   mkdir -p $CURL_BDIR
   pushd $CURL_BDIR
@@ -666,15 +676,25 @@ build_curl() {
     export KRB5CONFIG=$KRB5CONFIG_LOCATION
   fi
 
-  # Note: curl shows a message asking for CPPFLAGS to be used for include
-  # directories, not CFLAGS.
+  # In the scope of using libcurl in Kudu tests and other simple scenarios,
+  # not so much functionality is needed as of now, so configure for a fairly
+  # minimal install. For testing, we need HTTP/HTTPS with GSSAPI support
+  # (GSSAPI is needed for SPNEGO testing). Also, cookies might be useful
+  # to test the new functionality introduced in Impala's embedded Web server
+  # recently if Kudu is to pick up the new functionality as well.
+  #
+  # NOTE: curl shows a message asking for CPPFLAGS to be used for include
+  #       directories, not CFLAGS.
+  #
   CFLAGS="$EXTRA_CFLAGS" \
     CPPFLAGS="$EXTRA_CPPFLAGS $OPENSSL_CFLAGS" \
     LDFLAGS="$EXTRA_LDFLAGS $OPENSSL_LDFLAGS" \
     LIBS="$EXTRA_LIBS" \
     $CURL_SOURCE/configure \
     --prefix=$PREFIX \
+    --disable-alt-svc \
     --disable-dict \
+    --disable-doh \
     --disable-file \
     --disable-ftp \
     --disable-gopher \
@@ -682,12 +702,20 @@ build_curl() {
     --disable-ipv6 \
     --disable-ldap \
     --disable-ldaps \
+    --disable-libcurl-option \
     --disable-manual \
+    --disable-mime \
+    --disable-netrc \
+    --disable-parsedate \
     --disable-pop3 \
+    --disable-progress-meter \
     --disable-rtsp \
+    --disable-smb \
     --disable-smtp \
     --disable-telnet \
     --disable-tftp \
+    --without-libidn2 \
+    --without-libpsl \
     --without-librtmp \
     --without-libssh2 \
     --with-gssapi
@@ -1003,5 +1031,22 @@ build_gumbo_query() {
     $EXTRA_CMAKE_FLAGS \
     $GUMBO_QUERY_SOURCE
   ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
+  popd
+}
+
+build_postgres() {
+  POSTGRES_BDIR=$TP_BUILD_DIR/$POSTGRES_NAME$MODE_SUFFIX
+  mkdir -p $POSTGRES_BDIR
+  pushd $POSTGRES_BDIR
+
+  # We don't need readline and zlib, so let's simplify build.
+  CFLAGS="$EXTRA_CFLAGS" \
+    LDFLAGS="$EXTRA_LDFLAGS" \
+    $POSTGRES_SOURCE/configure \
+    --prefix=$PREFIX \
+    --without-readline \
+    --without-zlib
+
+  make -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }

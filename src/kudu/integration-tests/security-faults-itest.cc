@@ -30,10 +30,9 @@
 #include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/security/test/mini_kdc.h"
@@ -123,7 +122,7 @@ class SecurityComponentsFaultsITest : public KuduTest {
 
     // Create a table.
     KuduSchema schema = KuduSchema::FromSchema(CreateKeyValueTestSchema());
-    gscoped_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+    unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
 
     RETURN_NOT_OK(table_creator->table_name(kTableName)
                   .set_range_partition_columns({ "key" })
@@ -192,7 +191,7 @@ TEST_F(SecurityComponentsFaultsITest, NoKdcOnStart) {
     const Status s = server->Restart();
     ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "kudu-master: process exited on signal 6");
+                        "kudu-master: process exited with non-zero status 3");
   }
   {
     auto server = cluster_->tablet_server(0);
@@ -200,7 +199,7 @@ TEST_F(SecurityComponentsFaultsITest, NoKdcOnStart) {
     const Status s = server->Restart();
     ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
     ASSERT_STR_CONTAINS(s.ToString(),
-                        "kudu-tserver: process exited on signal 6");
+                        "kudu-tserver: process exited with non-zero status 3");
   }
 }
 

@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TSERVER_TABLET_SERVICE_H
-#define KUDU_TSERVER_TABLET_SERVICE_H
+#pragma once
 
 #include <cstdint>
 #include <memory>
@@ -92,6 +91,8 @@ class CreateTabletRequestPB;
 class CreateTabletResponsePB;
 class DeleteTabletRequestPB;
 class DeleteTabletResponsePB;
+class QuiesceTabletServerRequestPB;
+class QuiesceTabletServerResponsePB;
 class ScanResultCollector;
 class TabletReplicaLookupIf;
 class TabletServer;
@@ -117,32 +118,32 @@ class TabletServiceImpl : public TabletServerServiceIf {
                             google::protobuf::Message* resp,
                             rpc::RpcContext* context) override;
 
-  virtual void Ping(const PingRequestPB* req,
-                    PingResponsePB* resp,
-                    rpc::RpcContext* context) OVERRIDE;
+  void Ping(const PingRequestPB* req,
+            PingResponsePB* resp,
+            rpc::RpcContext* context) override;
 
-  virtual void Write(const WriteRequestPB* req, WriteResponsePB* resp,
-                   rpc::RpcContext* context) OVERRIDE;
+  void Write(const WriteRequestPB* req, WriteResponsePB* resp,
+             rpc::RpcContext* context) override;
 
-  virtual void Scan(const ScanRequestPB* req,
-                    ScanResponsePB* resp,
-                    rpc::RpcContext* context) OVERRIDE;
+  void Scan(const ScanRequestPB* req,
+            ScanResponsePB* resp,
+            rpc::RpcContext* context) override;
 
-  virtual void ScannerKeepAlive(const ScannerKeepAliveRequestPB *req,
-                                ScannerKeepAliveResponsePB *resp,
-                                rpc::RpcContext *context) OVERRIDE;
+  void ScannerKeepAlive(const ScannerKeepAliveRequestPB *req,
+                        ScannerKeepAliveResponsePB *resp,
+                        rpc::RpcContext *context) override;
 
-  virtual void ListTablets(const ListTabletsRequestPB* req,
-                           ListTabletsResponsePB* resp,
-                           rpc::RpcContext* context) OVERRIDE;
+  void ListTablets(const ListTabletsRequestPB* req,
+                   ListTabletsResponsePB* resp,
+                   rpc::RpcContext* context) override;
 
-  virtual void SplitKeyRange(const SplitKeyRangeRequestPB* req,
-                             SplitKeyRangeResponsePB* resp,
-                             rpc::RpcContext* context) OVERRIDE;
+  void SplitKeyRange(const SplitKeyRangeRequestPB* req,
+                     SplitKeyRangeResponsePB* resp,
+                     rpc::RpcContext* context) override;
 
-  virtual void Checksum(const ChecksumRequestPB* req,
-                        ChecksumResponsePB* resp,
-                        rpc::RpcContext* context) OVERRIDE;
+  void Checksum(const ChecksumRequestPB* req,
+                ChecksumResponsePB* resp,
+                rpc::RpcContext* context) override;
 
   bool SupportsFeature(uint32_t feature) const override;
 
@@ -199,17 +200,23 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
                             google::protobuf::Message* resp,
                             rpc::RpcContext* context) override;
 
-  virtual void CreateTablet(const CreateTabletRequestPB* req,
-                            CreateTabletResponsePB* resp,
-                            rpc::RpcContext* context) OVERRIDE;
+  void CreateTablet(const CreateTabletRequestPB* req,
+                    CreateTabletResponsePB* resp,
+                    rpc::RpcContext* context) override;
 
-  virtual void DeleteTablet(const DeleteTabletRequestPB* req,
-                            DeleteTabletResponsePB* resp,
-                            rpc::RpcContext* context) OVERRIDE;
+  void DeleteTablet(const DeleteTabletRequestPB* req,
+                    DeleteTabletResponsePB* resp,
+                    rpc::RpcContext* context) override;
 
-  virtual void AlterSchema(const AlterSchemaRequestPB* req,
-                           AlterSchemaResponsePB* resp,
-                           rpc::RpcContext* context) OVERRIDE;
+  void AlterSchema(const AlterSchemaRequestPB* req,
+                   AlterSchemaResponsePB* resp,
+                   rpc::RpcContext* context) override;
+
+  void Quiesce(const QuiesceTabletServerRequestPB* req,
+               QuiesceTabletServerResponsePB* resp,
+               rpc::RpcContext* context) override;
+
+  bool SupportsFeature(uint32_t feature) const override;
 
  private:
   TabletServer* server_;
@@ -278,4 +285,3 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
 } // namespace tserver
 } // namespace kudu
 
-#endif

@@ -28,7 +28,6 @@
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/wire_protocol-test-util.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/mathlimits.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
@@ -38,24 +37,24 @@
 #include "kudu/util/status.h"
 #include "kudu/util/test_util.h"
 
-namespace kudu {
-
-using client::KuduClient;
-using client::KuduColumnSchema;
-using client::KuduDelete;
-using client::KuduError;
-using client::KuduInsert;
-using client::KuduScanBatch;
-using client::KuduScanner;
-using client::KuduSchema;
-using client::KuduSession;
-using client::KuduTable;
-using client::KuduTableCreator;
-using client::KuduUpdate;
-using client::sp::shared_ptr;
-using cluster::MiniCluster;
-
+using kudu::client::KuduClient;
+using kudu::client::KuduColumnSchema;
+using kudu::client::KuduDelete;
+using kudu::client::KuduError;
+using kudu::client::KuduInsert;
+using kudu::client::KuduScanBatch;
+using kudu::client::KuduScanner;
+using kudu::client::KuduSchema;
+using kudu::client::KuduSession;
+using kudu::client::KuduTable;
+using kudu::client::KuduTableCreator;
+using kudu::client::KuduUpdate;
+using kudu::client::sp::shared_ptr;
+using kudu::cluster::MiniCluster;
+using std::unique_ptr;
 using std::vector;
+
+namespace kudu {
 
 const char* const TestWorkload::kDefaultTableName = "test-workload";
 
@@ -70,10 +69,14 @@ TestWorkload::TestWorkload(MiniCluster* cluster)
     write_batch_size_(50),
     write_interval_millis_(0),
     write_timeout_millis_(20000),
+    fault_tolerant_(true),
+    verify_num_rows_(true),
+    read_errors_allowed_(false),
     timeout_allowed_(false),
     not_found_allowed_(false),
     network_error_allowed_(false),
     remote_error_allowed_(false),
+    selection_(client::KuduClient::CLOSEST_REPLICA),
     schema_(KuduSchema::FromSchema(GetSimpleTestSchema())),
     num_replicas_(3),
     num_tablets_(1),
@@ -148,12 +151,12 @@ void TestWorkload::WriteThread() {
     {
       for (int i = 0; i < write_batch_size_; i++) {
         if (write_pattern_ == UPDATE_ONE_ROW) {
-          gscoped_ptr<KuduUpdate> update(table->NewUpdate());
+          unique_ptr<KuduUpdate> update(table->NewUpdate());
           KuduPartialRow* row = update->mutable_row();
           GenerateDataForRow(schema_, 0, &rng_, row);
           CHECK_OK(session->Apply(update.release()));
         } else {
-          gscoped_ptr<KuduInsert> insert(table->NewInsert());
+          unique_ptr<KuduInsert> insert(table->NewInsert());
           KuduPartialRow* row = insert->mutable_row();
           int32_t key;
           if (write_pattern_ == INSERT_SEQUENTIAL_ROWS) {
@@ -192,7 +195,7 @@ void TestWorkload::WriteThread() {
     // Write delete row to cluster.
     if (write_pattern_ == INSERT_RANDOM_ROWS_WITH_DELETE) {
       for (auto key : keys) {
-        gscoped_ptr<KuduDelete> op(table->NewDelete());
+        unique_ptr<KuduDelete> op(table->NewDelete());
         KuduPartialRow* row = op->mutable_row();
         WriteValueToColumn(schema_, 0, key, row);
         CHECK_OK(session->Apply(op.release()));
@@ -209,6 +212,19 @@ void TestWorkload::WriteThread() {
   }
 }
 
+#define CHECK_READ_OK(s) do {                               \
+  const Status& __s = (s);                                  \
+  if (read_errors_allowed_) {                               \
+    if (PREDICT_FALSE(!__s.ok())) {                         \
+      std::lock_guard<simple_spinlock> l(read_error_lock_); \
+      read_errors_.emplace_back(__s);                       \
+      return;                                               \
+    }                                                       \
+  } else {                                                  \
+    CHECK_OK(__s);                                          \
+  }                                                         \
+} while (0)
+
 void TestWorkload::ReadThread() {
   shared_ptr<KuduTable> table;
   OpenTable(&table);
@@ -219,24 +235,31 @@ void TestWorkload::ReadThread() {
 
     KuduScanner scanner(table.get());
     CHECK_OK(scanner.SetTimeoutMillis(read_timeout_millis_));
-    CHECK_OK(scanner.SetFaultTolerant());
+    CHECK_OK(scanner.SetSelection(selection_));
+    if (fault_tolerant_) {
+      CHECK_OK(scanner.SetFaultTolerant());
+    }
 
     // Note: when INSERT_RANDOM_ROWS_WITH_DELETE is used, ReadThread doesn't really verify
     // anything except that a scan works.
-    int64_t expected_row_count = write_pattern_ == INSERT_RANDOM_ROWS_WITH_DELETE ?
-                                 0 : rows_inserted_.Load();
+    int64_t expected_min_rows = 0;
+    if (write_pattern_ != INSERT_RANDOM_ROWS_WITH_DELETE && verify_num_rows_) {
+      expected_min_rows = rows_inserted_.Load();
+    }
     size_t row_count = 0;
 
-    CHECK_OK(scanner.Open());
+    CHECK_READ_OK(scanner.Open());
     while (scanner.HasMoreRows()) {
       KuduScanBatch batch;
-      CHECK_OK(scanner.NextBatch(&batch));
+      CHECK_READ_OK(scanner.NextBatch(&batch));
       row_count += batch.NumRows();
     }
 
-    CHECK_GE(row_count, expected_row_count);
+    CHECK_GE(row_count, expected_min_rows);
   }
 }
+
+#undef CHECK_READ_OK
 
 size_t TestWorkload::GetNumberOfErrors(KuduSession* session) {
   vector<KuduError*> errors;
@@ -290,7 +313,7 @@ void TestWorkload::Setup() {
     }
 
     // Create the table.
-    gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     Status s = table_creator->table_name(table_name_)

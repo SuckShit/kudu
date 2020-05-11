@@ -16,6 +16,7 @@
 // under the License.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -34,6 +35,7 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 
 using std::string;
 using std::vector;
@@ -111,13 +113,9 @@ TEST_F(DiskReservationITest, TestFillMultipleDisks) {
                               "disk_reserved_override_prefix_2_bytes_free_for_testing", "0"));
 
   // Wait for crash due to inability to flush or compact.
-  Status s;
-  for (int i = 0; i < 10; i++) {
-    s = cluster_->tablet_server(0)->WaitForFatal(MonoDelta::FromSeconds(1));
-    if (s.ok()) break;
-    LOG(INFO) << "Rows inserted: " << workload.rows_inserted();
-  }
-  ASSERT_OK(s);
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(cluster_->tablet_server(0)->WaitForFatal(MonoDelta::FromSeconds(1)));
+  });
   workload.StopAndJoin();
 }
 
@@ -131,7 +129,7 @@ TEST_F(DiskReservationITest, TestWalWriteToFullDiskAborts) {
     "--disable_core_dumps",
     // Disable compression so that our data being written doesn't end up
     // compressed away.
-    "--log_compression_codec=none"
+    "--log_compression_codec=no_compression"
   };
   NO_FATALS(StartCluster(ts_flags, {}, 1));
 

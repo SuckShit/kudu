@@ -19,11 +19,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
 #include <ostream>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -33,14 +35,12 @@
 
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol-test-util.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/mathlimits.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
@@ -53,10 +53,10 @@
 #include "kudu/util/atomic.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 namespace kudu {
 class HostPort;
@@ -65,6 +65,7 @@ class HostPort;
 using std::multimap;
 using std::set;
 using std::string;
+using std::thread;
 using std::unique_ptr;
 using std::vector;
 
@@ -110,7 +111,7 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
   // Try to create a single-tablet table.
   // This won't succeed because we can't create enough replicas to get
   // a quorum.
-  gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
+  unique_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
   auto client_schema = KuduSchema::FromSchema(GetSimpleTestSchema());
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&client_schema)
@@ -196,7 +197,7 @@ TEST_F(CreateTableITest, TestSpreadReplicasEvenly) {
   const int kNumTablets = 20;
   NO_FATALS(StartCluster({}, {}, kNumServers));
 
-  gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
+  unique_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
   auto client_schema = KuduSchema::FromSchema(GetSimpleTestSchema());
   ASSERT_OK(table_creator->table_name(kTableName)
             .schema(&client_schema)
@@ -279,8 +280,8 @@ TEST_F(CreateTableITest, TestSpreadReplicasEvenlyWithDimension) {
                               const string& table_name,
                               int32_t range_lower_bound,
                               int32_t range_upper_bound,
-                              const string& dimension_label) -> Status {
-    gscoped_ptr<client::KuduTableCreator> table_creator(client->NewTableCreator());
+                              const string& dimension_label) {
+    unique_ptr<client::KuduTableCreator> table_creator(client->NewTableCreator());
     unique_ptr<KuduPartialRow> lower_bound(client_schema->NewRow());
     RETURN_NOT_OK(lower_bound->SetInt32("key2", range_lower_bound));
     unique_ptr<KuduPartialRow> upper_bound(client_schema->NewRow());
@@ -300,8 +301,8 @@ TEST_F(CreateTableITest, TestSpreadReplicasEvenlyWithDimension) {
                              const string& table_name,
                              int32_t range_lower_bound,
                              int32_t range_upper_bound,
-                             const string& dimension_label) -> Status {
-    gscoped_ptr<client::KuduTableAlterer> table_alterer(client->NewTableAlterer(table_name));
+                             const string& dimension_label) {
+    unique_ptr<client::KuduTableAlterer> table_alterer(client->NewTableAlterer(table_name));
     unique_ptr<KuduPartialRow> lower_bound(client_schema->NewRow());
     RETURN_NOT_OK(lower_bound->SetInt32("key2", range_lower_bound));
     unique_ptr<KuduPartialRow> upper_bound(client_schema->NewRow());
@@ -399,7 +400,7 @@ static void LookUpRandomKeysLoop(const std::shared_ptr<master::MasterServiceProx
                                  AtomicBool* quit) {
   Schema schema(GetSimpleTestSchema());
   auto client_schema = KuduSchema::FromSchema(GetSimpleTestSchema());
-  gscoped_ptr<KuduPartialRow> r(client_schema.NewRow());
+  unique_ptr<KuduPartialRow> r(client_schema.NewRow());
 
   while (!quit->Load()) {
     master::GetTableLocationsRequestPB req;
@@ -467,7 +468,7 @@ TEST_F(CreateTableITest, TestCreateTableWithDeadTServers) {
 
   Schema schema(GetSimpleTestSchema());
   auto client_schema = KuduSchema::FromSchema(GetSimpleTestSchema());
-  gscoped_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
+  unique_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
 
   // Don't bother waiting for table creation to finish; it'll never happen
   // because all of the tservers are dead.
@@ -478,27 +479,28 @@ TEST_F(CreateTableITest, TestCreateTableWithDeadTServers) {
            .Create());
 
   // Spin off a bunch of threads that repeatedly look up random key ranges in the table.
+  constexpr int kNumThreads = 16;
   AtomicBool quit(false);
-  vector<scoped_refptr<Thread>> threads;
-  for (int i = 0; i < 16; i++) {
-    scoped_refptr<Thread> t;
-    ASSERT_OK(Thread::Create("test", "lookup_thread",
-                             &LookUpRandomKeysLoop, cluster_->master_proxy(),
-                             kTableName, &quit, &t));
-    threads.push_back(t);
+  vector<thread> threads;
+  threads.reserve(kNumThreads);
+  for (int i = 0; i < kNumThreads; i++) {
+    auto proxy = cluster_->master_proxy();
+    threads.emplace_back([proxy, kTableName, &quit]() {
+      LookUpRandomKeysLoop(proxy, kTableName, &quit);
+    });
   }
+  SCOPED_CLEANUP({
+    quit.Store(true);
+    for (auto& t : threads) {
+      t.join();
+    }
+  });
 
   // Give the lookup threads some time to crash the master.
   MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(15);
   while (MonoTime::Now() < deadline) {
     ASSERT_TRUE(cluster_->master()->IsProcessAlive()) << "Master crashed!";
     SleepFor(MonoDelta::FromMilliseconds(100));
-  }
-
-  quit.Store(true);
-
-  for (const auto& t : threads) {
-    t->Join();
   }
 }
 

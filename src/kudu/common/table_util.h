@@ -25,7 +25,9 @@ namespace kudu {
 
 class Slice;
 
-extern const char* const kInvalidTableError;
+extern const char* const kInvalidHiveTableError;
+
+extern const char* const kInvalidRangerTableError;
 
 // Parses a Kudu table name of the form '<database>.<table>' into
 // a Hive database and table name. Returns an error if the Kudu
@@ -34,5 +36,19 @@ extern const char* const kInvalidTableError;
 Status ParseHiveTableIdentifier(const std::string& table_name,
                                 Slice* hms_database,
                                 Slice* hms_table) WARN_UNUSED_RESULT;
+
+// Parses a Kudu table name of the form '<database>.<table>' into a Ranger
+// database and table name. If the table name doesn't contain a period it
+// defaults to a configurable default database name. If there are multiple
+// periods in the table name the first one will separate the database name from
+// the table name. The returned 'ranger_table' slice must not outlive
+// 'table_name'.
+//
+// Returns InvalidArgument if the table name doesn't conform the rules, i.e.
+// begins with a period, the only period is at the end of the string, or is an
+// empty string.
+Status ParseRangerTableIdentifier(const std::string& table_name,
+                                  std::string* ranger_database,
+                                  Slice* ranger_table) WARN_UNUSED_RESULT;
 
 } // namespace kudu

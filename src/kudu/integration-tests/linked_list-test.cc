@@ -31,21 +31,20 @@
 // either zero or one times, and no link_to refers to a missing key.
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/common/wire_protocol.pb.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/linked_list-test-util.h"
@@ -53,6 +52,7 @@
 #include "kudu/master/master.pb.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/mini-cluster/mini_cluster.h"
+#include "kudu/mini-cluster/webui_checker.h"
 #include "kudu/tserver/tablet_server-test-base.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
@@ -82,6 +82,7 @@ using kudu::itest::WaitForReplicasReportedToMaster;
 using kudu::itest::WaitForServersToAgree;
 using kudu::master::VOTER_REPLICA;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -156,7 +157,7 @@ class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
 
  protected:
   shared_ptr<client::KuduClient> client_;
-  gscoped_ptr<LinkedListTester> tester_;
+  unique_ptr<LinkedListTester> tester_;
 };
 
 TEST_F(LinkedListTest, TestLoadAndVerify) {
@@ -197,10 +198,9 @@ TEST_F(LinkedListTest, TestLoadAndVerify) {
     // Restart a tserver during a scan to test scanner fault tolerance.
     WaitForTSAndReplicas();
     LOG(INFO) << "Will restart the tablet server during verification scan.";
-    ASSERT_OK(tester_->WaitAndVerify(FLAGS_seconds_to_run, written,
-                                     boost::bind(
-                                         &TabletServerIntegrationTestBase::RestartServerWithUUID,
-                                         this, _1)));
+    ASSERT_OK(tester_->WaitAndVerify(
+        FLAGS_seconds_to_run, written,
+        [this](const string& uuid) { return this->RestartServerWithUUID(uuid); }));
     LOG(INFO) << "Done with tserver restart test.";
     ASSERT_OK(CheckTabletServersAreAlive(tablet_servers_.size()));
 
@@ -208,10 +208,9 @@ TEST_F(LinkedListTest, TestLoadAndVerify) {
     // Note that the previously restarted node is likely still be bootstrapping, which makes this
     // even harder.
     LOG(INFO) << "Will kill the tablet server during verification scan.";
-    ASSERT_OK(tester_->WaitAndVerify(FLAGS_seconds_to_run, written,
-                                     boost::bind(
-                                         &TabletServerIntegrationTestBase::ShutdownServerWithUUID,
-                                         this, _1)));
+    ASSERT_OK(tester_->WaitAndVerify(
+        FLAGS_seconds_to_run, written,
+        [this](const string& uuid) { return this->ShutdownServerWithUUID(uuid); }));
     LOG(INFO) << "Done with tserver kill test.";
     ASSERT_OK(CheckTabletServersAreAlive(tablet_servers_.size()-1));
     NO_FATALS(RestartCluster());

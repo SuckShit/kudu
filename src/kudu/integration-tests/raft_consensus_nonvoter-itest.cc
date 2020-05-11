@@ -17,6 +17,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <numeric>
 #include <ostream>
 #include <string>
@@ -32,11 +34,10 @@
 
 #include "kudu/client/client.h"
 #include "kudu/client/replica_controller-internal.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/quorum_util.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -50,6 +51,7 @@
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tserver/tablet_server-test-base.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
@@ -536,12 +538,14 @@ TEST_F(RaftConsensusNonVoterITest, AddNonVoterReplica) {
       WAIT_FOR_LEADER, ANY_REPLICA, &has_leader, &tablet_locations));
   ASSERT_TRUE(has_leader);
 
-  // Check the update cluster is able to elect a leader.
-  {
+  // Check the updated cluster is able to elect a leader.
+  // The leader role can fluctuate among tablet replicas, so the block below
+  // is wrapped into ASSERT_EVENTUALLY.
+  ASSERT_EVENTUALLY([&]() {
     TServerDetails* leader = nullptr;
     ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id, &leader));
     ASSERT_OK(LeaderStepDown(leader, tablet_id, kTimeout));
-  }
+  });
 
   // Make sure it's possible to insert more data into the table once it's backed
   // by one more (NON_VOTER) replica.
@@ -858,8 +862,13 @@ TEST_F(RaftConsensusNonVoterITest, PromoteAndDemote) {
   FLAGS_num_replicas = kInitialReplicasNum;
   NO_FATALS(BuildAndStart(kTserverFlags, kMasterFlags));
   ASSERT_FALSE(tablet_replicas_.empty());
-  ASSERT_OK(StartElection(tablet_replicas_.begin()->second, tablet_id_, kTimeout));
-  ASSERT_OK(WaitUntilLeader(tablet_replicas_.begin()->second, tablet_id_, kTimeout));
+  ASSERT_EVENTUALLY([&]() {
+    const MonoDelta kElectionTimeout = MonoDelta::FromSeconds(3);
+    ASSERT_OK(StartElection(
+        tablet_replicas_.begin()->second, tablet_id_, kElectionTimeout));
+    ASSERT_OK(WaitUntilLeader(
+        tablet_replicas_.begin()->second, tablet_id_, kElectionTimeout));
+  });
 
   ASSERT_EQ(4, tablet_servers_.size());
   ASSERT_EQ(kInitialReplicasNum, tablet_replicas_.size());
@@ -1085,7 +1094,15 @@ TEST_F(RaftConsensusNonVoterITest, PromotedReplicaCanVote) {
       if (leader->uuid() != new_replica_uuid) {
         break;
       }
-      ASSERT_OK(LeaderStepDown(leader, tablet_id, kTimeout));
+      // In rare cases, the leader replica can change its role right before the
+      // step-down request is received.
+      TabletServerErrorPB error;
+      auto s = LeaderStepDown(leader, tablet_id, kTimeout, &error);
+      if (s.IsIllegalState() &&
+          error.code() == TabletServerErrorPB::NOT_THE_LEADER) {
+        continue;
+      }
+      ASSERT_OK(s);
     }
 
     // Pause the newly added replica and the leader.

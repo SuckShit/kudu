@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_ROWSET_H
-#define KUDU_TABLET_ROWSET_H
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -33,7 +32,6 @@
 #include "kudu/common/row.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/timestamp.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/tablet/mvcc.h"
@@ -158,7 +156,7 @@ class RowSet {
   virtual Status NewCompactionInput(const Schema* projection,
                                     const MvccSnapshot &snap,
                                     const fs::IOContext* io_context,
-                                    gscoped_ptr<CompactionInput>* out) const = 0;
+                                    std::unique_ptr<CompactionInput>* out) const = 0;
 
   // Count the number of rows in this rowset.
   virtual Status CountRows(const fs::IOContext* io_context, rowid_t *count) const = 0;
@@ -220,6 +218,13 @@ class RowSet {
 
   // Compact delta stores if more than one.
   virtual Status MinorCompactDeltaStores(const fs::IOContext* io_context) = 0;
+
+  // Returns whether the rowset contains no live rows and is fully ancient (its
+  // newest update is older than 'ancient_history_mark').
+  //
+  // This may return false negatives, but should not return false positives.
+  virtual Status IsDeletedAndFullyAncient(Timestamp ancient_history_mark,
+                                          bool* deleted_and_ancient) = 0;
 
   // Estimate the number of bytes in ancient undo delta stores. This may be an
   // overestimate. The argument 'ancient_history_mark' must be valid (it may
@@ -312,9 +317,9 @@ class RowSetKeyProbe {
   // NOTE: row_key is not copied and must be valid for the lifetime
   // of this object.
   explicit RowSetKeyProbe(ConstContiguousRow row_key)
-      : row_key_(row_key) {
-    encoded_key_ = EncodedKey::FromContiguousRow(row_key_);
-    bloom_probe_ = BloomKeyProbe(encoded_key_slice());
+      : row_key_(row_key),
+        encoded_key_(EncodedKey::FromContiguousRow(row_key_)),
+        bloom_probe_(BloomKeyProbe(encoded_key_slice())) {
   }
 
   // RowSetKeyProbes are usually allocated on the stack, which means that we
@@ -346,7 +351,7 @@ class RowSetKeyProbe {
 
  private:
   const ConstContiguousRow row_key_;
-  gscoped_ptr<EncodedKey> encoded_key_;
+  std::unique_ptr<EncodedKey> encoded_key_;
   BloomKeyProbe bloom_probe_;
 };
 
@@ -405,7 +410,7 @@ class DuplicatingRowSet : public RowSet {
   virtual Status NewCompactionInput(const Schema* projection,
                                     const MvccSnapshot &snap,
                                     const fs::IOContext* io_context,
-                                    gscoped_ptr<CompactionInput>* out) const OVERRIDE;
+                                    std::unique_ptr<CompactionInput>* out) const OVERRIDE;
 
   Status CountRows(const fs::IOContext* io_context, rowid_t *count) const OVERRIDE;
 
@@ -476,6 +481,13 @@ class DuplicatingRowSet : public RowSet {
     return Status::OK();
   }
 
+  Status IsDeletedAndFullyAncient(Timestamp /*ancient_history_mark*/,
+                                  bool* deleted_and_ancient) override {
+    DCHECK(deleted_and_ancient);
+    *deleted_and_ancient = false;
+    return Status::OK();
+  }
+
   Status InitUndoDeltas(Timestamp /*ancient_history_mark*/,
                         MonoTime /*deadline*/,
                         const fs::IOContext* /*io_context*/,
@@ -509,5 +521,3 @@ class DuplicatingRowSet : public RowSet {
 
 } // namespace tablet
 } // namespace kudu
-
-#endif

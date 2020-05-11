@@ -19,7 +19,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -34,6 +36,7 @@
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+#include <google/protobuf/stubs/common.h>
 #include <gtest/gtest.h>
 #include <rapidjson/document.h>
 
@@ -57,6 +60,7 @@ DECLARE_bool(checksum_scan);
 DECLARE_int32(checksum_idle_timeout_sec);
 DECLARE_int32(max_progress_report_wait_ms);
 DECLARE_string(color);
+DECLARE_string(flags_categories_to_check);
 DECLARE_string(ksck_format);
 DECLARE_uint32(truncate_server_csv_length);
 
@@ -90,7 +94,9 @@ class MockKsckMaster : public KsckMaster {
     uuid_ = uuid;
     version_ = "mock-version";
     if (is_get_flags_available_) {
-      flags_ = GetFlagsResponsePB{};
+      for (size_t cat = FlagsCategory::MIN; cat <= FlagsCategory::MAX; ++cat) {
+        flags_by_category_[cat].flags.emplace();
+      }
     }
   }
 
@@ -111,13 +117,16 @@ class MockKsckMaster : public KsckMaster {
     return fetch_cstate_status_;
   }
 
-  Status FetchUnusualFlags() override {
-    if (is_get_flags_available_) {
-      flags_state_ = KsckFetchState::FETCHED;
-      return Status::OK();
+  Status FetchFlags(const std::vector<FlagsCategory>& categories) override {
+    for (const auto cat : categories) {
+      if (is_get_flags_available_) {
+        flags_by_category_[cat].state = KsckFetchState::FETCHED;
+      } else {
+        flags_by_category_[cat].state = KsckFetchState::FETCH_FAILED;
+      }
     }
-    flags_state_ = KsckFetchState::FETCH_FAILED;
-    return Status::RemoteError("GetFlags not available");
+    return is_get_flags_available_
+        ? Status::OK() : Status::RemoteError("GetFlags not available");
   }
 
   // Public because the unit tests mutate these variables directly.
@@ -125,7 +134,7 @@ class MockKsckMaster : public KsckMaster {
   Status fetch_cstate_status_;
   using KsckMaster::uuid_;
   using KsckMaster::cstate_;
-  using KsckMaster::flags_;
+  using KsckMaster::flags_by_category_;
   using KsckMaster::version_;
  private:
   const bool is_get_flags_available_;
@@ -141,7 +150,9 @@ class MockKsckTabletServer : public KsckTabletServer {
         is_get_flags_available_(is_get_flags_available) {
     version_ = "mock-version";
     if (is_get_flags_available_) {
-      flags_ = GetFlagsResponsePB{};
+      for (size_t cat = FlagsCategory::MIN; cat <= FlagsCategory::MAX; ++cat) {
+        flags_by_category_[cat].flags.emplace();
+      }
     }
   }
 
@@ -161,13 +172,16 @@ class MockKsckTabletServer : public KsckTabletServer {
     return Status::OK();
   }
 
-  Status FetchUnusualFlags() override {
-    if (is_get_flags_available_) {
-      flags_state_ = KsckFetchState::FETCHED;
-      return Status::OK();
+  Status FetchFlags(const std::vector<FlagsCategory>& categories) override {
+    for (const auto cat : categories) {
+      if (is_get_flags_available_) {
+        flags_by_category_[cat].state = KsckFetchState::FETCHED;
+      } else {
+        flags_by_category_[cat].state = KsckFetchState::FETCH_FAILED;
+      }
     }
-    flags_state_ = KsckFetchState::FETCH_FAILED;
-    return Status::RemoteError("GetFlags not available");
+    return is_get_flags_available_
+        ? Status::OK() : Status::RemoteError("GetFlags not available");
   }
 
   void FetchCurrentTimestampAsync() override {}
@@ -175,6 +189,8 @@ class MockKsckTabletServer : public KsckTabletServer {
   Status FetchCurrentTimestamp() override {
     return Status::OK();
   }
+
+  void FetchQuiescingInfo() override {}
 
   void RunTabletChecksumScanAsync(
       const std::string& tablet_id,
@@ -199,7 +215,7 @@ class MockKsckTabletServer : public KsckTabletServer {
   // The fake progress amount for this mock server, used to mock checksum
   // progress for this server.
   int64_t checksum_progress_ = 10;
-  using KsckTabletServer::flags_;
+  using KsckTabletServer::flags_by_category_;
   using KsckTabletServer::location_;
   using KsckTabletServer::version_;
 
@@ -1068,6 +1084,9 @@ TEST_F(KsckTest, TestLeaderMasterUnavailable) {
 }
 
 TEST_F(KsckTest, TestMasterFlagCheck) {
+  // Check for the differences in the 'unusual' flags category.
+  FLAGS_flags_categories_to_check = "unusual";
+
   // Setup flags for each mock master.
   for (int i = 0; i < cluster_->masters().size(); i++) {
     server::GetFlagsResponsePB flags;
@@ -1096,12 +1115,14 @@ TEST_F(KsckTest, TestMasterFlagCheck) {
     }
     shared_ptr<MockKsckMaster> master =
         std::static_pointer_cast<MockKsckMaster>(cluster_->masters_.at(i));
-    master->flags_ = flags;
+    master->flags_by_category_[FlagsCategory::UNUSUAL].flags = std::move(flags);
   }
   ASSERT_OK(ksck_->CheckMasterHealth());
   ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+  ASSERT_OK(ksck_->CheckMasterDivergedFlags());
   ASSERT_OK(ksck_->PrintResults());
   ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Unusual flags for Master:\n"
       "        Flag        | Value |     Tags      |         Master\n"
       "--------------------+-------+---------------+-------------------------\n"
       " experimental_flag  | x     | experimental  | all 3 server(s) checked\n"
@@ -1110,6 +1131,22 @@ TEST_F(KsckTest, TestMasterFlagCheck) {
       " hidden_flag        | 2     | hidden        | master-2\n"
       " hidden_unsafe_flag | 0     | hidden,unsafe | master-0, master-2\n"
       " hidden_unsafe_flag | 1     | hidden,unsafe | master-1");
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Some masters have unsafe, experimental, or hidden flags set");
+
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Flags of checked categories for Master:\n"
+      "        Flag        | Value |         Master\n"
+      "--------------------+-------+-------------------------\n"
+      " experimental_flag  | x     | all 3 server(s) checked\n"
+      " hidden_flag        | 0     | master-0\n"
+      " hidden_flag        | 1     | master-1\n"
+      " hidden_flag        | 2     | master-2\n"
+      " hidden_unsafe_flag | 0     | master-0, master-2\n"
+      " hidden_unsafe_flag | 1     | master-1");
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Different masters have different settings for same flags "
+      "of checked category 'unusual'");
 }
 
 TEST_F(GetFlagsUnavailableKsckTest, TestMasterFlagsUnavailable) {
@@ -1200,6 +1237,9 @@ TEST_F(KsckTest, TestTserverFlagCheck) {
   // Lower the truncation threshold to test truncation.
   FLAGS_truncate_server_csv_length = 1;
 
+  // Check for the differences in the 'unusual' flags category.
+  FLAGS_flags_categories_to_check = "unusual";
+
   // Setup flags for each mock tablet server.
   int i = 0;
   for (const auto& entry : cluster_->tablet_servers()) {
@@ -1229,13 +1269,15 @@ TEST_F(KsckTest, TestTserverFlagCheck) {
     }
     shared_ptr<MockKsckTabletServer> ts =
         std::static_pointer_cast<MockKsckTabletServer>(entry.second);
-    ts->flags_ = flags;
+    ts->flags_by_category_[FlagsCategory::UNUSUAL].flags = std::move(flags);
     i++;
   }
   ASSERT_OK(ksck_->FetchInfoFromTabletServers());
   ASSERT_OK(ksck_->CheckTabletServerUnusualFlags());
+  ASSERT_OK(ksck_->CheckTabletServerDivergedFlags());
   ASSERT_OK(ksck_->PrintResults());
   ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Unusual flags for Tablet Server:\n"
       "        Flag        | Value |     Tags      |         Tablet Server\n"
       "--------------------+-------+---------------+-------------------------------\n"
       " experimental_flag  | x     | experimental  | all 3 server(s) checked\n"
@@ -1244,6 +1286,130 @@ TEST_F(KsckTest, TestTserverFlagCheck) {
       " hidden_flag        | 2     | hidden        | <mock>\n"
       " hidden_unsafe_flag | 0     | hidden,unsafe | <mock>, and 1 other server(s)\n"
       " hidden_unsafe_flag | 1     | hidden,unsafe | <mock>");
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Some tablet servers have unsafe, experimental, or hidden flags set");
+
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Flags of checked categories for Tablet Server:\n"
+      "        Flag        | Value |         Tablet Server\n"
+      "--------------------+-------+-------------------------------\n"
+      " experimental_flag  | x     | all 3 server(s) checked\n"
+      " hidden_flag        | 0     | <mock>\n"
+      " hidden_flag        | 1     | <mock>\n"
+      " hidden_flag        | 2     | <mock>\n"
+      " hidden_unsafe_flag | 0     | <mock>, and 1 other server(s)\n"
+      " hidden_unsafe_flag | 1     | <mock>");
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Different tablet servers have different settings for same flags "
+      "of checked category 'unusual'");
+}
+
+TEST_F(KsckTest, FlagsCategoriesDifferenceBetweenMastersAndTabletServers) {
+  // Check for the differences in the 'time_source' flags category.
+  FLAGS_flags_categories_to_check = "time_source";
+
+  // Setup flags for mock masters.
+  for (const auto& master : cluster_->masters()) {
+    shared_ptr<MockKsckMaster> m =
+        std::static_pointer_cast<MockKsckMaster>(master);
+    // Set two flags in the 'time_source' category.
+    {
+      server::GetFlagsResponsePB flags;
+      {
+        auto* flag = flags.add_flags();
+        flag->set_name("time_source");
+        flag->set_value("builtin");
+      }
+      {
+        auto* flag = flags.add_flags();
+        flag->set_name("builtin_ntp_servers");
+        flag->set_value("mega.turbo.ntp");
+      }
+      m->flags_by_category_[FlagsCategory::TIME_SOURCE].flags = std::move(flags);
+    }
+
+    // Set a flag unrelated to the checked category.
+    {
+      server::GetFlagsResponsePB flags;
+      {
+        auto* flag = flags.add_flags();
+        flag->set_name("giga");
+        flag->set_value("hertz");
+      }
+      m->flags_by_category_[FlagsCategory::UNUSUAL].flags = std::move(flags);
+    }
+  }
+
+  // Setup flags for mock tablet servers.
+  for (const auto& entry : cluster_->tablet_servers()) {
+    shared_ptr<MockKsckTabletServer> ts =
+        std::static_pointer_cast<MockKsckTabletServer>(entry.second);
+    // Set one flag in the 'time_source' category.
+    {
+      server::GetFlagsResponsePB flags;
+      {
+        auto* flag = flags.add_flags();
+        flag->set_name("time_source");
+        flag->set_value("system");
+      }
+      ts->flags_by_category_[FlagsCategory::TIME_SOURCE].flags = std::move(flags);
+    }
+
+    // Set a flag unrelated to the 'time_source' category.
+    {
+      server::GetFlagsResponsePB flags;
+      {
+        auto* flag = flags.add_flags();
+        flag->set_name("foo");
+        flag->set_value("bar");
+      }
+      ts->flags_by_category_[FlagsCategory::UNUSUAL].flags = std::move(flags);
+    }
+  }
+
+  // Calling CheckMasterHealth() is a prerequisite for calling
+  // CheckMasterUnusualFlags().
+  ASSERT_OK(ksck_->CheckMasterHealth());
+  ASSERT_OK(ksck_->CheckMasterDivergedFlags());
+  // Calling FetchInfoFromTabletServers() is a prerequisite for calling
+  // CheckTabletServerDivergedFlags().
+  ASSERT_OK(ksck_->FetchInfoFromTabletServers());
+  ASSERT_OK(ksck_->CheckTabletServerDivergedFlags());
+  ASSERT_OK(ksck_->CheckDivergedFlags());
+  ASSERT_OK(ksck_->PrintResults());
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Flags of checked categories for Master:\n"
+      "        Flag         |     Value      |         Master\n"
+      "---------------------+----------------+-------------------------\n"
+      " builtin_ntp_servers | mega.turbo.ntp | all 3 server(s) checked\n"
+      " time_source         | builtin        | all 3 server(s) checked\n");
+  ASSERT_STR_NOT_CONTAINS(err_stream_.str(),
+      "Different masters have different settings for same flags "
+      "of checked category 'time_source'");
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Flags of checked categories for Master diverging from Tablet Server flags:\n"
+      "        Flag         |     Value      |         Master\n"
+      "---------------------+----------------+-------------------------\n"
+      " builtin_ntp_servers | mega.turbo.ntp | all 3 server(s) checked\n"
+      " time_source         | builtin        | all 3 server(s) checked");
+
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Flags of checked categories for Tablet Server:\n"
+      "    Flag     | Value  |      Tablet Server\n"
+      "-------------+--------+-------------------------\n"
+      " time_source | system | all 3 server(s) checked\n");
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+      "Flags of checked categories for Tablet Server diverging from Master flags:\n"
+      "    Flag     | Value  |      Tablet Server\n"
+      "-------------+--------+-------------------------\n"
+      " time_source | system | all 3 server(s) checked");
+  ASSERT_STR_NOT_CONTAINS(err_stream_.str(),
+      "Different tablet servers have different settings for same flags "
+      "of checked category 'time_source'");
+
+  ASSERT_STR_CONTAINS(err_stream_.str(),
+        "Same flags have different values between masters and tablet servers "
+        "for at least one checked flag category");
 }
 
 TEST_F(GetFlagsUnavailableKsckTest, TestTserverFlagsUnavailable) {
@@ -1304,7 +1470,7 @@ TEST_F(KsckTest, TestConsensusConflictExtraPeer) {
             error_messages[0].ToString());
   const string err_str = err_stream_.str();
   ASSERT_STR_CONTAINS(err_str, "Tablet tablet-id-0 of table 'test' is conflicted: "
-                               "3 replicas' active configs disagree with the leader master's");
+                               "1 replicas' active configs disagree with the leader master's");
   ASSERT_STR_CONTAINS(err_str,
       "The consensus matrix is:\n"
       " Config source |     Replicas     | Current term | Config index | Committed?\n"
@@ -1726,5 +1892,6 @@ TEST_F(KsckTest, TestSectionFilter) {
     CheckJsonStringVsKsckResults(json_output, ksck_->results(), selected_sections);
   }
 }
+
 } // namespace tools
 } // namespace kudu

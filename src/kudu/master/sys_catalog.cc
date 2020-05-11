@@ -23,9 +23,7 @@
 #include <iterator>
 #include <memory>
 #include <ostream>
-#include <set>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -34,7 +32,6 @@
 #include <glog/logging.h>
 #include <google/protobuf/util/message_differencer.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/common/column_predicate.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
@@ -57,9 +54,6 @@
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -84,6 +78,7 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -93,6 +88,15 @@
 DEFINE_double(sys_catalog_fail_during_write, 0.0,
               "Fraction of the time when system table writes will fail");
 TAG_FLAG(sys_catalog_fail_during_write, hidden);
+
+DECLARE_int64(rpc_max_message_size);
+
+METRIC_DEFINE_counter(server, sys_catalog_oversized_write_requests,
+                      "System Catalog Oversized Write Requests",
+                      kudu::MetricUnit::kRequests,
+                      "Number of oversized write requests to the system "
+                      "catalog tablet rejected since start",
+                      kudu::MetricLevel::kWarn);
 
 using kudu::consensus::ConsensusMetadata;
 using kudu::consensus::ConsensusMetadataManager;
@@ -106,6 +110,7 @@ using kudu::tablet::Tablet;
 using kudu::tablet::TabletReplica;
 using kudu::tserver::WriteRequestPB;
 using kudu::tserver::WriteResponsePB;
+using std::back_inserter;
 using std::function;
 using std::set;
 using std::shared_ptr;
@@ -124,6 +129,20 @@ class Message;
 namespace kudu {
 namespace master {
 
+namespace  {
+
+// An utility function to get the upper limit for the size of a write request
+// into the system tablet represented by WriteRequestPB. The write request is
+// eventually wrapped into ConsensusRequestPB when a leader master propagates
+// the updates to the followers. Wrapping WriteRequestPB into ConsensusRequestPB
+// requires adding extra fields, and 1KB looks like a reasonable estimate
+// for the upper limit of the added delta.
+size_t GetMaxWriteRequestSize() {
+  return std::max<int64_t>(0, FLAGS_rpc_max_message_size - 1024);
+}
+
+} // anonymous namespace
+
 static const char* const kSysCatalogTableColType = "entry_type";
 static const char* const kSysCatalogTableColId = "entry_id";
 static const char* const kSysCatalogTableColMetadata = "metadata";
@@ -135,7 +154,7 @@ const char* const SysCatalogTable::kSysCertAuthorityEntryId =
 const char* const SysCatalogTable::kInjectedFailureStatusMsg =
     "INJECTED FAILURE";
 const char* const SysCatalogTable::kLatestNotificationLogEntryIdRowId =
-  "latest_notification_log_entry_id";
+    "latest_notification_log_entry_id";
 
 namespace {
 
@@ -162,6 +181,8 @@ SysCatalogTable::SysCatalogTable(Master* master,
       master_(master),
       cmeta_manager_(new ConsensusMetadataManager(master_->fs_manager())),
       leader_cb_(std::move(leader_cb)) {
+  oversized_write_requests_ = master_->metric_entity()->FindOrCreateCounter(
+      &METRIC_sys_catalog_oversized_write_requests);
 }
 
 SysCatalogTable::~SysCatalogTable() {
@@ -207,16 +228,14 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
     }
     set<string> peer_addrs_from_disk;
     for (const auto& p : cstate.committed_config().peers()) {
-      HostPort hp;
-      RETURN_NOT_OK(HostPortFromPB(p.last_known_addr(), &hp));
-      peer_addrs_from_disk.insert(hp.ToString());
+      peer_addrs_from_disk.insert(HostPortFromPB(p.last_known_addr()).ToString());
     }
     vector<string> symm_diff;
     std::set_symmetric_difference(peer_addrs_from_opts.begin(),
                                   peer_addrs_from_opts.end(),
                                   peer_addrs_from_disk.begin(),
                                   peer_addrs_from_disk.end(),
-                                  std::back_inserter(symm_diff));
+                                  back_inserter(symm_diff));
     if (!symm_diff.empty()) {
       string msg = Substitute(
           "on-disk master list ($0) and provided master list ($1) differ. "
@@ -286,8 +305,7 @@ Status SysCatalogTable::CreateDistributedConfig(const MasterOptions& options,
   // Build the set of followers from our server options.
   for (const HostPort& host_port : options.master_addresses) {
     RaftPeerPB peer;
-    HostPortPB peer_host_port_pb;
-    RETURN_NOT_OK(HostPortToPB(host_port, &peer_host_port_pb));
+    HostPortPB peer_host_port_pb = HostPortToPB(host_port);
     peer.mutable_last_known_addr()->CopyFrom(peer_host_port_pb);
     peer.set_member_type(RaftPeerPB::VOTER);
     new_config.add_peers()->CopyFrom(peer);
@@ -342,7 +360,7 @@ void SysCatalogTable::SysCatalogStateChanged(const string& tablet_id, const stri
   LOG_WITH_PREFIX(INFO) << "This master's current role is: "
                         << RaftPeerPB::Role_Name(new_role);
   if (new_role == RaftPeerPB::LEADER) {
-    Status s = leader_cb_.Run();
+    Status s = leader_cb_();
 
     // Callback errors are non-fatal only if the catalog manager has shut down.
     if (!s.ok()) {
@@ -370,15 +388,18 @@ Status SysCatalogTable::SetupTablet(
 
   // TODO(matteo): handle crash mid-creation of tablet? do we ever end up with
   // a partially created tablet here?
+  const auto& tablet_id = metadata->tablet_id();
   tablet_replica_.reset(new TabletReplica(
       metadata,
       cmeta_manager_,
       local_peer_pb_,
       master_->tablet_apply_pool(),
-      Bind(&SysCatalogTable::SysCatalogStateChanged,
-           Unretained(this),
-           metadata->tablet_id())));
-  RETURN_NOT_OK_SHUTDOWN(tablet_replica_->Init(master_->raft_pool()),
+      [this, tablet_id](const string& reason) {
+        this->SysCatalogStateChanged(tablet_id, reason);
+      }));
+  RETURN_NOT_OK_SHUTDOWN(tablet_replica_->Init({ /*quiescing*/nullptr,
+                                                 master_->num_raft_leaders(),
+                                                 master_->raft_pool() }),
                          "failed to initialize system catalog replica");
 
   shared_ptr<Tablet> tablet;
@@ -388,14 +409,15 @@ Status SysCatalogTable::SetupTablet(
   RETURN_NOT_OK_SHUTDOWN(BootstrapTablet(
       metadata,
       cmeta->CommittedConfig(),
-      scoped_refptr<clock::Clock>(master_->clock()),
+      master_->clock(),
       master_->mem_tracker(),
-      scoped_refptr<rpc::ResultTracker>(),
+      /*result_tracker*/nullptr,
       metric_registry_,
+      master_->file_cache(),
       tablet_replica_,
+      tablet_replica_->log_anchor_registry(),
       &tablet,
       &log,
-      tablet_replica_->log_anchor_registry(),
       &consensus_info), "failed to bootstrap system catalog");
 
   // TODO(matteo): Do we have a setSplittable(false) or something from the
@@ -404,9 +426,9 @@ Status SysCatalogTable::SetupTablet(
   RETURN_NOT_OK_SHUTDOWN(tablet_replica_->Start(
       consensus_info,
       tablet,
-      scoped_refptr<clock::Clock>(master_->clock()),
+      master_->clock(),
       master_->messenger(),
-      scoped_refptr<rpc::ResultTracker>(),
+      /*result_tracker*/nullptr,
       log,
       master_->tablet_prepare_pool(),
       master_->dns_resolver()), "failed to start system catalog replica");
@@ -447,31 +469,41 @@ Status SysCatalogTable::WaitUntilRunning() {
   return Status::OK();
 }
 
-Status SysCatalogTable::SyncWrite(const WriteRequestPB *req, WriteResponsePB *resp) {
+Status SysCatalogTable::SyncWrite(const WriteRequestPB& req) {
+  DCHECK(req.has_tablet_id());
+  DCHECK(req.has_schema());
   MAYBE_RETURN_FAILURE(FLAGS_sys_catalog_fail_during_write,
                        Status::RuntimeError(kInjectedFailureStatusMsg));
-
+  const size_t request_size = req.ByteSizeLong();
+  if (request_size > GetMaxWriteRequestSize()) {
+    oversized_write_requests_->Increment();
+    return Status::InvalidArgument(
+        Substitute("write request ($0 bytes in size) is too large for current "
+                   "setting of the --rpc_max_message_size flag", request_size));
+  }
   CountDownLatch latch(1);
-  gscoped_ptr<tablet::TransactionCompletionCallback> txn_callback(
-      new LatchTransactionCompletionCallback<WriteResponsePB>(&latch, resp));
+  WriteResponsePB resp;
+  unique_ptr<tablet::TransactionCompletionCallback> txn_callback(
+      new LatchTransactionCompletionCallback<WriteResponsePB>(&latch, &resp));
   unique_ptr<tablet::WriteTransactionState> tx_state(
       new tablet::WriteTransactionState(tablet_replica_.get(),
-                                        req,
+                                        &req,
                                         nullptr, // No RequestIdPB
-                                        resp));
+                                        &resp));
   tx_state->set_completion_callback(std::move(txn_callback));
 
   RETURN_NOT_OK(tablet_replica_->SubmitWrite(std::move(tx_state)));
   latch.Wait();
 
-  if (resp->has_error()) {
-    return StatusFromPB(resp->error().status());
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
   }
-  if (resp->per_row_errors_size() > 0) {
-    for (const WriteResponsePB::PerRowErrorPB& error : resp->per_row_errors()) {
-      LOG(WARNING) << "row " << error.row_index() << ": " << StatusFromPB(error.error()).ToString();
+  if (resp.per_row_errors_size() > 0) {
+    for (const auto& error : resp.per_row_errors()) {
+      LOG(WARNING) << Substitute(
+          "row $0: $1", error.row_index(), StatusFromPB(error.error()).ToString());
     }
-    return Status::Corruption("One or more rows failed to write");
+    return Status::Corruption("failed to write one or more rows");
   }
   return Status::OK();
 }
@@ -486,11 +518,10 @@ Schema SysCatalogTable::BuildTableSchema() {
   return builder.Build();
 }
 
-Status SysCatalogTable::Write(const Actions& actions) {
+Status SysCatalogTable::Write(Actions actions, WriteMode mode) {
   TRACE_EVENT0("master", "SysCatalogTable::Write");
 
   WriteRequestPB req;
-  WriteResponsePB resp;
   req.set_tablet_id(kSysCatalogTabletId);
   RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
 
@@ -504,9 +535,23 @@ Status SysCatalogTable::Write(const Actions& actions) {
     ReqDeleteTable(&req, actions.table_to_delete);
   }
 
-  ReqAddTablets(&req, actions.tablets_to_add);
-  ReqUpdateTablets(&req, actions.tablets_to_update);
-  ReqDeleteTablets(&req, actions.tablets_to_delete);
+  // There might be many updates on tablet metadata in a cluster, especially
+  // in a big one. When persisting these, the write operations are broken into
+  // chunks if requested.
+  const size_t max_batch_size =
+      (mode == WriteMode::ATOMIC) ? 0 : GetMaxWriteRequestSize();
+  RETURN_NOT_OK(ChunkedWrite(&SysCatalogTable::ReqAddTablets,
+                             max_batch_size,
+                             std::move(actions.tablets_to_add),
+                             &req));
+  RETURN_NOT_OK(ChunkedWrite(&SysCatalogTable::ReqUpdateTablets,
+                             max_batch_size,
+                             std::move(actions.tablets_to_update),
+                             &req));
+  RETURN_NOT_OK(ChunkedWrite(&SysCatalogTable::ReqDeleteTablets,
+                             max_batch_size,
+                             std::move(actions.tablets_to_delete),
+                             &req));
 
   if (actions.hms_notification_log_event_id) {
     ReqSetNotificationLogEventId(&req, *actions.hms_notification_log_event_id);
@@ -517,13 +562,12 @@ Status SysCatalogTable::Write(const Actions& actions) {
     // previous version of the data).
     return Status::OK();
   }
-  RETURN_NOT_OK(SyncWrite(&req, &resp));
-  return Status::OK();
+  return SyncWrite(req);
 }
 
-// ==================================================================
+// ------------------------------------------------------------------
 // Table related methods
-// ==================================================================
+// ------------------------------------------------------------------
 
 void SysCatalogTable::ReqAddTable(WriteRequestPB* req,
                                   const scoped_refptr<TableInfo>& table) {
@@ -578,6 +622,17 @@ string SysCatalogTable::TskSeqNumberToEntryId(int64_t seq_number) {
   string entry_id;
   KeyEncoderTraits<DataType::INT64, string>::Encode(seq_number, &entry_id);
   return entry_id;
+}
+
+int64_t SysCatalogTable::TskEntryIdToSeqNumber(const string& entry_id) {
+  Slice to_decode(entry_id);
+  int64_t tsk_seq_id = 0;
+  // Extra parentheses in CHECK_OK() are because of the comma separating types
+  // for the template.
+  CHECK_OK((KeyEncoderTraits<DataType::INT64, string>::DecodeKeyPortion(
+      &to_decode, /* is_last */false, /* arena */nullptr,
+      reinterpret_cast<uint8_t*>(&tsk_seq_id))));
+  return tsk_seq_id;
 }
 
 Status SysCatalogTable::VisitTServerStates(TServerStateVisitor* visitor) {
@@ -706,7 +761,6 @@ Status SysCatalogTable::GetCertAuthorityEntry(SysCertAuthorityEntryPB* entry) {
 Status SysCatalogTable::AddCertAuthorityEntry(
     const SysCertAuthorityEntryPB& entry) {
   WriteRequestPB req;
-  WriteResponsePB resp;
   req.set_tablet_id(kSysCatalogTabletId);
   RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
 
@@ -720,13 +774,11 @@ Status SysCatalogTable::AddCertAuthorityEntry(
   RowOperationsPBEncoder enc(req.mutable_row_operations());
   enc.Add(RowOperationsPB::INSERT, row);
 
-  return SyncWrite(&req, &resp);
+  return SyncWrite(req);
 }
 
 Status SysCatalogTable::AddTskEntry(const SysTskEntryPB& entry) {
   WriteRequestPB req;
-  WriteResponsePB resp;
-
   req.set_tablet_id(kSysCatalogTabletId);
   CHECK_OK(SchemaToPB(schema_, req.mutable_schema()));
 
@@ -748,7 +800,7 @@ Status SysCatalogTable::AddTskEntry(const SysTskEntryPB& entry) {
   RowOperationsPBEncoder enc(req.mutable_row_operations());
   enc.Add(RowOperationsPB::INSERT, row);
 
-  return SyncWrite(&req, &resp);
+  return SyncWrite(req);
 }
 
 Status SysCatalogTable::RemoveTskEntries(const set<string>& entry_ids) {
@@ -764,8 +816,7 @@ Status SysCatalogTable::RemoveTskEntries(const set<string>& entry_ids) {
     enc.Add(RowOperationsPB::DELETE, row);
   }
 
-  WriteResponsePB resp;
-  return SyncWrite(&req, &resp);
+  return SyncWrite(req);
 }
 
 Status SysCatalogTable::WriteTServerState(const string& tserver_id,
@@ -785,8 +836,7 @@ Status SysCatalogTable::WriteTServerState(const string& tserver_id,
   RowOperationsPBEncoder enc(req.mutable_row_operations());
   enc.Add(RowOperationsPB::INSERT, row);
 
-  WriteResponsePB resp;
-  return SyncWrite(&req, &resp);
+  return SyncWrite(req);
 }
 
 Status SysCatalogTable::RemoveTServerState(const string& tserver_id) {
@@ -799,36 +849,52 @@ Status SysCatalogTable::RemoveTServerState(const string& tserver_id) {
   RETURN_NOT_OK(row.SetStringNoCopy(kSysCatalogTableColId, tserver_id));
   enc.Add(RowOperationsPB::DELETE, row);
 
-  WriteResponsePB resp;
-  return SyncWrite(&req, &resp);
+  return SyncWrite(req);
 }
 
-// ==================================================================
+// ------------------------------------------------------------------
 // Tablet related methods
-// ==================================================================
+// ------------------------------------------------------------------
 
-void SysCatalogTable::ReqAddTablets(WriteRequestPB* req,
-                                    const vector<scoped_refptr<TabletInfo>>& tablets) {
+void SysCatalogTable::ReqAddTablets(
+    size_t max_size,
+    vector<scoped_refptr<TabletInfo>> tablets,
+    vector<scoped_refptr<TabletInfo>>* excess_tablets,
+    WriteRequestPB* req) {
+  DCHECK(excess_tablets);
   faststring metadata_buf;
   KuduPartialRow row(&schema_);
   RowOperationsPBEncoder enc(req->mutable_row_operations());
-  for (const auto& tablet : tablets) {
-    VLOG(2) << "Adding tablet " << tablet->id() << " in catalog: "
-            << SecureShortDebugString(tablet->metadata().dirty().pb);
+  size_t req_size = req->ByteSizeLong();
+  for (auto it = tablets.begin(); it != tablets.end(); ++it) {
+    const auto& tablet = *it;
     pb_util::SerializeToString(tablet->metadata().dirty().pb, &metadata_buf);
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
     CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->id()));
     CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
-    enc.Add(RowOperationsPB::INSERT, row);
+    req_size += enc.Add(RowOperationsPB::INSERT, row);
+    if (max_size > 0 && req_size > max_size && !enc.empty()) {
+      enc.RemoveLast();
+      std::move(it, tablets.end(), back_inserter(*excess_tablets));
+      break;
+    }
+    VLOG(2) << "Adding tablet " << tablet->id() << " in catalog: "
+            << SecureShortDebugString(tablet->metadata().dirty().pb);
   }
 }
 
-void SysCatalogTable::ReqUpdateTablets(WriteRequestPB* req,
-                                       const vector<scoped_refptr<TabletInfo>>& tablets) {
+void SysCatalogTable::ReqUpdateTablets(
+    size_t max_size,
+    vector<scoped_refptr<TabletInfo>> tablets,
+    vector<scoped_refptr<TabletInfo>>* excess_tablets,
+    WriteRequestPB* req) {
+  DCHECK(excess_tablets);
   faststring metadata_buf;
   KuduPartialRow row(&schema_);
   RowOperationsPBEncoder enc(req->mutable_row_operations());
-  for (const auto& tablet : tablets) {
+  size_t req_size = req->ByteSizeLong();
+  for (auto it = tablets.begin(); it != tablets.end(); ++it) {
+    const auto& tablet = *it;
     string diff;
     if (ArePBsEqual(tablet->metadata().state().pb,
                     tablet->metadata().dirty().pb,
@@ -836,25 +902,66 @@ void SysCatalogTable::ReqUpdateTablets(WriteRequestPB* req,
       // Short-circuit empty updates.
       continue;
     }
-    VLOG(2) << "Updating tablet " << tablet->id() << " in catalog: "
-            << diff;
+
     pb_util::SerializeToString(tablet->metadata().dirty().pb, &metadata_buf);
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
     CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->id()));
     CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
-    enc.Add(RowOperationsPB::UPDATE, row);
+    req_size += enc.Add(RowOperationsPB::UPDATE, row);
+    if (max_size > 0 && req_size > max_size && !enc.empty()) {
+      enc.RemoveLast();
+      std::move(it, tablets.end(), back_inserter(*excess_tablets));
+      break;
+    }
+    VLOG(2) << "Updating tablet " << tablet->id() << " in catalog: " << diff;
   }
 }
 
-void SysCatalogTable::ReqDeleteTablets(WriteRequestPB* req,
-                                       const vector<scoped_refptr<TabletInfo>>& tablets) {
+void SysCatalogTable::ReqDeleteTablets(
+    size_t max_size,
+    vector<scoped_refptr<TabletInfo>> tablets,
+    vector<scoped_refptr<TabletInfo>>* excess_tablets,
+    WriteRequestPB* req) {
+  DCHECK(excess_tablets);
   KuduPartialRow row(&schema_);
   RowOperationsPBEncoder enc(req->mutable_row_operations());
-  for (const auto& tablet : tablets) {
+  size_t req_size = req->ByteSizeLong();
+  for (auto it = tablets.begin(); it != tablets.end(); ++it) {
+    const auto& tablet = *it;
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
     CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->id()));
-    enc.Add(RowOperationsPB::DELETE, row);
+    req_size += enc.Add(RowOperationsPB::DELETE, row);
+    if (max_size > 0 && req_size > max_size && !enc.empty()) {
+      enc.RemoveLast();
+      std::move(it, tablets.end(), back_inserter(*excess_tablets));
+      break;
+    }
+    VLOG(2) << "Deleting tablet " << tablet->id() << " from catalog";
   }
+}
+
+Status SysCatalogTable::ChunkedWrite(
+    const Generator& generator,
+    size_t max_chunk_size,
+    vector<scoped_refptr<TabletInfo>> tablets_info,
+    WriteRequestPB* req) {
+  decltype(tablets_info) input(std::move(tablets_info));
+  do {
+    decltype(tablets_info) excess;
+    generator(*this, max_chunk_size, std::move(input), &excess, req);
+    if (!excess.empty()) {
+      // It's time to write a chunk of the generated data because
+      // the generator returned some of the input elements back. Those extra
+      // elements will go next batch if trying to stay under the specified
+      // maximum size for the result request.
+      RETURN_NOT_OK(SyncWrite(*req));
+      req->Clear();
+      req->set_tablet_id(kSysCatalogTabletId);
+      RETURN_NOT_OK(SchemaToPB(schema_, req->mutable_schema()));
+    }
+    input = std::move(excess);
+  } while (!input.empty());
+  return Status::OK();
 }
 
 void SysCatalogTable::ReqSetNotificationLogEventId(WriteRequestPB* req, int64_t event_id) {
@@ -897,7 +1004,7 @@ void SysCatalogTable::InitLocalRaftPeerPB() {
   Sockaddr addr = master_->first_rpc_address();
   HostPort hp;
   CHECK_OK(HostPortFromSockaddrReplaceWildcard(addr, &hp));
-  CHECK_OK(HostPortToPB(hp, local_peer_pb_.mutable_last_known_addr()));
+  *local_peer_pb_.mutable_last_known_addr() = HostPortToPB(hp);
 }
 
 } // namespace master

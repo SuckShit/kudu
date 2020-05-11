@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
@@ -28,8 +29,9 @@
 
 namespace kudu {
 
-class AutoReleasePool;
 class Arena;
+class AutoReleasePool;
+class ColumnSchema;
 class EncodedKey;
 class Schema;
 
@@ -56,6 +58,9 @@ class ScanSpec {
   // Returns true if the result set is known to be empty.
   bool CanShortCircuit() const;
 
+  // Returns true if a Bloom filter predicate is present.
+  bool ContainsBloomFilterPredicate() const;
+
   // Optimizes the scan by unifying the lower and upper bound constraints and
   // the column predicates.
   //
@@ -67,6 +72,9 @@ class ScanSpec {
                     Arena* arena,
                     AutoReleasePool* pool,
                     bool remove_pushed_predicates);
+
+  // Get columns that are present in the predicates but not in the projection
+  std::vector<ColumnSchema> GetMissingColumns(const Schema& projection);
 
   // Set the lower bound (inclusive) primary key for the scan.
   // Does not take ownership of 'key', which must remain valid.

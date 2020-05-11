@@ -14,14 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_TABLET_TRANSACTION_H_
-#define KUDU_TABLET_TRANSACTION_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #include <glog/logging.h>
 
@@ -31,7 +31,6 @@
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/raft_consensus.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/result_tracker.h"
@@ -60,6 +59,7 @@ struct TransactionMetrics {
   TransactionMetrics();
   void Reset();
   int successful_inserts;
+  int insert_ignore_errors;
   int successful_upserts;
   int successful_updates;
   int successful_deletes;
@@ -102,7 +102,7 @@ class Transaction {
   TransactionType tx_type() const { return tx_type_; }
 
   // Builds the ReplicateMsg for this transaction.
-  virtual void NewReplicateMsg(gscoped_ptr<consensus::ReplicateMsg>* replicate_msg) = 0;
+  virtual void NewReplicateMsg(std::unique_ptr<consensus::ReplicateMsg>* replicate_msg) = 0;
 
   // Executes the prepare phase of this transaction, the actual actions
   // of this phase depend on the transaction type, but usually are limited
@@ -124,7 +124,7 @@ class Transaction {
   // Executes the Apply() phase of the transaction, the actual actions of
   // this phase depend on the transaction type, but usually this is the
   // method where data-structures are changed.
-  virtual Status Apply(gscoped_ptr<consensus::CommitMsg>* commit_msg) = 0;
+  virtual Status Apply(std::unique_ptr<consensus::CommitMsg>* commit_msg) = 0;
 
   // Executed after the transaction has been applied and the commit message has
   // been appended to the log (though it might not be durable yet), or if the
@@ -193,8 +193,9 @@ class TransactionState {
     return &tx_metrics_;
   }
 
-  void set_completion_callback(gscoped_ptr<TransactionCompletionCallback> completion_clbk) {
-    completion_clbk_.reset(completion_clbk.release());
+  void set_completion_callback(
+      std::unique_ptr<TransactionCompletionCallback> completion_clbk) {
+    completion_clbk_ = std::move(completion_clbk);
   }
 
   // Returns the completion callback.
@@ -280,7 +281,7 @@ class TransactionState {
   scoped_refptr<rpc::ResultTracker> result_tracker_;
 
   // Optional callback to be called once the transaction completes.
-  gscoped_ptr<TransactionCompletionCallback> completion_clbk_;
+  std::unique_ptr<TransactionCompletionCallback> completion_clbk_;
 
   AutoReleasePool pool_;
 
@@ -371,5 +372,3 @@ class LatchTransactionCompletionCallback : public TransactionCompletionCallback 
 
 }  // namespace tablet
 }  // namespace kudu
-
-#endif /* KUDU_TABLET_TRANSACTION_H_ */

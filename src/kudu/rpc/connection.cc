@@ -26,7 +26,6 @@
 #include <memory>
 #include <set>
 #include <string>
-#include <type_traits>
 
 #include <boost/intrusive/detail/list_iterator.hpp>
 #include <boost/intrusive/list.hpp>
@@ -44,6 +43,7 @@
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/transfer.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 #include "kudu/util/slice.h"
@@ -329,7 +329,7 @@ void Connection::Shutdown(const Status &status,
   }
 }
 
-void Connection::QueueOutbound(gscoped_ptr<OutboundTransfer> transfer) {
+void Connection::QueueOutbound(unique_ptr<OutboundTransfer> transfer) {
   DCHECK(reactor_thread_->IsCurrentThread());
 
   if (!shutdown_status_.ok()) {
@@ -344,10 +344,11 @@ void Connection::QueueOutbound(gscoped_ptr<OutboundTransfer> transfer) {
   outbound_transfers_.push_back(*transfer.release());
 
   if (negotiation_complete_ && !write_io_.is_active()) {
-    // If we weren't currently in the middle of sending anything,
-    // then our write_io_ interest is stopped. Need to re-start it.
-    // Only do this after connection negotiation is done doing its work.
-    write_io_.start();
+    // Optimistically assume that the socket is writable if we didn't already
+    // have something queued.
+    if (ProcessOutboundTransfers() == kMoreToSend) {
+      write_io_.start();
+    }
   }
 }
 
@@ -376,7 +377,10 @@ void Connection::CallAwaitingResponse::HandleTimeout(ev::timer &watcher, int rev
 
 void Connection::HandleOutboundCallTimeout(CallAwaitingResponse *car) {
   DCHECK(reactor_thread_->IsCurrentThread());
-  DCHECK(car->call);
+  if (!car->call) {
+    // The RPC may have been cancelled before the timeout was hit.
+    return;
+  }
   // The timeout timer is stopped by the car destructor exiting Connection::HandleCallResponse()
   DCHECK(!car->call->IsFinished());
 
@@ -475,7 +479,7 @@ void Connection::QueueOutboundCall(shared_ptr<OutboundCall> call) {
 
   // Serialize the actual bytes to be put on the wire.
   TransferPayload tmp_slices;
-  size_t n_slices = call->SerializeTo(&tmp_slices);
+  call->SerializeTo(&tmp_slices);
 
   call->SetQueued();
 
@@ -532,8 +536,8 @@ void Connection::QueueOutboundCall(shared_ptr<OutboundCall> call) {
 
   TransferCallbacks *cb = new CallTransferCallbacks(std::move(call), this);
   awaiting_response_[call_id] = car.release();
-  QueueOutbound(gscoped_ptr<OutboundTransfer>(
-      OutboundTransfer::CreateForCallRequest(call_id, tmp_slices, n_slices, cb)));
+  QueueOutbound(unique_ptr<OutboundTransfer>(
+      OutboundTransfer::CreateForCallRequest(call_id, tmp_slices, cb)));
 }
 
 // Callbacks for sending an RPC call response from the server.
@@ -541,7 +545,7 @@ void Connection::QueueOutboundCall(shared_ptr<OutboundCall> call) {
 // been responded to, we can free up all of the associated memory.
 struct ResponseTransferCallbacks : public TransferCallbacks {
  public:
-  ResponseTransferCallbacks(gscoped_ptr<InboundCall> call,
+  ResponseTransferCallbacks(unique_ptr<InboundCall> call,
                             Connection *conn) :
     call_(std::move(call)),
     conn_(conn)
@@ -565,14 +569,14 @@ struct ResponseTransferCallbacks : public TransferCallbacks {
   }
 
  private:
-  gscoped_ptr<InboundCall> call_;
+  unique_ptr<InboundCall> call_;
   Connection *conn_;
 };
 
 // Reactor task which puts a transfer on the outbound transfer queue.
 class QueueTransferTask : public ReactorTask {
  public:
-  QueueTransferTask(gscoped_ptr<OutboundTransfer> transfer,
+  QueueTransferTask(unique_ptr<OutboundTransfer> transfer,
                     Connection *conn)
     : transfer_(std::move(transfer)),
       conn_(conn)
@@ -589,11 +593,11 @@ class QueueTransferTask : public ReactorTask {
   }
 
  private:
-  gscoped_ptr<OutboundTransfer> transfer_;
+  unique_ptr<OutboundTransfer> transfer_;
   Connection *conn_;
 };
 
-void Connection::QueueResponseForCall(gscoped_ptr<InboundCall> call) {
+void Connection::QueueResponseForCall(unique_ptr<InboundCall> call) {
   // This is usually called by the IPC worker thread when the response
   // is set, but in some circumstances may also be called by the
   // reactor thread (e.g. if the service has shut down)
@@ -605,14 +609,14 @@ void Connection::QueueResponseForCall(gscoped_ptr<InboundCall> call) {
   // ResponseTransferCallbacks::NotifyTransferAborted.
 
   TransferPayload tmp_slices;
-  size_t n_slices = call->SerializeResponseTo(&tmp_slices);
+  call->SerializeResponseTo(&tmp_slices);
 
   TransferCallbacks *cb = new ResponseTransferCallbacks(std::move(call), this);
   // After the response is sent, can delete the InboundCall object.
   // We set a dummy call ID and required feature set, since these are not needed
   // when sending responses.
-  gscoped_ptr<OutboundTransfer> t(
-      OutboundTransfer::CreateForCallResponse(tmp_slices, n_slices, cb));
+  unique_ptr<OutboundTransfer> t(
+      OutboundTransfer::CreateForCallResponse(tmp_slices, cb));
 
   QueueTransferTask *task = new QueueTransferTask(std::move(t), this);
   reactor_thread_->reactor()->ScheduleReactorTask(task);
@@ -643,11 +647,12 @@ void Connection::ReadHandler(ev::io &watcher, int revents) {
   }
   last_activity_time_ = reactor_thread_->cur_time();
 
+  faststring extra_buf;
   while (true) {
     if (!inbound_) {
       inbound_.reset(new InboundTransfer());
     }
-    Status status = inbound_->ReceiveBuffer(*socket_);
+    Status status = inbound_->ReceiveBuffer(socket_.get(), &extra_buf);
     if (PREDICT_FALSE(!status.ok())) {
       if (status.posix_code() == ESHUTDOWN) {
         VLOG(1) << ToString() << " shut down by remote end.";
@@ -671,21 +676,18 @@ void Connection::ReadHandler(ev::io &watcher, int revents) {
       LOG(FATAL) << "Invalid direction: " << direction_;
     }
 
-    // TODO: it would seem that it would be good to loop around and see if
-    // there is more data on the socket by trying another recv(), but it turns
-    // out that it really hurts throughput to do so. A better approach
-    // might be for each InboundTransfer to actually try to read an extra byte,
-    // and if it succeeds, then we'd copy that byte into a new InboundTransfer
-    // and loop around, since it's likely the next call also arrived at the
-    // same time.
-    break;
+    if (extra_buf.size() > 0) {
+      inbound_.reset(new InboundTransfer(std::move(extra_buf)));
+    } else {
+      break;
+    }
   }
 }
 
-void Connection::HandleIncomingCall(gscoped_ptr<InboundTransfer> transfer) {
+void Connection::HandleIncomingCall(unique_ptr<InboundTransfer> transfer) {
   DCHECK(reactor_thread_->IsCurrentThread());
 
-  gscoped_ptr<InboundCall> call(new InboundCall(this));
+  unique_ptr<InboundCall> call(new InboundCall(this));
   Status s = call->ParseFrom(std::move(transfer));
   if (!s.ok()) {
     LOG(WARNING) << ToString() << ": received bad data: " << s.ToString();
@@ -706,9 +708,9 @@ void Connection::HandleIncomingCall(gscoped_ptr<InboundTransfer> transfer) {
   reactor_thread_->reactor()->messenger()->QueueInboundCall(std::move(call));
 }
 
-void Connection::HandleCallResponse(gscoped_ptr<InboundTransfer> transfer) {
+void Connection::HandleCallResponse(unique_ptr<InboundTransfer> transfer) {
   DCHECK(reactor_thread_->IsCurrentThread());
-  gscoped_ptr<CallResponse> resp(new CallResponse);
+  unique_ptr<CallResponse> resp(new CallResponse);
   CHECK_OK(resp->ParseFrom(std::move(transfer)));
 
   CallAwaitingResponse *car_ptr =
@@ -745,19 +747,22 @@ void Connection::WriteHandler(ev::io &watcher, int revents) {
   }
   DVLOG(3) << ToString() << ": writeHandler: revents = " << revents;
 
-  OutboundTransfer *transfer;
   if (outbound_transfers_.empty()) {
     LOG(WARNING) << ToString() << " got a ready-to-write callback, but there is "
       "nothing to write.";
     write_io_.stop();
     return;
   }
+  if (ProcessOutboundTransfers() == kNoMoreToSend) {
+    write_io_.stop();
+  }
+}
 
+Connection::ProcessOutboundTransfersResult Connection::ProcessOutboundTransfers() {
   while (!outbound_transfers_.empty()) {
-    transfer = &(outbound_transfers_.front());
+    OutboundTransfer* transfer = &(outbound_transfers_.front());
 
     if (!transfer->TransferStarted()) {
-
       if (transfer->is_for_outbound_call()) {
         CallAwaitingResponse* car = FindOrDie(awaiting_response_, transfer->call_id());
         if (!car->call) {
@@ -800,21 +805,19 @@ void Connection::WriteHandler(ev::io &watcher, int revents) {
     if (PREDICT_FALSE(!status.ok())) {
       LOG(WARNING) << ToString() << " send error: " << status.ToString();
       reactor_thread_->DestroyConnection(this, status);
-      return;
+      return kConnectionDestroyed;
     }
 
     if (!transfer->TransferFinished()) {
       DVLOG(3) << ToString() << ": writeHandler: xfer not finished.";
-      return;
+      return kMoreToSend;
     }
 
     outbound_transfers_.pop_front();
     delete transfer;
   }
 
-  // If we were able to write all of our outbound transfers,
-  // we don't have any more to write.
-  write_io_.stop();
+  return kNoMoreToSend;
 }
 
 std::string Connection::ToString() const {
@@ -904,7 +907,7 @@ Status Connection::DumpPB(const DumpConnectionsRequestPB& req,
     LOG(FATAL);
   }
 #ifdef __linux__
-  if (negotiation_complete_) {
+  if (negotiation_complete_ && remote_.is_ip()) {
     // TODO(todd): it's a little strange to not set socket level stats during
     // negotiation, but we don't have access to the socket here until negotiation
     // is complete.

@@ -22,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <set>
@@ -33,19 +35,17 @@
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/data_dirs.h"
+#include "kudu/fs/dir_manager.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_report.h"
 #include "kudu/fs/log_block_manager-test-util.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
@@ -54,6 +54,7 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/env.h"
+#include "kudu/util/file_cache.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
@@ -80,7 +81,6 @@ DECLARE_double(env_inject_eio);
 DECLARE_double(log_container_excess_space_before_cleanup_fraction);
 DECLARE_double(log_container_live_metadata_before_compact_ratio);
 DECLARE_int32(fs_target_data_dirs_per_tablet);
-DECLARE_int64(block_manager_max_open_files);
 DECLARE_int64(log_container_max_blocks);
 DECLARE_string(block_manager_preflush_control);
 DECLARE_string(env_inject_eio_globs);
@@ -112,10 +112,14 @@ class LogBlockContainer;
 class LogBlockManagerTest : public KuduTest {
  public:
   LogBlockManagerTest() :
-    test_tablet_name_("test_tablet"),
-    test_block_opts_({ test_tablet_name_ }),
-    test_error_manager_(new FsErrorManager()),
-    bm_(CreateBlockManager(scoped_refptr<MetricEntity>())) {
+      test_tablet_name_("test_tablet"),
+      test_block_opts_({ test_tablet_name_ }),
+      // Use a small file cache (smaller than the number of containers).
+      //
+      // Not strictly necessary except for TestDeleteFromContainerAfterMetadataCompaction.
+      file_cache_("test_cache", env_, 50, scoped_refptr<MetricEntity>()),
+      bm_(CreateBlockManager(scoped_refptr<MetricEntity>())) {
+    CHECK_OK(file_cache_.Init());
   }
 
   void SetUp() override {
@@ -136,10 +140,11 @@ class LogBlockManagerTest : public KuduTest {
       CHECK_OK(DataDirManager::CreateNewForTests(env_, test_data_dirs,
           DataDirManagerOptions(), &dd_manager_));
     }
+
     BlockManagerOptions opts;
     opts.metric_entity = metric_entity;
-    return new LogBlockManager(env_, dd_manager_.get(), test_error_manager_.get(),
-                               std::move(opts));
+    return new LogBlockManager(env_, dd_manager_.get(), &error_manager_,
+                               &file_cache_, std::move(opts));
   }
 
   Status ReopenBlockManager(const scoped_refptr<MetricEntity>& metric_entity = nullptr,
@@ -223,7 +228,8 @@ class LogBlockManagerTest : public KuduTest {
   CreateBlockOptions test_block_opts_;
 
   unique_ptr<DataDirManager> dd_manager_;
-  unique_ptr<FsErrorManager> test_error_manager_;
+  FsErrorManager error_manager_;
+  FileCache file_cache_;
   unique_ptr<LogBlockManager> bm_;
 
  private:
@@ -236,7 +242,7 @@ class LogBlockManagerTest : public KuduTest {
     // Populate 'data_files' and 'metadata_files'.
     vector<string> data_files;
     vector<string> metadata_files;
-    for (const string& data_dir : dd_manager_->GetDataDirs()) {
+    for (const string& data_dir : dd_manager_->GetDirs()) {
       vector<string> children;
       ASSERT_OK(env_->GetChildren(data_dir, &children));
       for (const string& child : children) {
@@ -425,7 +431,7 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
           {0, &METRIC_log_block_manager_dead_containers_deleted} }));
   }
   // Wait for the actual hole punching to take place.
-  for (const auto& data_dir : dd_manager_->data_dirs()) {
+  for (const auto& data_dir : dd_manager_->dirs()) {
     data_dir->WaitOnClosures();
   }
   NO_FATALS(CheckLogMetrics(new_entity,
@@ -472,7 +478,7 @@ TEST_F(LogBlockManagerTest, MetricsTest) {
           {0, &METRIC_log_block_manager_dead_containers_deleted} }));
   }
   // Wait for the actual hole punching to take place.
-  for (const auto& data_dir : dd_manager_->data_dirs()) {
+  for (const auto& data_dir : dd_manager_->dirs()) {
     data_dir->WaitOnClosures();
   }
   NO_FATALS(CheckLogMetrics(new_entity,
@@ -1125,7 +1131,7 @@ TEST_F(LogBlockManagerTest, TestContainerBlockLimiting) {
   const int kNumBlocks = 1000;
 
   // Creates 'kNumBlocks' blocks with minimal data.
-  auto create_some_blocks = [&]() -> Status {
+  auto create_some_blocks = [&]() {
     for (int i = 0; i < kNumBlocks; i++) {
       unique_ptr<WritableBlock> block;
       RETURN_NOT_OK(bm_->CreateBlock(test_block_opts_, &block));
@@ -1167,7 +1173,7 @@ TEST_F(LogBlockManagerTest, TestMisalignedBlocksFuzz) {
   NO_FATALS(GetOnlyContainer(&container_name));
 
   // Add a mixture of regular and misaligned blocks to it.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   int num_misaligned_blocks = 0;
   for (int i = 0; i < kNumBlocks; i++) {
@@ -1285,7 +1291,7 @@ TEST_F(LogBlockManagerTest, TestRepairPreallocateExcessSpace) {
   NO_FATALS(GetContainerNames(&container_names));
 
   // Corrupt one container.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   ASSERT_OK(corruptor.PreallocateFullContainer());
 
@@ -1330,7 +1336,7 @@ TEST_F(LogBlockManagerTest, TestRepairUnpunchedBlocks) {
   ASSERT_EQ(0, file_size_on_disk);
 
   // Add some "unpunched blocks" to the container.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumBlocks; i++) {
     ASSERT_OK(corruptor.AddUnpunchedBlockToFullContainer());
@@ -1371,7 +1377,7 @@ TEST_F(LogBlockManagerTest, TestRepairIncompleteContainer) {
   // Create some incomplete containers. The corruptor will select between
   // several variants of "incompleteness" at random (see
   // LBMCorruptor::CreateIncompleteContainer() for details).
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumContainers; i++) {
     ASSERT_OK(corruptor.CreateIncompleteContainer());
@@ -1409,7 +1415,7 @@ TEST_F(LogBlockManagerTest, TestDetectMalformedRecords) {
   // Add some malformed records. The corruptor will select between
   // several variants of "malformedness" at random (see
   // LBMCorruptor::AddMalformedRecordToContainer for details).
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumRecords; i++) {
     ASSERT_OK(corruptor.AddMalformedRecordToContainer());
@@ -1439,7 +1445,7 @@ TEST_F(LogBlockManagerTest, TestDetectMisalignedBlocks) {
   NO_FATALS(GetOnlyContainer(&container_name));
 
   // Add some misaligned blocks.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumBlocks; i++) {
     ASSERT_OK(corruptor.AddMisalignedBlockToContainer());
@@ -1478,7 +1484,7 @@ TEST_F(LogBlockManagerTest, TestRepairPartialRecords) {
   ASSERT_EQ(kNumContainers, container_names.size());
 
   // Add some partial records.
-  LBMCorruptor corruptor(env_, dd_manager_->GetDataDirs(), SeedRandom());
+  LBMCorruptor corruptor(env_, dd_manager_->GetDirs(), SeedRandom());
   ASSERT_OK(corruptor.Init());
   for (int i = 0; i < kNumRecords; i++) {
     ASSERT_OK(corruptor.AddPartialRecordToContainer());
@@ -1505,10 +1511,14 @@ TEST_F(LogBlockManagerTest, TestDeleteDeadContainersAtStartup) {
   FLAGS_log_container_max_size = 0;
 
   // Create one container.
-  unique_ptr<WritableBlock> block;
-  ASSERT_OK(bm_->CreateBlock(test_block_opts_, &block));
-  ASSERT_OK(block->Append("a"));
-  ASSERT_OK(block->Close());
+  BlockId block_id;
+  {
+    unique_ptr<WritableBlock> block;
+    ASSERT_OK(bm_->CreateBlock(test_block_opts_, &block));
+    ASSERT_OK(block->Append("a"));
+    ASSERT_OK(block->Close());
+    block_id = block->id();
+  }
   string data_file_name;
   string metadata_file_name;
   NO_FATALS(GetOnlyContainerDataFile(&data_file_name));
@@ -1524,7 +1534,7 @@ TEST_F(LogBlockManagerTest, TestDeleteDeadContainersAtStartup) {
   {
     shared_ptr<BlockDeletionTransaction> deletion_transaction =
         this->bm_->NewDeletionTransaction();
-    deletion_transaction->AddDeletedBlock(block->id());
+    deletion_transaction->AddDeletedBlock(block_id);
     vector<BlockId> deleted;
     ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
   }
@@ -1601,8 +1611,6 @@ TEST_F(LogBlockManagerTest, TestCompactFullContainerMetadataAtStartup) {
 TEST_F(LogBlockManagerTest, TestDeleteFromContainerAfterMetadataCompaction) {
   // Compact aggressively.
   FLAGS_log_container_live_metadata_before_compact_ratio = 0.99;
-  // Use a small file cache (smaller than the number of containers).
-  FLAGS_block_manager_max_open_files = 50;
   // Use a single shard so that we have an accurate max cache capacity
   // regardless of the number of cores on the machine.
   FLAGS_cache_force_single_shard = true;
@@ -1680,8 +1688,10 @@ TEST_F(LogBlockManagerTest, TestOpenWithFailedDirectories) {
       DataDirManagerOptions(), &dd_manager_));
 
   // Wire in a callback to fail data directories.
-  test_error_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK_ERROR,
-      Bind(&DataDirManager::MarkDataDirFailedByUuid, Unretained(dd_manager_.get())));
+  error_manager_.SetErrorNotificationCb(
+      ErrorHandlerType::DISK_ERROR, [this](const string& uuid) {
+        this->dd_manager_->MarkDirFailedByUuid(uuid);
+      });
   bm_.reset(CreateBlockManager(nullptr));
 
   // Fail one of the directories, chosen randomly.
@@ -1697,7 +1707,7 @@ TEST_F(LogBlockManagerTest, TestOpenWithFailedDirectories) {
   for (const string& data_dir : report.data_dirs) {
     ASSERT_NE(data_dir, test_dirs[failed_idx]);
   }
-  const set<int>& failed_dirs = dd_manager_->GetFailedDataDirs();
+  const set<int>& failed_dirs = dd_manager_->GetFailedDirs();
   ASSERT_EQ(1, failed_dirs.size());
 
   int uuid_idx;
@@ -1941,7 +1951,7 @@ TEST_F(LogBlockManagerTest, TestDoNotDeleteFakeDeadContainer) {
       }
       ASSERT_OK(transaction->CommitDeletedBlocks(&deleted));
       transaction.reset();
-      for (const auto& data_dir : dd_manager_->data_dirs()) {
+      for (const auto& data_dir : dd_manager_->dirs()) {
         data_dir->WaitOnClosures();
       }
     }
@@ -1989,6 +1999,10 @@ TEST_F(LogBlockManagerTest, TestHalfPresentContainer) {
   };
 
   const auto CreateMetadataFile = [&] () {
+    // We're often recreating an existing file, so we must invalidate any
+    // entry in the file cache first.
+    file_cache_.Invalidate(metadata_file_name);
+
     unique_ptr<WritableFile> metadata_file_writer;
     ASSERT_OK(env_->NewWritableFile(metadata_file_name, &metadata_file_writer));
     ASSERT_OK(metadata_file_writer->Append(Slice("a")));
@@ -1996,6 +2010,10 @@ TEST_F(LogBlockManagerTest, TestHalfPresentContainer) {
   };
 
   const auto CreateDataFile = [&] () {
+    // We're often recreating an existing file, so we must invalidate any
+    // entry in the file cache first.
+    file_cache_.Invalidate(data_file_name);
+
     unique_ptr<WritableFile> data_file_writer;
     ASSERT_OK(env_->NewWritableFile(data_file_name, &data_file_writer));
     data_file_writer->Close();
@@ -2007,7 +2025,7 @@ TEST_F(LogBlockManagerTest, TestHalfPresentContainer) {
     transaction->AddDeletedBlock(block_id);
     ASSERT_OK(transaction->CommitDeletedBlocks(&deleted));
     transaction.reset();
-    for (const auto& data_dir : dd_manager_->data_dirs()) {
+    for (const auto& data_dir : dd_manager_->dirs()) {
       data_dir->WaitOnClosures();
     }
   };

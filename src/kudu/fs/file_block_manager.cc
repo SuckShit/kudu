@@ -18,6 +18,7 @@
 #include "kudu/fs/file_block_manager.h"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -33,9 +34,9 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager_metrics.h"
 #include "kudu/fs/data_dirs.h"
+#include "kudu/fs/dir_manager.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs_report.h"
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/map-util.h"
@@ -98,16 +99,16 @@ class FileBlockLocation {
   }
 
   // Construct a location from its constituent parts.
-  static FileBlockLocation FromParts(DataDir* data_dir,
+  static FileBlockLocation FromParts(Dir* data_dir,
                                      int data_dir_idx,
                                      const BlockId& block_id);
 
   // Construct a location from a full block ID.
-  static FileBlockLocation FromBlockId(DataDir* data_dir,
+  static FileBlockLocation FromBlockId(Dir* data_dir,
                                        const BlockId& block_id);
 
   // Get the data dir index of a given block ID.
-  static int GetDataDirIdx(const BlockId& block_id) {
+  static int GetDirIdx(const BlockId& block_id) {
     return block_id.id() >> 48;
   }
 
@@ -128,11 +129,11 @@ class FileBlockLocation {
   void GetAllParentDirs(vector<string>* parent_dirs) const;
 
   // Simple accessors.
-  DataDir* data_dir() const { return data_dir_; }
+  Dir* data_dir() const { return data_dir_; }
   const BlockId& block_id() const { return block_id_; }
 
  private:
-  FileBlockLocation(DataDir* data_dir, BlockId block_id)
+  FileBlockLocation(Dir* data_dir, BlockId block_id)
       : data_dir_(data_dir), block_id_(block_id) {}
 
   // These per-byte accessors yield subdirectories in which blocks are grouped.
@@ -149,11 +150,11 @@ class FileBlockLocation {
                         (block_id_.id() & 0x00000000FF000000ULL) >> 24);
   }
 
-  DataDir* data_dir_;
+  Dir* data_dir_;
   BlockId block_id_;
 };
 
-FileBlockLocation FileBlockLocation::FromParts(DataDir* data_dir,
+FileBlockLocation FileBlockLocation::FromParts(Dir* data_dir,
                                                int data_dir_idx,
                                                const BlockId& block_id) {
   DCHECK_LT(data_dir_idx, kuint16max);
@@ -165,7 +166,7 @@ FileBlockLocation FileBlockLocation::FromParts(DataDir* data_dir,
   return FileBlockLocation(data_dir, BlockId(combined_id));
 }
 
-FileBlockLocation FileBlockLocation::FromBlockId(DataDir* data_dir,
+FileBlockLocation FileBlockLocation::FromBlockId(Dir* data_dir,
                                                  const BlockId& block_id) {
   return FileBlockLocation(data_dir, block_id);
 }
@@ -341,7 +342,7 @@ Status FileWritableBlock::AppendV(ArrayView<const Slice> data) {
   DCHECK(state_ == CLEAN || state_ == DIRTY) << "Invalid state: " << state_;
   RETURN_NOT_OK_HANDLE_ERROR(writer_->AppendV(data));
   RETURN_NOT_OK_HANDLE_ERROR(location_.data_dir()->RefreshAvailableSpace(
-      DataDir::RefreshMode::ALWAYS));
+      Dir::RefreshMode::ALWAYS));
   state_ = DIRTY;
 
   // Calculate the amount of data written
@@ -471,8 +472,8 @@ class FileReadableBlock : public ReadableBlock {
 };
 
 void FileReadableBlock::HandleError(const Status& s) const {
-  const DataDir* dir = block_manager_->dd_manager_->FindDataDirByUuidIndex(
-      internal::FileBlockLocation::GetDataDirIdx(block_id_));
+  const Dir* dir = block_manager_->dd_manager_->FindDirByUuidIndex(
+      internal::FileBlockLocation::GetDirIdx(block_id_));
   HANDLE_DISK_FAILURE(s, block_manager_->error_manager()->RunErrorNotificationCb(
       ErrorHandlerType::DISK_ERROR, dir));
 }
@@ -682,8 +683,8 @@ Status FileBlockManager::SyncMetadata(const internal::FileBlockLocation& locatio
 
 bool FileBlockManager::FindBlockPath(const BlockId& block_id,
                                      string* path) const {
-  DataDir* dir = dd_manager_->FindDataDirByUuidIndex(
-      internal::FileBlockLocation::GetDataDirIdx(block_id));
+  Dir* dir = dd_manager_->FindDirByUuidIndex(
+      internal::FileBlockLocation::GetDirIdx(block_id));
   if (dir) {
     *path = internal::FileBlockLocation::FromBlockId(
         dir, block_id).GetFullPath();
@@ -694,13 +695,13 @@ bool FileBlockManager::FindBlockPath(const BlockId& block_id,
 FileBlockManager::FileBlockManager(Env* env,
                                    DataDirManager* dd_manager,
                                    FsErrorManager* error_manager,
+                                   FileCache* file_cache,
                                    BlockManagerOptions opts)
   : env_(DCHECK_NOTNULL(env)),
     dd_manager_(dd_manager),
     error_manager_(DCHECK_NOTNULL(error_manager)),
     opts_(std::move(opts)),
-    file_cache_("fbm", env_, GetFileCacheCapacityForBlockManager(env_),
-                opts_.metric_entity),
+    file_cache_(file_cache),
     rand_(GetRandomSeed32()),
     next_block_id_(rand_.Next64()),
     mem_tracker_(MemTracker::CreateTracker(-1,
@@ -715,19 +716,17 @@ FileBlockManager::~FileBlockManager() {
 }
 
 Status FileBlockManager::Open(FsReport* report) {
-  RETURN_NOT_OK(file_cache_.Init());
-
   // Prepare the filesystem report and either return or log it.
   FsReport local_report;
-  set<int> failed_dirs = dd_manager_->GetFailedDataDirs();
-  for (const auto& dd : dd_manager_->data_dirs()) {
+  set<int> failed_dirs = dd_manager_->GetFailedDirs();
+  for (const auto& dd : dd_manager_->dirs()) {
     // Don't report failed directories.
     // TODO(KUDU-2111): currently the FsReport only reports on containers for
     // the log block manager. Implement some sort of reporting for failed
     // directories as well.
     if (PREDICT_FALSE(!failed_dirs.empty())) {
       int uuid_idx;
-      CHECK(dd_manager_->FindUuidIndexByDataDir(dd.get(), &uuid_idx));
+      CHECK(dd_manager_->FindUuidIndexByDir(dd.get(), &uuid_idx));
       if (ContainsKey(failed_dirs, uuid_idx)) {
         continue;
       }
@@ -747,11 +746,11 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
                                      unique_ptr<WritableBlock>* block) {
   CHECK(!opts_.read_only);
 
-  DataDir* dir;
+  Dir* dir;
   RETURN_NOT_OK_EVAL(dd_manager_->GetDirAddIfNecessary(opts, &dir),
       error_manager_->RunErrorNotificationCb(ErrorHandlerType::NO_AVAILABLE_DISKS, opts.tablet_id));
   int uuid_idx;
-  CHECK(dd_manager_->FindUuidIndexByDataDir(dir, &uuid_idx));
+  CHECK(dd_manager_->FindUuidIndexByDir(dir, &uuid_idx));
 
   string path;
   vector<string> created_dirs;
@@ -814,8 +813,8 @@ Status FileBlockManager::CreateBlock(const CreateBlockOptions& opts,
 #define RETURN_NOT_OK_FBM_DISK_FAILURE(status_expr) do { \
   RETURN_NOT_OK_HANDLE_DISK_FAILURE((status_expr), \
       error_manager_->RunErrorNotificationCb(ErrorHandlerType::DISK_ERROR, \
-      dd_manager_->FindDataDirByUuidIndex( \
-      internal::FileBlockLocation::GetDataDirIdx(block_id)))); \
+      dd_manager_->FindDirByUuidIndex( \
+      internal::FileBlockLocation::GetDirIdx(block_id)))); \
 } while (0)
 
 Status FileBlockManager::OpenBlock(const BlockId& block_id,
@@ -829,7 +828,14 @@ Status FileBlockManager::OpenBlock(const BlockId& block_id,
   VLOG(1) << "Opening block with id " << block_id.ToString() << " at " << path;
 
   shared_ptr<RandomAccessFile> reader;
-  RETURN_NOT_OK_FBM_DISK_FAILURE(file_cache_.OpenExistingFile(path, &reader));
+  if (PREDICT_TRUE(file_cache_)) {
+    RETURN_NOT_OK_FBM_DISK_FAILURE(file_cache_->OpenFile<Env::MUST_EXIST>(
+        path, &reader));
+  } else {
+    unique_ptr<RandomAccessFile> r;
+    RETURN_NOT_OK_FBM_DISK_FAILURE(env_->NewRandomAccessFile(path, &r));
+    reader.reset(r.release());
+  }
   block->reset(new internal::FileReadableBlock(this, block_id, reader));
   return Status::OK();
 }
@@ -838,9 +844,9 @@ Status FileBlockManager::DeleteBlock(const BlockId& block_id) {
   CHECK(!opts_.read_only);
 
   // Return early if deleting a block in a failed directory.
-  set<int> failed_dirs = dd_manager_->GetFailedDataDirs();
+  set<int> failed_dirs = dd_manager_->GetFailedDirs();
   if (PREDICT_FALSE(!failed_dirs.empty())) {
-    int uuid_idx = internal::FileBlockLocation::GetDataDirIdx(block_id);
+    int uuid_idx = internal::FileBlockLocation::GetDirIdx(block_id);
     if (ContainsKey(failed_dirs, uuid_idx)) {
       LOG_EVERY_N(INFO, 10) << Substitute("Block $0 is in a failed directory; not deleting",
                                           block_id.ToString());
@@ -853,7 +859,11 @@ Status FileBlockManager::DeleteBlock(const BlockId& block_id) {
     return Status::NotFound(
         Substitute("Block $0 not found", block_id.ToString()));
   }
-  RETURN_NOT_OK_FBM_DISK_FAILURE(file_cache_.DeleteFile(path));
+  if (PREDICT_TRUE(file_cache_)) {
+    RETURN_NOT_OK_FBM_DISK_FAILURE(file_cache_->DeleteFile(path));
+  } else {
+    RETURN_NOT_OK_FBM_DISK_FAILURE(env_->DeleteFile(path));
+  }
 
   // We don't bother fsyncing the parent directory as there's nothing to be
   // gained by ensuring that the deletion is made durable. Even if we did
@@ -880,7 +890,7 @@ shared_ptr<BlockDeletionTransaction> FileBlockManager::NewDeletionTransaction() 
 
 namespace {
 
-Status GetAllBlockIdsForDataDirCb(DataDir* dd,
+Status GetAllBlockIdsForDataDirCb(Dir* dd,
                                   vector<BlockId>* block_ids,
                                   Env::FileType file_type,
                                   const string& dirname,
@@ -910,18 +920,21 @@ Status GetAllBlockIdsForDataDirCb(DataDir* dd,
   return Status::OK();
 }
 
-void GetAllBlockIdsForDataDir(Env* env,
-                              DataDir* dd,
-                              vector<BlockId>* block_ids,
-                              Status* status) {
-  *status = env->Walk(dd->dir(), Env::PRE_ORDER,
-                      Bind(&GetAllBlockIdsForDataDirCb, dd, block_ids));
+void GetAllBlockIdsForDir(Env* env,
+                          Dir* dd,
+                          vector<BlockId>* block_ids,
+                          Status* status) {
+  *status = env->Walk(
+      dd->dir(), Env::PRE_ORDER,
+      [dd, block_ids](Env::FileType type, const string& dirname, const string& basename) {
+        return GetAllBlockIdsForDataDirCb(dd, block_ids, type, dirname, basename);
+      });
 }
 
 } // anonymous namespace
 
 Status FileBlockManager::GetAllBlockIds(vector<BlockId>* block_ids) {
-  const auto& dds = dd_manager_->data_dirs();
+  const auto& dds = dd_manager_->dirs();
   block_ids->clear();
 
   // The FBM does not maintain block listings in memory, so off we go to the
@@ -929,13 +942,14 @@ Status FileBlockManager::GetAllBlockIds(vector<BlockId>* block_ids) {
   vector<vector<BlockId>> block_id_vecs(dds.size());
   vector<Status> statuses(dds.size());
   for (int i = 0; i < dds.size(); i++) {
-    dds[i]->ExecClosure(Bind(&GetAllBlockIdsForDataDir,
-                             env_,
-                             dds[i].get(),
-                             &block_id_vecs[i],
-                             &statuses[i]));
+    auto* dd = dds[i].get();
+    auto* bid_vec = &block_id_vecs[i];
+    auto* s = &statuses[i];
+    dds[i]->ExecClosure([this, dd, bid_vec, s]() {
+      GetAllBlockIdsForDir(this->env_, dd, bid_vec, s);
+    });
   }
-  for (const auto& dd : dd_manager_->data_dirs()) {
+  for (const auto& dd : dd_manager_->dirs()) {
     dd->WaitOnClosures();
   }
 

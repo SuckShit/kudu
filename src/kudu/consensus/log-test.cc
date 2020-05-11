@@ -20,11 +20,11 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -43,8 +43,6 @@
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
-#include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -53,6 +51,7 @@
 #include "kudu/util/debug/sanitizer_scopes.h"
 #include "kudu/util/env.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/file_cache.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/random.h"
 #include "kudu/util/status.h"
@@ -127,13 +126,11 @@ class LogTest : public LogTestBase {
                                        int first_repl_index,
                                        LogReader* reader) {
     string fqp = GetTestPath(strings::Substitute("wal-00000000$0", sequence_number));
-    unique_ptr<WritableFile> w_log_seg;
-    RETURN_NOT_OK(fs_manager_->env()->NewWritableFile(fqp, &w_log_seg));
-    unique_ptr<RandomAccessFile> r_log_seg;
-    RETURN_NOT_OK(fs_manager_->env()->NewRandomAccessFile(fqp, &r_log_seg));
+    shared_ptr<RWFile> log_seg;
+    RETURN_NOT_OK(file_cache_->OpenFile<Env::MUST_CREATE>(fqp, &log_seg));
 
     scoped_refptr<ReadableLogSegment> readable_segment(
-        new ReadableLogSegment(fqp, shared_ptr<RandomAccessFile>(r_log_seg.release())));
+        new ReadableLogSegment(fqp, std::move(log_seg)));
 
     LogSegmentHeaderPB header;
     header.set_sequence_number(sequence_number);
@@ -189,7 +186,7 @@ TEST_P(LogTestOptionalCompression, TestMultipleEntriesInABatch) {
   opid.set_term(1);
   opid.set_index(1);
 
-  AppendNoOpsToLogSync(clock_, log_.get(), &opid, 2);
+  AppendNoOpsToLogSync(clock_.get(), log_.get(), &opid, 2);
 
   // RollOver() the batch so that we have a properly formed footer.
   ASSERT_OK(log_->AllocateSegmentAndRollOverForTests());
@@ -322,9 +319,11 @@ void LogTest::DoCorruptionTest(CorruptionType type, CorruptionPosition place,
   OpId op_id = MakeOpId(1, 1);
   ASSERT_OK(AppendNoOps(&op_id, kNumEntries));
 
-  // Find the entry that we want to corrupt before closing the log.
+  // Find the entry that we want to corrupt and get the active segment path
+  // before closing the log; both will be invalid after.
   LogIndexEntry entry;
   ASSERT_OK(log_->log_index_->GetEntry(4, &entry));
+  string active_segment_path = log_->ActiveSegmentPathForTests();
 
   ASSERT_OK(log_->Close());
 
@@ -340,14 +339,19 @@ void LogTest::DoCorruptionTest(CorruptionType type, CorruptionPosition place,
     default:
       LOG(FATAL) << "unreachable";
   }
-  ASSERT_OK(CorruptLogFile(env_, log_->ActiveSegmentPathForTests(), type, offset));
+  ASSERT_OK(CorruptLogFile(env_, active_segment_path, type, offset));
 
   // Open a new reader -- we don't reuse the existing LogReader from log_
   // because it has a cached header.
   shared_ptr<LogReader> reader;
   ASSERT_OK(LogReader::Open(fs_manager_.get(),
-                            make_scoped_refptr(new LogIndex(env_, log_->log_dir_)),
-                            kTestTablet, nullptr, &reader));
+                            make_scoped_refptr(new LogIndex(env_,
+                                                            file_cache_.get(),
+                                                            log_->log_dir_)),
+                            kTestTablet,
+                            metric_entity_tablet_,
+                            file_cache_.get(),
+                            &reader));
   ASSERT_EQ(1, reader->num_segments());
 
   SegmentSequence segments;
@@ -408,7 +412,12 @@ TEST_P(LogTestOptionalCompression, TestSegmentRollover) {
   ASSERT_OK(log_->Close());
 
   shared_ptr<LogReader> reader;
-  ASSERT_OK(LogReader::Open(fs_manager_.get(), nullptr, kTestTablet, nullptr, &reader));
+  ASSERT_OK(LogReader::Open(fs_manager_.get(),
+                            /*index*/nullptr,
+                            kTestTablet,
+                            metric_entity_tablet_,
+                            file_cache_.get(),
+                            &reader));
   reader->GetSegmentsSnapshot(&segments);
 
   ASSERT_TRUE(segments.back()->HasFooter());
@@ -426,7 +435,7 @@ TEST_P(LogTestOptionalCompression, TestSegmentRollover) {
 }
 
 TEST_F(LogTest, TestWriteAndReadToAndFromInProgressSegment) {
-  FLAGS_log_compression_codec = "none";
+  FLAGS_log_compression_codec = "no_compression";
 
   const int kNumEntries = 4;
   ASSERT_OK(BuildLog());
@@ -756,7 +765,12 @@ TEST_P(LogTestOptionalCompression, TestWriteManyBatches) {
     vector<scoped_refptr<ReadableLogSegment> > segments;
 
     shared_ptr<LogReader> reader;
-    ASSERT_OK(LogReader::Open(fs_manager_.get(), nullptr, kTestTablet, nullptr, &reader));
+    ASSERT_OK(LogReader::Open(fs_manager_.get(),
+                              /*index*/nullptr,
+                              kTestTablet,
+                              metric_entity_tablet_,
+                              file_cache_.get(),
+                              &reader));
     reader->GetSegmentsSnapshot(&segments);
 
     for (const scoped_refptr<ReadableLogSegment>& entry : segments) {
@@ -777,9 +791,10 @@ TEST_P(LogTestOptionalCompression, TestWriteManyBatches) {
 // seg004: 0.30 through 0.39
 TEST_P(LogTestOptionalCompression, TestLogReader) {
   LogReader reader(env_,
-                   scoped_refptr<LogIndex>(),
+                   /*index*/nullptr,
                    kTestTablet,
-                   nullptr);
+                   metric_entity_tablet_,
+                   file_cache_.get());
   reader.InitEmptyReaderForTests();
   ASSERT_OK(AppendNewEmptySegmentToReader(2, 10, &reader));
   ASSERT_OK(AppendNewEmptySegmentToReader(3, 20, &reader));
@@ -912,7 +927,7 @@ void LogTest::AppendTestSequence(const vector<TestLogSequenceElem>& seq) {
       }
       case TestLogSequenceElem::COMMIT:
       {
-        gscoped_ptr<CommitMsg> commit(new CommitMsg);
+        unique_ptr<CommitMsg> commit(new CommitMsg);
         commit->set_op_type(NO_OP);
         commit->mutable_commited_op_id()->CopyFrom(e.id);
         Synchronizer s;
@@ -1050,7 +1065,7 @@ TEST_P(LogTestOptionalCompression, TestReadReplicatesHighIndex) {
 // Test various situations where we expect different segments depending on what the
 // min log index is.
 TEST_F(LogTest, TestGetGCableDataSize) {
-  FLAGS_log_compression_codec = "none";
+  FLAGS_log_compression_codec = "no_compression";
   FLAGS_log_min_segments_to_retain = 2;
   ASSERT_OK(BuildLog());
 
@@ -1134,7 +1149,7 @@ TEST_F(LogTest, TestAutoStopIdleAppendThread) {
   // after the append long enough for the append thread to shut itself down
   // again.
   ASSERT_EVENTUALLY([&]() {
-      AppendNoOpsToLogSync(clock_, log_.get(), &opid, 2);
+      AppendNoOpsToLogSync(clock_.get(), log_.get(), &opid, 2);
       ASSERT_TRUE(log_->append_thread_active_for_tests());
       debug::ScopedTSANIgnoreReadsAndWrites ignore_tsan;
       ASSERT_GT(log_->segment_allocator_.active_segment_->compress_buf_.capacity(),

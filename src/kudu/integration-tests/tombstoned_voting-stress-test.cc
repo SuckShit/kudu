@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <ostream>
@@ -266,6 +267,8 @@ TEST_F(TombstonedVotingStressTest, TestTombstonedVotingUnderStress) {
   // We don't shut this node down because it will serve as the tablet copy
   // "source" during the test.
   LOG(INFO) << "forcing leader to step down...";
+  // The leader role cannot fluctuate in this scenario because of
+  // --enable_leader_failure_detection=false setting.
   ASSERT_OK(itest::LeaderStepDown(ts0_ets, tablet_id_, kTimeout));
 
   // Now we are done with setup. Start the "stress" part of the test.
@@ -296,8 +299,7 @@ TEST_F(TombstonedVotingStressTest, TestTombstonedVotingUnderStress) {
 
     // 2. Copy tablet.
     LOG(INFO) << "copying tablet...";
-    HostPort source_hp;
-    ASSERT_OK(HostPortFromPB(ts0_ets->registration.rpc_addresses(0), &source_hp));
+    HostPort source_hp = HostPortFromPB(ts0_ets->registration.rpc_addresses(0));
     SetState(kCopying);
     ASSERT_OK(itest::StartTabletCopy(ts1_ets, tablet_id_, ts0_ets->uuid(), source_hp, current_term_,
                                      kTimeout));

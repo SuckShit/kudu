@@ -17,7 +17,6 @@
 
 #include "kudu/client/schema.h"
 
-#include <cstdint>
 #include <memory>
 #include <ostream>
 #include <unordered_map>
@@ -35,7 +34,6 @@
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -62,6 +60,7 @@ MAKE_ENUM_LIMITS(kudu::client::KuduColumnSchema::DataType,
                  kudu::client::KuduColumnSchema::BOOL);
 
 using std::string;
+using std::unique_ptr;
 using std::unordered_map;
 using std::vector;
 using strings::Substitute;
@@ -126,6 +125,7 @@ kudu::DataType ToInternalDataType(KuduColumnSchema::DataType type,
     case KuduColumnSchema::INT32: return kudu::INT32;
     case KuduColumnSchema::INT64: return kudu::INT64;
     case KuduColumnSchema::UNIXTIME_MICROS: return kudu::UNIXTIME_MICROS;
+    case KuduColumnSchema::DATE: return kudu::DATE;
     case KuduColumnSchema::FLOAT: return kudu::FLOAT;
     case KuduColumnSchema::DOUBLE: return kudu::DOUBLE;
     case KuduColumnSchema::VARCHAR: return kudu::VARCHAR;
@@ -153,6 +153,7 @@ KuduColumnSchema::DataType FromInternalDataType(kudu::DataType type) {
     case kudu::INT32: return KuduColumnSchema::INT32;
     case kudu::INT64: return KuduColumnSchema::INT64;
     case kudu::UNIXTIME_MICROS: return KuduColumnSchema::UNIXTIME_MICROS;
+    case kudu::DATE: return KuduColumnSchema::DATE;
     case kudu::FLOAT: return KuduColumnSchema::FLOAT;
     case kudu::DOUBLE: return KuduColumnSchema::DOUBLE;
     case kudu::VARCHAR: return KuduColumnSchema::VARCHAR;
@@ -405,6 +406,9 @@ Status KuduColumnSpec::ToColumnSchema(KuduColumnSchema* col) const {
       }
       break;
     case KuduColumnSchema::VARCHAR:
+      if (!data_->length) {
+        return Status::InvalidArgument("no length provided for VARCHAR column", data_->name);
+      }
       if (data_->length.value() < kMinVarcharLength ||
           data_->length.value() > kMaxVarcharLength) {
         return Status::InvalidArgument(
@@ -676,6 +680,8 @@ string KuduColumnSchema::DataTypeToString(DataType type) {
       return "BINARY";
     case UNIXTIME_MICROS:
       return "UNIXTIME_MICROS";
+    case DATE:
+      return "DATE";
     case DECIMAL:
       return "DECIMAL";
     case VARCHAR:
@@ -711,6 +717,10 @@ string KuduColumnSchema::DataTypeToString(DataType type) {
     *type = UNIXTIME_MICROS;
   } else if (type_uc == "DECIMAL") {
     *type = DECIMAL;
+  } else if (type_uc == "VARCHAR") {
+    *type = VARCHAR;
+  } else if (type_uc == "DATE") {
+    *type = DATE;
   } else {
     s = Status::InvalidArgument(Substitute(
         "data type $0 is not supported", type_str));
@@ -812,6 +822,10 @@ KuduSchema::KuduSchema(const Schema& schema)
   : schema_(new Schema(schema)) {
 }
 
+KuduSchema::KuduSchema(Schema&& schema)
+  : schema_(new Schema(schema)) {
+}
+
 KuduSchema::~KuduSchema() {
   delete schema_;
 }
@@ -830,10 +844,11 @@ void KuduSchema::CopyFrom(const KuduSchema& other) {
 
 Status KuduSchema::Reset(const vector<KuduColumnSchema>& columns, int key_columns) {
   vector<ColumnSchema> cols_private;
-  for (const KuduColumnSchema& col : columns) {
-    cols_private.push_back(*col.col_);
+  cols_private.reserve(columns.size());
+  for (const auto& col : columns) {
+    cols_private.emplace_back(*col.col_);
   }
-  gscoped_ptr<Schema> new_schema(new Schema());
+  unique_ptr<Schema> new_schema(new Schema());
   RETURN_NOT_OK(new_schema->Reset(cols_private, key_columns));
 
   delete schema_;
@@ -847,7 +862,7 @@ bool KuduSchema::Equals(const KuduSchema& other) const {
 }
 
 KuduColumnSchema KuduSchema::Column(size_t idx) const {
-  ColumnSchema col(schema_->column(idx));
+  const ColumnSchema& col = schema_->column(idx);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   KuduColumnStorageAttributes attrs(FromInternalEncodingType(col.attributes().encoding),

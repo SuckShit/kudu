@@ -32,7 +32,7 @@
 
 namespace kudu {
 
-class HostPortPB;
+class HostPort;
 class MaintenanceManager;
 class MonoDelta;
 class ThreadPool;
@@ -60,9 +60,11 @@ class Master : public kserver::KuduServer {
   explicit Master(const MasterOptions& opts);
   ~Master();
 
-  virtual Status Init() override;
-  virtual Status Start() override;
-  virtual void Shutdown() override;
+  Status Init() override;
+  Status Start() override;
+  void Shutdown() override {
+    ShutdownImpl();
+  }
 
   Status StartAsync();
   Status WaitForCatalogManagerInit() const;
@@ -103,13 +105,13 @@ class Master : public kserver::KuduServer {
   // Gets the HostPorts for all of the masters in the cluster.
   // This is not as complete as ListMasters() above, but operates just
   // based on local state.
-  Status GetMasterHostPorts(std::vector<HostPortPB>* hostports) const;
+  Status GetMasterHostPorts(std::vector<HostPort>* hostports) const;
 
   // Crash the master on disk error.
-  void CrashMasterOnDiskError(const std::string& uuid);
+  static void CrashMasterOnDiskError(const std::string& uuid);
 
   // Crash the master on CFile corruption.
-  void CrashMasterOnCFileCorruption(const std::string& tablet_id);
+  static void CrashMasterOnCFileCorruption(const std::string& tablet_id);
 
   bool IsShutdown() const {
     return state_ == kStopped;
@@ -129,6 +131,11 @@ class Master : public kserver::KuduServer {
   // Requires that the web server and RPC server have been started.
   Status InitMasterRegistration();
 
+  // A method for internal use in the destructor. Some static code analyzers
+  // issue a warning if calling a virtual function from destructor even if it's
+  // safe in a particular case.
+  void ShutdownImpl();
+
   enum MasterState {
     kStopped,
     kInitialized,
@@ -142,12 +149,12 @@ class Master : public kserver::KuduServer {
   std::unique_ptr<CatalogManager> catalog_manager_;
   std::unique_ptr<MasterPathHandlers> path_handlers_;
 
-  // For initializing the catalog manager.
-  std::unique_ptr<ThreadPool> init_pool_;
-
   // The status of the master initialization. This is set
   // by the async initialization task.
   Promise<Status> init_status_;
+
+  // For initializing the catalog manager.
+  std::unique_ptr<ThreadPool> init_pool_;
 
   MasterOptions opts_;
 

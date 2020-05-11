@@ -14,11 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <ostream>
 #include <string>
 
@@ -26,7 +26,6 @@
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/types.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/fastmem.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/bitmap.h"
@@ -48,12 +47,12 @@ class ColumnBlock {
   typedef ColumnBlockCell Cell;
 
   ColumnBlock(const TypeInfo* type,
-              uint8_t *null_bitmap,
+              uint8_t *non_null_bitmap,
               void *data,
               size_t nrows,
               Arena *arena)
     : type_(type),
-      null_bitmap_(null_bitmap),
+      non_null_bitmap_(non_null_bitmap),
       data_(reinterpret_cast<uint8_t *>(data)),
       nrows_(nrows),
       arena_(arena) {
@@ -62,7 +61,7 @@ class ColumnBlock {
 
   void SetCellIsNull(size_t idx, bool is_null) {
     DCHECK(is_nullable());
-    BitmapChange(null_bitmap_, idx, !is_null);
+    BitmapChange(non_null_bitmap_, idx, !is_null);
   }
 
   void SetCellValue(size_t idx, const void *new_val) {
@@ -89,18 +88,22 @@ class ColumnBlock {
 
   Cell cell(size_t idx) const;
 
-  uint8_t *null_bitmap() const {
-    return null_bitmap_;
+  // Return the bitmap indicating whether each cell is non-NULL.
+  // A set bit indicates non-NULL.
+  //
+  // This returns nullptr for a non-nullable column.
+  uint8_t *non_null_bitmap() const {
+    return non_null_bitmap_;
   }
 
   bool is_nullable() const {
-    return null_bitmap_ != NULL;
+    return non_null_bitmap_ != nullptr;
   }
 
   bool is_null(size_t idx) const {
     DCHECK(is_nullable());
     DCHECK_LT(idx, nrows_);
-    return !BitmapTest(null_bitmap_, idx);
+    return !BitmapTest(non_null_bitmap_, idx);
   }
 
   const size_t stride() const { return type_->size(); }
@@ -156,7 +159,7 @@ class ColumnBlock {
   }
 
   const TypeInfo *type_;
-  uint8_t *null_bitmap_;
+  uint8_t *non_null_bitmap_;
 
   uint8_t *data_;
   size_t nrows_;
@@ -177,7 +180,7 @@ inline bool operator==(const ColumnBlock& a, const ColumnBlock& b) {
 
   // 3. If nullable, same null bitmap contents.
   if (a.is_nullable() &&
-      !BitmapEquals(a.null_bitmap(), b.null_bitmap(), a.nrows())) {
+      !BitmapEquals(a.non_null_bitmap(), b.non_null_bitmap(), a.nrows())) {
     return false;
   }
 
@@ -247,7 +250,7 @@ class ColumnDataView {
   // Set 'nrows' bits of the the null-bitmap to "value"
   // true if not null, false if null.
   void SetNullBits(size_t nrows, bool value) {
-    BitmapChangeBits(column_block_->null_bitmap(), row_offset_, nrows, value);
+    BitmapChangeBits(column_block_->non_null_bitmap(), row_offset_, nrows, value);
   }
 
   uint8_t *data() {
@@ -294,12 +297,12 @@ class ScopedColumnBlock : public ColumnBlock {
                   new cpp_type[n_rows],
                   n_rows,
                   new Arena(1024)),
-      null_bitmap_(null_bitmap()),
+      non_null_bitmap_(non_null_bitmap()),
       data_(reinterpret_cast<cpp_type *>(data())),
       arena_(arena()) {
     if (allow_nulls) {
       // All rows begin null.
-      BitmapChangeBits(null_bitmap(), /*offset=*/ 0, n_rows, /*value=*/ false);
+      BitmapChangeBits(non_null_bitmap(), /*offset=*/ 0, n_rows, /*value=*/ false);
     }
   }
 
@@ -312,9 +315,9 @@ class ScopedColumnBlock : public ColumnBlock {
   }
 
  private:
-  gscoped_array<uint8_t> null_bitmap_;
-  gscoped_array<cpp_type> data_;
-  gscoped_ptr<Arena> arena_;
+  std::unique_ptr<uint8_t[]> non_null_bitmap_;
+  std::unique_ptr<cpp_type[]> data_;
+  std::unique_ptr<Arena> arena_;
 
 };
 

@@ -14,11 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_INTEGRATION_TESTS_TEST_WORKLOAD_H
-#define KUDU_INTEGRATION_TESTS_TEST_WORKLOAD_H
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <ostream>
 #include <string>
 #include <thread>
@@ -29,16 +30,16 @@
 
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/gutil/macros.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
-
-class Status;
 
 namespace cluster {
 class MiniCluster;
@@ -60,6 +61,21 @@ class TestWorkload {
 
   explicit TestWorkload(cluster::MiniCluster* cluster);
   ~TestWorkload();
+
+  // Sets whether the read thread should crash if scanning to the cluster fails
+  // for whatever reason. If set to true, errors will be populated in
+  // 'read_errors_'.
+  void set_read_errors_allowed(bool allowed) {
+    read_errors_allowed_ = allowed;
+  }
+
+  void set_scanner_fault_tolerant(bool fault_tolerant) {
+    fault_tolerant_ = fault_tolerant;
+  }
+
+  void set_scanner_selection(client::KuduClient::ReplicaSelection selection) {
+    selection_ = selection;
+  }
 
   void set_payload_bytes(int n) {
     payload_bytes_ = n;
@@ -117,6 +133,12 @@ class TestWorkload {
   // By default, this triggers a CHECK failure.
   void set_not_found_allowed(bool allowed) {
     not_found_allowed_ = allowed;
+  }
+
+  // Set whether we should attempt to verify the number of rows when scanning.
+  // An incorrect number of rows may be indicative of a stale read.
+  void set_verify_num_rows(bool should_verify) {
+    verify_num_rows_ = should_verify;
   }
 
   // Whether per-row errors with Status::AlreadyPresent() are allowed.
@@ -225,6 +247,12 @@ class TestWorkload {
     return batches_completed_.Load();
   }
 
+  // Returns a copy of the errors seen by the read threads so far.
+  std::vector<Status> read_errors() const {
+    std::lock_guard<simple_spinlock> l(read_error_lock_);
+    return read_errors_;
+  }
+
   client::sp::shared_ptr<client::KuduClient> client() const { return client_; }
 
  private:
@@ -245,12 +273,16 @@ class TestWorkload {
   int write_batch_size_;
   int write_interval_millis_;
   int write_timeout_millis_;
+  bool fault_tolerant_;
+  bool verify_num_rows_;
+  bool read_errors_allowed_;
   bool timeout_allowed_;
   bool not_found_allowed_;
   bool already_present_allowed_;
   bool network_error_allowed_;
   bool remote_error_allowed_;
   WritePattern write_pattern_;
+  client::KuduClient::ReplicaSelection selection_;
   client::KuduSchema schema_;
 
   int num_replicas_;
@@ -266,8 +298,10 @@ class TestWorkload {
 
   std::vector<std::thread> threads_;
 
+  mutable simple_spinlock read_error_lock_;
+  std::vector<Status> read_errors_;
+
   DISALLOW_COPY_AND_ASSIGN(TestWorkload);
 };
 
 } // namespace kudu
-#endif /* KUDU_INTEGRATION_TESTS_TEST_WORKLOAD_H */

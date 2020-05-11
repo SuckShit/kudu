@@ -17,9 +17,9 @@
 
 #include "kudu/fs/fs_manager.h"
 
-#include <algorithm>
 #include <cinttypes>
 #include <ctime>
+#include <functional>
 #include <initializer_list>
 #include <iostream>
 #include <unordered_map>
@@ -38,8 +38,6 @@
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_report.h"
 #include "kudu/fs/log_block_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
@@ -140,7 +138,9 @@ FsManagerOpts::FsManagerOpts()
     metadata_root(FLAGS_fs_metadata_dir),
     block_manager_type(FLAGS_block_manager),
     read_only(false),
-    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES) {
+    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES),
+    file_cache(nullptr),
+    skip_block_manager(false) {
   data_roots = strings::Split(FLAGS_fs_data_dirs, ",", strings::SkipEmpty());
 }
 
@@ -149,21 +149,17 @@ FsManagerOpts::FsManagerOpts(const string& root)
     data_roots({ root }),
     block_manager_type(FLAGS_block_manager),
     read_only(false),
-    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES) {}
-
-FsManager::FsManager(Env* env, const string& root_path)
-  : env_(DCHECK_NOTNULL(env)),
-    opts_(FsManagerOpts(root_path)),
-    error_manager_(new FsErrorManager()),
-    initted_(false) {}
+    update_instances(UpdateInstanceBehavior::UPDATE_AND_IGNORE_FAILURES),
+    file_cache(nullptr),
+    skip_block_manager(false) {}
 
 FsManager::FsManager(Env* env, FsManagerOpts opts)
   : env_(DCHECK_NOTNULL(env)),
     opts_(std::move(opts)),
     error_manager_(new FsErrorManager()),
     initted_(false) {
-DCHECK(opts_.update_instances == UpdateInstanceBehavior::DONT_UPDATE ||
-       !opts_.read_only) << "FsManager can only be for updated if not in read-only mode";
+  DCHECK(opts_.update_instances == UpdateInstanceBehavior::DONT_UPDATE ||
+         !opts_.read_only) << "FsManager can only be for updated if not in read-only mode";
 }
 
 FsManager::~FsManager() {}
@@ -305,10 +301,10 @@ void FsManager::InitBlockManager() {
   bm_opts.read_only = opts_.read_only;
   if (opts_.block_manager_type == "file") {
     block_manager_.reset(new FileBlockManager(
-        env_, dd_manager_.get(), error_manager_.get(), std::move(bm_opts)));
+        env_, dd_manager_.get(), error_manager_.get(), opts_.file_cache, std::move(bm_opts)));
   } else {
     block_manager_.reset(new LogBlockManager(
-        env_, dd_manager_.get(), error_manager_.get(), std::move(bm_opts)));
+        env_, dd_manager_.get(), error_manager_.get(), opts_.file_cache, std::move(bm_opts)));
   }
 }
 
@@ -408,12 +404,12 @@ Status FsManager::Open(FsReport* report) {
   if (!dd_manager_) {
     DataDirManagerOptions dm_opts;
     dm_opts.metric_entity = opts_.metric_entity;
-    dm_opts.block_manager_type = opts_.block_manager_type;
     dm_opts.read_only = opts_.read_only;
+    dm_opts.dir_type = opts_.block_manager_type;
     dm_opts.update_instances = opts_.update_instances;
     LOG_TIMING(INFO, "opening directory manager") {
       RETURN_NOT_OK(DataDirManager::OpenExisting(env_,
-          canonicalized_data_fs_roots_, std::move(dm_opts), &dd_manager_));
+          canonicalized_data_fs_roots_, dm_opts, &dd_manager_));
     }
   }
 
@@ -426,13 +422,17 @@ Status FsManager::Open(FsReport* report) {
   }
 
   // Set an initial error handler to mark data directories as failed.
-  error_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK_ERROR,
-      Bind(&DataDirManager::MarkDataDirFailedByUuid, Unretained(dd_manager_.get())));
+  error_manager_->SetErrorNotificationCb(
+      ErrorHandlerType::DISK_ERROR, [this](const string& uuid) {
+        this->dd_manager_->MarkDirFailedByUuid(uuid);
+      });
 
-  // Finally, initialize and open the block manager.
-  InitBlockManager();
-  LOG_TIMING(INFO, "opening block manager") {
-    RETURN_NOT_OK(block_manager_->Open(report));
+  // Finally, initialize and open the block manager if needed.
+  if (!opts_.skip_block_manager) {
+    InitBlockManager();
+    LOG_TIMING(INFO, "opening block manager") {
+      RETURN_NOT_OK(block_manager_->Open(report));
+    }
   }
 
   // Report wal and metadata directories.
@@ -517,7 +517,7 @@ Status FsManager::CreateInitialFileSystemLayout(boost::optional<string> uuid) {
   dm_opts.read_only = opts_.read_only;
   LOG_TIMING(INFO, "creating directory manager") {
     RETURN_NOT_OK_PREPEND(DataDirManager::CreateNew(
-        env_, canonicalized_data_fs_roots_, std::move(dm_opts), &dd_manager_),
+        env_, canonicalized_data_fs_roots_, dm_opts, &dd_manager_),
                           "Unable to create directory manager");
   }
 
@@ -625,7 +625,7 @@ const string& FsManager::uuid() const {
 
 vector<string> FsManager::GetDataRootDirs() const {
   // Get the data subdirectory for each data root.
-  return dd_manager_->GetDataDirs();
+  return dd_manager_->GetDirs();
 }
 
 string FsManager::GetTabletMetadataDir() const {
@@ -767,15 +767,17 @@ void FsManager::DumpFileSystemTree(ostream& out, const string& prefix,
 
 Status FsManager::CreateNewBlock(const CreateBlockOptions& opts, unique_ptr<WritableBlock>* block) {
   CHECK(!opts_.read_only);
-
+  DCHECK(block_manager_);
   return block_manager_->CreateBlock(opts, block);
 }
 
 Status FsManager::OpenBlock(const BlockId& block_id, unique_ptr<ReadableBlock>* block) {
+  DCHECK(block_manager_);
   return block_manager_->OpenBlock(block_id, block);
 }
 
 bool FsManager::BlockExists(const BlockId& block_id) const {
+  DCHECK(block_manager_);
   unique_ptr<ReadableBlock> block;
   return block_manager_->OpenBlock(block_id, &block).ok();
 }

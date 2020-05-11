@@ -29,13 +29,13 @@
 #include <glog/logging.h>
 
 #include "kudu/common/iterator.h"
+#include "kudu/common/iterator_stats.h"
 #include "kudu/common/row.h"
 #include "kudu/common/rowid.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/gutil/atomicops.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/tablet/concurrent_btree.h"
 #include "kudu/tablet/rowset.h"
@@ -55,7 +55,6 @@ class RowBlock;
 class RowBlockRow;
 class RowChangeList;
 class ScanSpec;
-struct IteratorStats;
 
 namespace fs {
 struct IOContext;
@@ -331,7 +330,7 @@ class MemRowSet : public RowSet,
   virtual Status NewCompactionInput(const Schema* projection,
                                     const MvccSnapshot& snap,
                                     const fs::IOContext* io_context,
-                                    gscoped_ptr<CompactionInput>* out) const override;
+                                    std::unique_ptr<CompactionInput>* out) const override;
 
   // Return the Schema for the rows in this memrowset.
    const Schema &schema() const {
@@ -391,6 +390,13 @@ class MemRowSet : public RowSet,
                                                      int64_t* bytes) override {
     DCHECK(bytes);
     *bytes = 0;
+    return Status::OK();
+  }
+
+  Status IsDeletedAndFullyAncient(Timestamp /*ancient_history_mark*/,
+                                  bool* deleted_and_ancient) override {
+    DCHECK(deleted_and_ancient);
+    *deleted_and_ancient = false;
     return Status::OK();
   }
 
@@ -507,10 +513,9 @@ class MemRowSet::Iterator : public RowwiseIterator {
 
   // NOTE: This method will return a MRSRow with the MemRowSet schema.
   //       The row is NOT projected using the schema specified to the iterator.
-  const MRSRow GetCurrentRow() const {
+  MRSRow GetCurrentRow() const {
     DCHECK_NE(state_, kUninitialized) << "not initted";
-    Slice dummy, mrsrow_data;
-    iter_->GetCurrentEntry(&dummy, &mrsrow_data);
+    Slice mrsrow_data = iter_->GetCurrentValue();
     return MRSRow(memrowset_.get(), mrsrow_data);
   }
 
@@ -593,7 +598,7 @@ class MemRowSet::Iterator : public RowwiseIterator {
                                       ApplyStatus* apply_status);
 
   const std::shared_ptr<const MemRowSet> memrowset_;
-  gscoped_ptr<MemRowSet::MSBTIter> iter_;
+  std::unique_ptr<MemRowSet::MSBTIter> iter_;
 
   const RowIteratorOptions opts_;
 
@@ -601,7 +606,7 @@ class MemRowSet::Iterator : public RowwiseIterator {
   // Relies on the MRSRowProjector interface to abstract from the two
   // different implementations of the RowProjector, which may change
   // at runtime (using vs. not using code generation).
-  const gscoped_ptr<MRSRowProjector> projector_;
+  const std::unique_ptr<MRSRowProjector> projector_;
   DeltaProjector delta_projector_;
 
   // The index of the first IS_DELETED virtual column in the projection schema,

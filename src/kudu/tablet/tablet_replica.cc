@@ -23,12 +23,10 @@
 #include <mutex>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include <glog/logging.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/consensus/consensus.pb.h"
@@ -38,10 +36,9 @@
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/raft_consensus.h"
+#include "kudu/consensus/time_manager.h"
 #include "kudu/fs/data_dirs.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -105,12 +102,14 @@ namespace tablet {
 using consensus::ConsensusBootstrapInfo;
 using consensus::ConsensusOptions;
 using consensus::ConsensusRound;
+using consensus::MarkDirtyCallback;
 using consensus::OpId;
 using consensus::PeerProxyFactory;
 using consensus::RaftConfigPB;
 using consensus::RaftPeerPB;
 using consensus::RaftConsensus;
 using consensus::RpcPeerProxyFactory;
+using consensus::ServerContext;
 using consensus::TimeManager;
 using consensus::ALTER_SCHEMA_OP;
 using consensus::WRITE_OP;
@@ -131,13 +130,13 @@ TabletReplica::TabletReplica(
     scoped_refptr<consensus::ConsensusMetadataManager> cmeta_manager,
     consensus::RaftPeerPB local_peer_pb,
     ThreadPool* apply_pool,
-    Callback<void(const std::string& reason)> mark_dirty_clbk)
+    MarkDirtyCallback cb)
     : meta_(DCHECK_NOTNULL(std::move(meta))),
       cmeta_manager_(DCHECK_NOTNULL(std::move(cmeta_manager))),
       local_peer_pb_(std::move(local_peer_pb)),
       log_anchor_registry_(new LogAnchorRegistry()),
       apply_pool_(apply_pool),
-      mark_dirty_clbk_(std::move(mark_dirty_clbk)),
+      mark_dirty_clbk_(std::move(cb)),
       state_(NOT_INITIALIZED),
       last_status_("Tablet initializing...") {
 }
@@ -149,7 +148,7 @@ TabletReplica::~TabletReplica() {
       << TabletStatePB_Name(state_);
 }
 
-Status TabletReplica::Init(ThreadPool* raft_pool) {
+Status TabletReplica::Init(ServerContext server_ctx) {
   CHECK_EQ(NOT_INITIALIZED, state_);
   TRACE("Creating consensus instance");
   SetStatusMessage("Initializing consensus...");
@@ -159,7 +158,7 @@ Status TabletReplica::Init(ThreadPool* raft_pool) {
   RETURN_NOT_OK(RaftConsensus::Create(std::move(options),
                                       local_peer_pb_,
                                       cmeta_manager_,
-                                      raft_pool,
+                                      std::move(server_ctx),
                                       &consensus));
   consensus_ = std::move(consensus);
   set_state(INITIALIZED);
@@ -169,7 +168,7 @@ Status TabletReplica::Init(ThreadPool* raft_pool) {
 
 Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
                             shared_ptr<Tablet> tablet,
-                            scoped_refptr<clock::Clock> clock,
+                            clock::Clock* clock,
                             shared_ptr<Messenger> messenger,
                             scoped_refptr<ResultTracker> result_tracker,
                             scoped_refptr<Log> log,
@@ -183,13 +182,13 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
 
     scoped_refptr<MetricEntity> metric_entity;
     unique_ptr<PeerProxyFactory> peer_proxy_factory;
-    scoped_refptr<TimeManager> time_manager;
+    unique_ptr<TimeManager> time_manager;
     {
       std::lock_guard<simple_spinlock> l(lock_);
       CHECK_EQ(BOOTSTRAPPING, state_);
 
       tablet_ = DCHECK_NOTNULL(std::move(tablet));
-      clock_ = DCHECK_NOTNULL(std::move(clock));
+      clock_ = DCHECK_NOTNULL(clock);
       messenger_ = DCHECK_NOTNULL(std::move(messenger));
       result_tracker_ = std::move(result_tracker); // Passed null in tablet_replica-test
       log_ = DCHECK_NOTNULL(log); // Not moved because it's passed to RaftConsensus::Start() below.
@@ -208,15 +207,14 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
         txn_tracker_.StartInstrumentation(tablet_->GetMetricEntity());
 
         METRIC_on_disk_size.InstantiateFunctionGauge(
-            tablet_->GetMetricEntity(), Bind(&TabletReplica::OnDiskSize, Unretained(this)))
+            tablet_->GetMetricEntity(), [this]() { return this->OnDiskSize(); })
             ->AutoDetach(&metric_detacher_);
         METRIC_state.InstantiateFunctionGauge(
-            tablet_->GetMetricEntity(), Bind(&TabletReplica::StateName, Unretained(this)))
+            tablet_->GetMetricEntity(), [this]() { return this->StateName(); })
             ->AutoDetach(&metric_detacher_);
         if (tablet_->metadata()->supports_live_row_count()) {
           METRIC_live_row_count.InstantiateFunctionGauge(
-              tablet_->GetMetricEntity(),
-              Bind(&TabletReplica::CountLiveRowsNoFail, Unretained(this)))
+              tablet_->GetMetricEntity(), [this]() { return this->CountLiveRowsNoFail(); })
               ->AutoDetach(&metric_detacher_);
         } else {
           METRIC_live_row_count.InstantiateInvalid(tablet_->GetMetricEntity(), 0);
@@ -254,9 +252,6 @@ Status TabletReplica::Start(const ConsensusBootstrapInfo& bootstrap_info,
     CHECK_EQ(BOOTSTRAPPING, state_); // We are still protected by 'state_change_lock_'.
     set_state(RUNNING);
   }
-
-  // Because we changed the tablet state, we need to re-report the tablet to the master.
-  mark_dirty_clbk_.Run("Started TabletReplica");
 
   return Status::OK();
 }
@@ -430,10 +425,10 @@ Status TabletReplica::SubmitWrite(unique_ptr<WriteTransactionState> state) {
   RETURN_NOT_OK(CheckRunning());
 
   state->SetResultTracker(result_tracker_);
-  gscoped_ptr<WriteTransaction> transaction(new WriteTransaction(std::move(state),
+  unique_ptr<WriteTransaction> transaction(new WriteTransaction(std::move(state),
                                                                  consensus::LEADER));
   scoped_refptr<TransactionDriver> driver;
-  RETURN_NOT_OK(NewLeaderTransactionDriver(transaction.PassAs<Transaction>(),
+  RETURN_NOT_OK(NewLeaderTransactionDriver(std::move(transaction),
                                            &driver));
   return driver->ExecuteAsync();
 }
@@ -441,10 +436,10 @@ Status TabletReplica::SubmitWrite(unique_ptr<WriteTransactionState> state) {
 Status TabletReplica::SubmitAlterSchema(unique_ptr<AlterSchemaTransactionState> state) {
   RETURN_NOT_OK(CheckRunning());
 
-  gscoped_ptr<AlterSchemaTransaction> transaction(
+  unique_ptr<AlterSchemaTransaction> transaction(
       new AlterSchemaTransaction(std::move(state), consensus::LEADER));
   scoped_refptr<TransactionDriver> driver;
-  RETURN_NOT_OK(NewLeaderTransactionDriver(transaction.PassAs<Transaction>(), &driver));
+  RETURN_NOT_OK(NewLeaderTransactionDriver(std::move(transaction), &driver));
   return driver->ExecuteAsync();
 }
 
@@ -620,7 +615,7 @@ Status TabletReplica::StartFollowerTransaction(const scoped_refptr<ConsensusRoun
 
   consensus::ReplicateMsg* replicate_msg = round->replicate_msg();
   DCHECK(replicate_msg->has_timestamp());
-  gscoped_ptr<Transaction> transaction;
+  unique_ptr<Transaction> transaction;
   switch (replicate_msg->op_type()) {
     case WRITE_OP:
     {
@@ -659,10 +654,9 @@ Status TabletReplica::StartFollowerTransaction(const scoped_refptr<ConsensusRoun
   RETURN_NOT_OK(NewReplicaTransactionDriver(std::move(transaction), &driver));
 
   // A raw pointer is required to avoid a refcount cycle.
+  auto* driver_raw = driver.get();
   state->consensus_round()->SetConsensusReplicatedCallback(
-      std::bind(&TransactionDriver::ReplicationFinished,
-                driver.get(),
-                std::placeholders::_1));
+      [driver_raw](const Status& s) { driver_raw->ReplicationFinished(s); });
 
   RETURN_NOT_OK(driver->ExecuteAsync());
   return Status::OK();
@@ -696,16 +690,16 @@ void TabletReplica::FinishConsensusOnlyRound(ConsensusRound* round) {
     // TabletReplica::Stop() stops RaftConsensus before it stops the prepare
     // pool token and this callback is invoked while the RaftConsensus lock is
     // held.
-    CHECK_OK(prepare_pool_token_->SubmitFunc([this, ts] {
+    CHECK_OK(prepare_pool_token_->Submit([this, ts] {
       std::lock_guard<simple_spinlock> l(lock_);
       if (state_ == RUNNING || state_ == BOOTSTRAPPING) {
-        tablet_->mvcc_manager()->AdjustSafeTime(Timestamp(ts));
+        tablet_->mvcc_manager()->AdjustNewTransactionLowerBound(Timestamp(ts));
       }
     }));
   }
 }
 
-Status TabletReplica::NewLeaderTransactionDriver(gscoped_ptr<Transaction> transaction,
+Status TabletReplica::NewLeaderTransactionDriver(unique_ptr<Transaction> transaction,
                                                  scoped_refptr<TransactionDriver>* driver) {
   scoped_refptr<TransactionDriver> tx_driver = new TransactionDriver(
     &txn_tracker_,
@@ -715,12 +709,12 @@ Status TabletReplica::NewLeaderTransactionDriver(gscoped_ptr<Transaction> transa
     apply_pool_,
     &txn_order_verifier_);
   RETURN_NOT_OK(tx_driver->Init(std::move(transaction), consensus::LEADER));
-  driver->swap(tx_driver);
+  *driver = std::move(tx_driver);
 
   return Status::OK();
 }
 
-Status TabletReplica::NewReplicaTransactionDriver(gscoped_ptr<Transaction> transaction,
+Status TabletReplica::NewReplicaTransactionDriver(unique_ptr<Transaction> transaction,
                                                   scoped_refptr<TransactionDriver>* driver) {
   scoped_refptr<TransactionDriver> tx_driver = new TransactionDriver(
     &txn_tracker_,
@@ -730,7 +724,7 @@ Status TabletReplica::NewReplicaTransactionDriver(gscoped_ptr<Transaction> trans
     apply_pool_,
     &txn_order_verifier_);
   RETURN_NOT_OK(tx_driver->Init(std::move(transaction), consensus::REPLICA));
-  driver->swap(tx_driver);
+  *driver = std::move(tx_driver);
 
   return Status::OK();
 }
@@ -748,15 +742,15 @@ void TabletReplica::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
 
   vector<MaintenanceOp*> maintenance_ops;
 
-  gscoped_ptr<MaintenanceOp> mrs_flush_op(new FlushMRSOp(this));
+  unique_ptr<MaintenanceOp> mrs_flush_op(new FlushMRSOp(this));
   maint_mgr->RegisterOp(mrs_flush_op.get());
   maintenance_ops.push_back(mrs_flush_op.release());
 
-  gscoped_ptr<MaintenanceOp> dms_flush_op(new FlushDeltaMemStoresOp(this));
+  unique_ptr<MaintenanceOp> dms_flush_op(new FlushDeltaMemStoresOp(this));
   maint_mgr->RegisterOp(dms_flush_op.get());
   maintenance_ops.push_back(dms_flush_op.release());
 
-  gscoped_ptr<MaintenanceOp> log_gc(new LogGCOp(this));
+  unique_ptr<MaintenanceOp> log_gc(new LogGCOp(this));
   maint_mgr->RegisterOp(log_gc.get());
   maintenance_ops.push_back(log_gc.release());
 
@@ -764,7 +758,7 @@ void TabletReplica::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
   {
     std::lock_guard<simple_spinlock> l(lock_);
     DCHECK(maintenance_ops_.empty());
-    maintenance_ops_.swap(maintenance_ops);
+    maintenance_ops_ = std::move(maintenance_ops);
     tablet = tablet_;
   }
   tablet->RegisterMaintenanceOps(maint_mgr);
@@ -782,7 +776,7 @@ void TabletReplica::UnregisterMaintenanceOps() {
   vector<MaintenanceOp*> maintenance_ops;
   {
     std::lock_guard<simple_spinlock> l(lock_);
-    maintenance_ops.swap(maintenance_ops_);
+    maintenance_ops = std::move(maintenance_ops_);
   }
   for (MaintenanceOp* op : maintenance_ops) {
     op->Unregister();
@@ -859,7 +853,7 @@ void TabletReplica::UpdateTabletStats(vector<string>* dirty_tablets) {
     if (consensus::RaftPeerPB_Role_LEADER == role) {
       dirty_tablets->emplace_back(tablet_id());
     }
-    stats_pb_.Swap(&pb);
+    stats_pb_ = std::move(pb);
   }
 }
 

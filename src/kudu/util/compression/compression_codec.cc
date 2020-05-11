@@ -17,7 +17,6 @@
 
 #include "kudu/util/compression/compression_codec.h"
 
-#include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -276,7 +275,7 @@ CompressionType GetCompressionCodecType(const std::string& name) {
     return LZ4;
   if (uname == "ZLIB")
     return ZLIB;
-  if (uname == "NONE")
+  if (uname == "NO_COMPRESSION")
     return NO_COMPRESSION;
 
   LOG(WARNING) << "Unable to recognize the compression codec '" << name

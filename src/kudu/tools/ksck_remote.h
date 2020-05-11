@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/tools/ksck.h"
@@ -56,6 +56,7 @@ class GenericServiceProxy;
 
 namespace tserver {
 class TabletServerServiceProxy;
+class TabletServerAdminServiceProxy;
 }
 
 namespace tools {
@@ -81,7 +82,7 @@ class RemoteKsckMaster : public KsckMaster {
   // Gathers consensus state for the master tablet.
   Status FetchConsensusState() override;
 
-  Status FetchUnusualFlags() override;
+  Status FetchFlags(const std::vector<FlagsCategory>& categories) override;
 
  private:
   std::shared_ptr<rpc::Messenger> messenger_;
@@ -110,10 +111,12 @@ class RemoteKsckTabletServer : public KsckTabletServer,
 
   Status FetchConsensusState(cluster_summary::ServerHealth* health) override;
 
-  Status FetchUnusualFlags() override;
+  Status FetchFlags(const std::vector<FlagsCategory>& categories) override;
 
   void FetchCurrentTimestampAsync() override;
   Status FetchCurrentTimestamp() override;
+
+  void FetchQuiescingInfo() override;
 
   void RunTabletChecksumScanAsync(
       const std::string& tablet_id,
@@ -148,6 +151,7 @@ class RemoteKsckTabletServer : public KsckTabletServer,
   const std::shared_ptr<rpc::Messenger> messenger_;
   std::shared_ptr<server::GenericServiceProxy> generic_proxy_;
   std::shared_ptr<tserver::TabletServerServiceProxy> ts_proxy_;
+  std::shared_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy_;
   std::shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy_;
 };
 

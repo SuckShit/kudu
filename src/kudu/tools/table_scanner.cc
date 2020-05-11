@@ -28,10 +28,8 @@
 #include <set>
 
 #include <boost/algorithm/string/predicate.hpp>
-#include <boost/bind.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <rapidjson/document.h>
 
@@ -380,7 +378,7 @@ Status CreateDstTableIfNeeded(const client::sp::shared_ptr<KuduTable>& src_table
   };
 
   // Table schema and replica number.
-  gscoped_ptr<KuduTableCreator> table_creator(dst_client->NewTableCreator());
+  unique_ptr<KuduTableCreator> table_creator(dst_client->NewTableCreator());
   table_creator->table_name(dst_table_name)
       .schema(&dst_table_schema)
       .num_replicas(src_table->num_replicas());
@@ -502,8 +500,9 @@ void TableScanner::ScanTask(const vector<KuduScanToken *>& tokens, Status* threa
     if (out_ && FLAGS_show_values) {
       MutexLock l(output_lock_);
       for (const auto& row : batch) {
-        *out_ << row.ToString() << endl;
+        *out_ << row.ToString() << "\n";
       }
+      out_->flush();
     }
   });
 }
@@ -530,16 +529,6 @@ void TableScanner::CopyTask(const vector<KuduScanToken*>& tokens, Status* thread
   });
 }
 
-void TableScanner::MonitorTask() {
-  MonoTime last_log_time = MonoTime::Now();
-  while (thread_pool_->num_threads() > 1) {    // Some other table scan thread is running.
-    if (MonoTime::Now() - last_log_time >= MonoDelta::FromSeconds(5)) {
-      LOG(INFO) << "Scanned count: " << total_count_.Load();
-      last_log_time = MonoTime::Now();
-    }
-    SleepFor(MonoDelta::FromMilliseconds(100));
-  }
-}
 
 void TableScanner::SetOutput(ostream* out) {
   out_ = out;
@@ -590,7 +579,7 @@ Status TableScanner::StartWork(WorkType type) {
   const set<string>& tablet_id_filters = Split(FLAGS_tablets, ",", strings::SkipWhitespace());
   map<int, vector<KuduScanToken*>> thread_tokens;
   int i = 0;
-  for (auto token : tokens) {
+  for (auto* token : tokens) {
     if (tablet_id_filters.empty() || ContainsKey(tablet_id_filters, token->tablet().id())) {
       thread_tokens[i++ % FLAGS_num_threads].emplace_back(token);
     }
@@ -600,7 +589,7 @@ Status TableScanner::StartWork(WorkType type) {
   vector<Status> thread_statuses(FLAGS_num_threads);
 
   RETURN_NOT_OK(ThreadPoolBuilder("table_scan_pool")
-                  .set_max_threads(FLAGS_num_threads + 1)  // add extra 1 thread for MonitorTask
+                  .set_max_threads(FLAGS_num_threads)
                   .set_idle_timeout(MonoDelta::FromMilliseconds(1))
                   .Build(&thread_pool_));
 
@@ -608,17 +597,20 @@ Status TableScanner::StartWork(WorkType type) {
   Stopwatch sw(Stopwatch::THIS_THREAD);
   sw.start();
   for (i = 0; i < FLAGS_num_threads; ++i) {
+    auto* t_tokens = &thread_tokens[i];
+    auto* t_status = &thread_statuses[i];
     if (type == WorkType::kScan) {
-      RETURN_NOT_OK(thread_pool_->SubmitFunc(
-        boost::bind(&TableScanner::ScanTask, this, thread_tokens[i], &thread_statuses[i])));
+      RETURN_NOT_OK(thread_pool_->Submit([this, t_tokens, t_status]()
+                                         { this->ScanTask(*t_tokens, t_status); }));
     } else {
       CHECK(type == WorkType::kCopy);
-      RETURN_NOT_OK(thread_pool_->SubmitFunc(
-        boost::bind(&TableScanner::CopyTask, this, thread_tokens[i], &thread_statuses[i])));
+      RETURN_NOT_OK(thread_pool_->Submit([this, t_tokens, t_status]()
+                                         { this->CopyTask(*t_tokens, t_status); }));
     }
   }
-  RETURN_NOT_OK(thread_pool_->SubmitFunc(boost::bind(&TableScanner::MonitorTask, this)));
-  thread_pool_->Wait();
+  while (!thread_pool_->WaitFor(MonoDelta::FromSeconds(5))) {
+    LOG(INFO) << "Scanned count: " << total_count_.Load();
+  }
   thread_pool_->Shutdown();
 
   sw.stop();

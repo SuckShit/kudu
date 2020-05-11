@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 #pragma once
 
 #include <cstddef>
@@ -30,11 +29,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/schema.h"
 #include "kudu/fs/io_context.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
@@ -48,6 +45,7 @@
 #include "kudu/util/bloom_filter.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/rw_semaphore.h"
 #include "kudu/util/semaphore.h"
 #include "kudu/util/status.h"
@@ -61,7 +59,6 @@ class MaintenanceManager;
 class MaintenanceOp;
 class MaintenanceOpStats;
 class MemTracker;
-class MonoDelta;
 class RowBlock;
 class ScanSpec;
 class Throttler;
@@ -69,9 +66,13 @@ class Timestamp;
 struct IterWithBounds;
 struct IteratorStats;
 
+namespace clock {
+class Clock;
+} // namespace clock
+
 namespace log {
 class LogAnchorRegistry;
-}
+} // namespace log
 
 namespace tablet {
 
@@ -102,7 +103,7 @@ class Tablet {
   // If 'metric_registry' is non-NULL, then this tablet will create a 'tablet' entity
   // within the provided registry. Otherwise, no metrics are collected.
   Tablet(scoped_refptr<TabletMetadata> metadata,
-         scoped_refptr<clock::Clock> clock,
+         clock::Clock* clock,
          std::shared_ptr<MemTracker> parent_mem_tracker,
          MetricRegistry* metric_registry,
          scoped_refptr<log::LogAnchorRegistry> log_anchor_registry);
@@ -332,10 +333,31 @@ class Tablet {
   // Find and delete all undo delta blocks that have a maximum op timestamp
   // prior to the current ancient history mark. If this method returns OK, the
   // number of blocks and bytes deleted are returned in the out-parameters.
+  //
+  // Returns an error if the metadata update fails. Upon failure, no in-memory
+  // state is change.
   Status DeleteAncientUndoDeltas(int64_t* blocks_deleted = nullptr,
                                  int64_t* bytes_deleted = nullptr);
 
-  // Count the number of deltas in the tablet. Only used for tests.
+  // Returns the number of bytes potentially used by rowsets that have no live
+  // rows and are entirely ancient.
+  //
+  // These checks may not touch on-disk block data if we can determine from the
+  // live row count that the rowsets aren't fully deleted, or from the DMS that
+  // the latest update is not considered ancient. If there is no DMS, looks at
+  // the newest redo but doesn't initialize it. As such, since we may miss out
+  // on counting rowsets we haven't initialized yet, this may be an
+  // underestimate.
+  Status GetBytesInAncientDeletedRowsets(int64_t* bytes_in_ancient_deleted_rowsets);
+
+  // Finds and GCs all fully deleted rowsets that have a maximum op timestamp
+  // prior to the current ancient history mark.
+  //
+  // Returns an error if the metadata update fails. Upon failure, no in-memory
+  // state is change.
+  Status DeleteAncientDeletedRowsets();
+
+  // Counts the number of deltas in the tablet. Only used for tests.
   int64_t CountUndoDeltasForTests() const;
   int64_t CountRedoDeltasForTests() const;
 
@@ -440,7 +462,7 @@ class Tablet {
   // Return true if this RPC is allowed.
   bool ShouldThrottleAllow(int64_t bytes);
 
-  scoped_refptr<clock::Clock> clock() const { return clock_; }
+  clock::Clock* clock() const { return clock_; }
 
   std::string LogPrefix() const;
 
@@ -457,6 +479,11 @@ class Tablet {
                      const std::vector<ColumnId>& column_ids,
                      uint64 target_chunk_size,
                      std::vector<KeyRange>* ranges);
+
+  // Update the last read operation timestamp.
+  // NOTE: It's a const function, because we have to call it in Iterator, where Tablet is a const
+  // variable there.
+  void UpdateLastReadTime() const;
 
  private:
   friend class kudu::AlterTableTest;
@@ -538,8 +565,8 @@ class Tablet {
   // Validate the given update/delete operation.
   static Status ValidateMutateUnlocked(const RowOp& op);
 
-  // Perform an INSERT or UPSERT operation, assuming that the transaction is already in
-  // prepared state. This state ensures that:
+  // Perform an INSERT, INSERT_IGNORE, or UPSERT operation, assuming that the transaction is
+  // already in a prepared state. This state ensures that:
   // - the row lock is acquired
   // - the tablet components have been acquired
   // - the operation has been decoded
@@ -659,6 +686,13 @@ class Tablet {
   static int64_t GetReplaySizeForIndex(int64_t min_log_index,
                                        const ReplaySizeMap& size_map);
 
+  // The elapsed time, in seconds, since the last read operation on this tablet, or since this
+  // Tablet object was created on current tserver if it hasn't been read since then.
+  uint64_t LastReadElapsedSeconds() const;
+
+  // Same as LastReadElapsedSeconds(), but for write operation.
+  uint64_t LastWriteElapsedSeconds() const;
+
   // Test-only lock that synchronizes access to AssignTimestampAndStartTransactionForTests().
   // Tests that use LocalTabletWriter take this lock to synchronize timestamp assignment,
   // transaction start and safe time adjustment.
@@ -708,20 +742,19 @@ class Tablet {
   TabletMemTrackers mem_trackers_;
 
   scoped_refptr<MetricEntity> metric_entity_;
-  gscoped_ptr<TabletMetrics> metrics_;
-  FunctionGaugeDetacher metric_detacher_;
+  std::unique_ptr<TabletMetrics> metrics_;
 
   std::unique_ptr<Throttler> throttler_;
 
   int64_t next_mrs_id_;
 
   // A pointer to the server's clock.
-  scoped_refptr<clock::Clock> clock_;
+  clock::Clock* clock_;
 
   MvccManager mvcc_;
   LockManager lock_manager_;
 
-  gscoped_ptr<CompactionPolicy> compaction_policy_;
+  std::unique_ptr<CompactionPolicy> compaction_policy_;
 
   // Lock protecting the selection of rowsets for compaction.
   // Only one thread may run the compaction selection algorithm at a time
@@ -751,6 +784,15 @@ class Tablet {
   std::shared_ptr<FlushCompactCommonHooks> common_hooks_;
 
   std::vector<MaintenanceOp*> maintenance_ops_;
+
+  // Lock protecting access to 'last_write_time_' and 'last_read_time_'.
+  mutable rw_spinlock last_rw_time_lock_;
+  MonoTime last_write_time_;
+  mutable MonoTime last_read_time_;
+
+  // NOTE: it's important that this is the first member to be destructed. This
+  // ensures we do not attempt to collect metrics while calling the destructor.
+  FunctionGaugeDetacher metric_detacher_;
 
   DISALLOW_COPY_AND_ASSIGN(Tablet);
 };

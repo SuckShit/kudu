@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -30,7 +31,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/clock/logical_clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/row.h"
@@ -85,7 +85,7 @@ class TestMemRowSet : public KuduTest {
       log_anchor_registry_(new LogAnchorRegistry()),
       schema_(CreateSchema()),
       key_schema_(schema_.CreateKeyProjection()),
-      clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
+      clock_(Timestamp::kInitialTimestamp) {
   }
 
   static Schema CreateSchema() {
@@ -146,7 +146,7 @@ class TestMemRowSet : public KuduTest {
   }
 
   Status InsertRow(MemRowSet *mrs, const string &key, uint32_t val) {
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     RowBuilder rb(&schema_);
     rb.AddString(key);
     rb.AddUint32(val);
@@ -160,7 +160,7 @@ class TestMemRowSet : public KuduTest {
                    const string &key,
                    uint32_t new_val,
                    OperationResultPB* result) {
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
 
     mutation_buf_.clear();
@@ -183,7 +183,7 @@ class TestMemRowSet : public KuduTest {
   }
 
   Status DeleteRow(MemRowSet *mrs, const string &key, OperationResultPB* result) {
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
 
     mutation_buf_.clear();
@@ -259,7 +259,7 @@ class TestMemRowSet : public KuduTest {
   faststring mutation_buf_;
   const Schema schema_;
   const Schema key_schema_;
-  scoped_refptr<clock::Clock> clock_;
+  clock::LogicalClock clock_;
   MvccManager mvcc_;
 };
 
@@ -307,7 +307,7 @@ TEST_F(TestMemRowSet, TestInsertAndIterateCompoundKey) {
 
   RowBuilder rb(&compound_key_schema);
   {
-    ScopedTransaction tx(&mvcc_, clock_->Now());
+    ScopedTransaction tx(&mvcc_, clock_.Now());
     tx.StartApplying();
     rb.AddString(string("hello world"));
     rb.AddInt32(1);
@@ -318,7 +318,7 @@ TEST_F(TestMemRowSet, TestInsertAndIterateCompoundKey) {
   }
 
   {
-    ScopedTransaction tx2(&mvcc_, clock_->Now());
+    ScopedTransaction tx2(&mvcc_, clock_.Now());
     tx2.StartApplying();
     rb.Reset();
     rb.AddString(string("goodbye world"));
@@ -330,7 +330,7 @@ TEST_F(TestMemRowSet, TestInsertAndIterateCompoundKey) {
   }
 
   {
-    ScopedTransaction tx3(&mvcc_, clock_->Now());
+    ScopedTransaction tx3(&mvcc_, clock_.Now());
     tx3.StartApplying();
     rb.Reset();
     rb.AddString(string("goodbye world"));
@@ -547,7 +547,7 @@ TEST_F(TestMemRowSet, TestInsertionMVCC) {
   // Insert 5 rows in tx 0 through 4
   for (uint32_t i = 0; i < 5; i++) {
     {
-      ScopedTransaction tx(&mvcc_, clock_->Now());
+      ScopedTransaction tx(&mvcc_, clock_.Now());
       tx.StartApplying();
       RowBuilder rb(&schema_);
       char keybuf[256];

@@ -26,6 +26,9 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <ostream>
 #include <string>
@@ -45,6 +48,7 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -66,8 +70,8 @@ DEFINE_string(builtin_ntp_servers,
               "3.pool.ntp.org",
               "The NTP servers used by the built-in NTP client, in format "
               "<FQDN|IP>[:PORT]. These will only be used if the built-in NTP "
-              "client is enabled.");
-TAG_FLAG(builtin_ntp_servers, evolving);
+              "client is enabled (i.e. if setting --time_source=builtin).");
+TAG_FLAG(builtin_ntp_servers, stable);
 
 // In the 'Best practices' section, RFC 4330 states that 15 seconds is the
 // minimum allowed polling interval.
@@ -82,7 +86,6 @@ DEFINE_uint32(builtin_ntp_poll_interval_ms, 16000,
               "The time between successive polls of a single NTP server "
               "(in milliseconds)");
 TAG_FLAG(builtin_ntp_poll_interval_ms, advanced);
-TAG_FLAG(builtin_ntp_poll_interval_ms, evolving);
 TAG_FLAG(builtin_ntp_poll_interval_ms, runtime);
 
 DEFINE_string(builtin_ntp_client_bind_address, "0.0.0.0",
@@ -93,7 +96,6 @@ DEFINE_string(builtin_ntp_client_bind_address, "0.0.0.0",
               "to customize this flag if getting through a firewall to "
               "reach public NTP servers specified by --builtin_ntp_servers.");
 TAG_FLAG(builtin_ntp_client_bind_address, advanced);
-TAG_FLAG(builtin_ntp_client_bind_address, evolving);
 
 DEFINE_uint32(builtin_ntp_request_timeout_ms, 3000,
               "Timeout for requests sent to NTP servers (in milliseconds)");
@@ -105,6 +107,36 @@ DEFINE_uint32(builtin_ntp_true_time_refresh_max_interval_s, 3600,
               "true time estimation (in seconds)");
 TAG_FLAG(builtin_ntp_true_time_refresh_max_interval_s, experimental);
 TAG_FLAG(builtin_ntp_true_time_refresh_max_interval_s, runtime);
+
+METRIC_DEFINE_gauge_int64(server, builtin_ntp_local_clock_delta,
+                          "Local Clock vs Built-In NTP True Time Delta",
+                          kudu::MetricUnit::kMilliseconds,
+                          "Delta between local clock and true time "
+                          "tracked by built-in NTP client; set to "
+                          "2^63-1 when true time is not tracked",
+                          kudu::MetricLevel::kInfo);
+
+METRIC_DEFINE_gauge_int64(server, builtin_ntp_time,
+                          "Built-in NTP Time",
+                          kudu::MetricUnit::kMicroseconds,
+                          "Latest true time as tracked by "
+                          "built-in NTP client",
+                          kudu::MetricLevel::kDebug);
+
+METRIC_DEFINE_gauge_int64(server, builtin_ntp_error,
+                          "Built-in NTP Latest Maximum Time Error",
+                          kudu::MetricUnit::kMicroseconds,
+                          "Latest maximum time error as tracked by "
+                          "built-in NTP client",
+                          kudu::MetricLevel::kInfo);
+
+METRIC_DEFINE_histogram(server, builtin_ntp_max_errors,
+                        "Built-In NTP Maximum Time Errors",
+                        kudu::MetricUnit::kMicroseconds,
+                        "Statistics on the maximum true time error computed by "
+                        "built-in NTP client",
+                         kudu::MetricLevel::kDebug,
+                        10000000, 1);
 
 using kudu::clock::internal::Interval;
 using kudu::clock::internal::kIntervalNone;
@@ -119,10 +151,8 @@ using strings::Substitute;
 namespace kudu {
 namespace clock {
 
-constexpr int kStandardNtpPort = 123;
-
 // Number of seconds between Jan 1 1900 and the unix epoch start.
-constexpr uint64_t kNtpTimestampDelta = 2208988800ull;
+constexpr uint64_t kNtpTimestampDelta = 2208988800ULL;
 
 // Keep the last 8 polls from each server.
 constexpr int kResponsesToRememberPerServer = 8;
@@ -162,6 +192,7 @@ DEFINE_validator(builtin_ntp_client_bind_address,
 //   http://support.ntp.org/bin/view/Support/NTPRelatedDefinitions
 //
 // Revelant RFC references:
+//   https://tools.ietf.org/html/rfc7822 (updates RFC 5905)
 //   https://tools.ietf.org/html/rfc5905
 //   https://tools.ietf.org/html/rfc4330 (obsoleted by RFC 5905)
 struct BuiltInNtp::NtpPacket {
@@ -448,7 +479,6 @@ class BuiltInNtp::ServerState {
   }
 
  private:
-
   // Lock to protect internal state below from concurrent access.
   mutable rw_spinlock lock_;
 
@@ -478,13 +508,16 @@ class BuiltInNtp::ServerState {
   size_t o_pkt_total_num_;    // number of NTP requests sent
 };
 
-BuiltInNtp::BuiltInNtp()
+BuiltInNtp::BuiltInNtp(const scoped_refptr<MetricEntity>& metric_entity)
     : rng_(GetRandomSeed32()) {
+  RegisterMetrics(metric_entity);
 }
 
-BuiltInNtp::BuiltInNtp(vector<HostPort> servers)
+BuiltInNtp::BuiltInNtp(vector<HostPort> servers,
+                       const scoped_refptr<MetricEntity>& metric_entity)
     : rng_(GetRandomSeed32()) {
   CHECK_OK(PopulateServers(std::move(servers)));
+  RegisterMetrics(metric_entity);
 }
 
 BuiltInNtp::~BuiltInNtp() {
@@ -560,12 +593,14 @@ Status BuiltInNtp::InitImpl() {
 
   if (servers_.empty()) {
     // That's the case when this object has been created using the default
-    // constructor.
+    // constructor. In this case, the set of NTP servers is taken from the
+    // --builtin_ntp_servers flag.
     vector<HostPort> hps;
     RETURN_NOT_OK_PREPEND(HostPort::ParseStrings(FLAGS_builtin_ntp_servers,
                                                  kStandardNtpPort, &hps),
                           "could not parse --builtin_ntp_servers flag");
     RETURN_NOT_OK(PopulateServers(std::move(hps)));
+    DCHECK(!servers_.empty());
   }
   for (const auto& s : servers_) {
     RETURN_NOT_OK(s->Init());
@@ -593,7 +628,7 @@ Status BuiltInNtp::InitImpl() {
   RETURN_NOT_OK_PREPEND(socket_.SetRecvTimeout(MonoDelta::FromSeconds(0.5)),
                         "could not set socket recv timeout");
   RETURN_NOT_OK_PREPEND(
-      Thread::Create("ntp", "ntp client", &BuiltInNtp::PollThread, this, &thread_),
+      Thread::Create("ntp", "ntp client", [this]() { this->PollThread(); }, &thread_),
       "could not start NTP client thread");
   return Status::OK();
 }
@@ -698,8 +733,22 @@ bool BuiltInNtp::TryReceivePacket() {
     p->server->InvalidatePacket();
   });
 
-  if (resp.version_number() < kMinNtpVersion ||
-      resp.version_number() > kNtpVersion) {
+  // Basic validation on the NTP version (VN field): it should not be less than
+  // 1 as per RFC 4330, Section 5. SNTP Client Operations:
+  //
+  //   NTP and SNTP clients set the mode field to 3 (client) for unicast and
+  //   manycast requests.  They set the VN field to any version number that
+  //   is supported by the server, selected by configuration or discovery,
+  //   and that can interoperate with all previous version NTP and SNTP
+  //   servers.  Servers reply with the same version as the request, so the
+  //   VN field of the request also specifies the VN field of the reply.  A
+  //   prudent SNTP client can specify the earliest acceptable version on
+  //   the expectation that any server of that or a later version will
+  //   respond.  NTP Version 3 (RFC 1305) and Version 2 (RFC 1119) servers
+  //   accept all previous versions, including Version 1 (RFC 1059).  Note
+  //   that Version 0 (RFC 959) is no longer supported by current and future
+  //   NTP and SNTP servers.
+  if (resp.version_number() < kMinNtpVersion) {
     VLOG(1) << Substitute("$0: unexpected protocol version in response packet "
                           "from NTP server at $1",
                           resp.version_number(), from_server.ToString());
@@ -850,7 +899,6 @@ Status BuiltInNtp::SendRequests() {
 Status BuiltInNtp::SendPoll(ServerState* s) {
   CHECK_NE(-1, socket_.GetFd());
   const Sockaddr& addr = s->cur_addr();
-  sockaddr_in si_other = addr.addr();
 
   unique_ptr<PendingRequest> pr(new PendingRequest);
   pr->server = s;
@@ -865,8 +913,7 @@ Status BuiltInNtp::SendPoll(ServerState* s) {
     sched_yield();
     pr->send_time_mono_us = GetMonoTimeMicrosRaw();
     return sendto(socket_.GetFd(), &pr->request, sizeof(pr->request),
-                  /*flags=*/0, reinterpret_cast<sockaddr*>(&si_other),
-                  sizeof(si_other));
+                  /*flags=*/0, addr.addr(), addr.addrlen());
   };
   ssize_t rc = -1;
   RETRY_ON_EINTR(rc, sender());
@@ -1020,8 +1067,8 @@ Status BuiltInNtp::CombineClocks() {
                           falsetickers_num, all_sources_num);
   }
 
-  int64_t compute_wall = (best_interval.first + best_interval.second) / 2;
-  int64_t compute_error = (best_interval.second - best_interval.first) / 2;
+  const int64_t compute_wall = (best_interval.first + best_interval.second) / 2;
+  const int64_t compute_error = (best_interval.second - best_interval.first) / 2;
   {
     // Extra sanity check to make sure walltime doesn't go back.
     std::lock_guard<rw_spinlock> l(last_computed_lock_);
@@ -1037,6 +1084,9 @@ Status BuiltInNtp::CombineClocks() {
     last_computed_.mono = now;
     last_computed_.wall = compute_wall;
     last_computed_.error = compute_error;
+
+    // Update stats on the computed error.
+    max_errors_histogram_->Increment(compute_error);
   }
   VLOG(2) << Substitute("combined clocks: $0 $1 $2",
                         now, compute_wall, compute_error);
@@ -1050,6 +1100,46 @@ Status BuiltInNtp::CombineClocks() {
   }
 
   return Status::OK();
+}
+
+void BuiltInNtp::RegisterMetrics(const scoped_refptr<MetricEntity>& entity) {
+  METRIC_builtin_ntp_local_clock_delta.InstantiateFunctionGauge(
+      entity, [this]() { return this->LocalClockDeltaForMetrics(); })->
+      AutoDetachToLastValue(&metric_detacher_);
+  METRIC_builtin_ntp_time.InstantiateFunctionGauge(
+      entity, [this]() { return this->WalltimeForMetrics(); })->
+      AutoDetachToLastValue(&metric_detacher_);
+  METRIC_builtin_ntp_error.InstantiateFunctionGauge(
+      entity, [this]() { return this->MaxErrorForMetrics(); })->
+      AutoDetachToLastValue(&metric_detacher_);
+  max_errors_histogram_ =
+      METRIC_builtin_ntp_max_errors.Instantiate(entity);
+}
+
+int64_t BuiltInNtp::LocalClockDeltaForMetrics() {
+  uint64_t now = 0; // avoid clang-tidy warnings
+  uint64_t err_ignored;
+  auto s = WalltimeWithError(&now, &err_ignored);
+  const int64_t now_local = GetCurrentTimeMicros();
+  if (!s.ok()) {
+    return std::numeric_limits<int64_t>::max();
+  }
+
+  // Here we don't care much about scheduling anomalies to take into account
+  // the timing of the clock sampling above. There might be some delay between
+  // calls to WalltimeWithError() and GetCurrentTimeMicros(), but the metric
+  // is designed to spot relatively big offsets like few seconds and more.
+  return (now_local - static_cast<int64_t>(now)) / 1000;
+}
+
+int64_t BuiltInNtp::WalltimeForMetrics() {
+  shared_lock<rw_spinlock> l(last_computed_lock_);
+  return last_computed_.wall;
+}
+
+int64_t BuiltInNtp::MaxErrorForMetrics() {
+  shared_lock<rw_spinlock> l(last_computed_lock_);
+  return last_computed_.error;
 }
 
 } // namespace clock

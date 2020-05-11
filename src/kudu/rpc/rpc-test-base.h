@@ -14,13 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_RPC_RPC_TEST_BASE_H
-#define KUDU_RPC_RPC_TEST_BASE_H
+#pragma once
 
 #include <algorithm>
 #include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "kudu/gutil/walltime.h"
 #include "kudu/rpc/acceptor_pool.h"
@@ -38,6 +39,7 @@
 #include "kudu/rpc/service_if.h"
 #include "kudu/rpc/service_pool.h"
 #include "kudu/security/security-test-util.h"
+#include "kudu/util/crc.h"
 #include "kudu/util/env.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/mem_tracker.h"
@@ -69,8 +71,8 @@ using kudu::rpc_test::ExactlyOnceResponsePB;
 using kudu::rpc_test::FeatureFlags;
 using kudu::rpc_test::PanicRequestPB;
 using kudu::rpc_test::PanicResponsePB;
-using kudu::rpc_test::PushTwoStringsRequestPB;
-using kudu::rpc_test::PushTwoStringsResponsePB;
+using kudu::rpc_test::PushStringsRequestPB;
+using kudu::rpc_test::PushStringsResponsePB;
 using kudu::rpc_test::SendTwoStringsRequestPB;
 using kudu::rpc_test::SendTwoStringsResponsePB;
 using kudu::rpc_test::SleepRequestPB;
@@ -92,7 +94,7 @@ class GenericCalculatorService : public ServiceIf {
   static const char *kAddMethodName;
   static const char *kSleepMethodName;
   static const char *kSleepWithSidecarMethodName;
-  static const char *kPushTwoStringsMethodName;
+  static const char *kPushStringsMethodName;
   static const char *kSendTwoStringsMethodName;
   static const char *kAddExactlyOnce;
 
@@ -117,8 +119,8 @@ class GenericCalculatorService : public ServiceIf {
       DoSleepWithSidecar(incoming);
     } else if (incoming->remote_method().method_name() == kSendTwoStringsMethodName) {
       DoSendTwoStrings(incoming);
-    } else if (incoming->remote_method().method_name() == kPushTwoStringsMethodName) {
-      DoPushTwoStrings(incoming);
+    } else if (incoming->remote_method().method_name() == kPushStringsMethodName) {
+      DoPushStrings(incoming);
     } else {
       incoming->RespondFailure(ErrorStatusPB::ERROR_NO_SUCH_METHOD,
                                Status::InvalidArgument("bad method"));
@@ -148,50 +150,55 @@ class GenericCalculatorService : public ServiceIf {
       LOG(FATAL) << "couldn't parse: " << param.ToDebugString();
     }
 
-    std::unique_ptr<faststring> first(new faststring);
-    std::unique_ptr<faststring> second(new faststring);
+    faststring first;
 
     Random r(req.random_seed());
-    first->resize(req.size1());
-    RandomString(first->data(), req.size1(), &r);
+    first.resize(req.size1());
+    RandomString(first.data(), req.size1(), &r);
 
-    second->resize(req.size2());
-    RandomString(second->data(), req.size2(), &r);
+    // The second string gets sent in two separate buffers, which get
+    // concatenated on the client side.
+    faststring second_data;
+    second_data.resize(req.size2());
+    RandomString(second_data.data(), second_data.size(), &r);
+
+    std::vector<faststring> second(2);
+    second[0].append(second_data.data(), second_data.size() / 3);
+    second[1].append(second_data.data() + second[0].size(),
+                     second_data.size() - second[0].size());
 
     SendTwoStringsResponsePB resp;
     int idx1, idx2;
     CHECK_OK(incoming->AddOutboundSidecar(
             RpcSidecar::FromFaststring(std::move(first)), &idx1));
+
     CHECK_OK(incoming->AddOutboundSidecar(
-            RpcSidecar::FromFaststring(std::move(second)), &idx2));
+            RpcSidecar::FromFaststrings(std::move(second)), &idx2));
     resp.set_sidecar1(idx1);
     resp.set_sidecar2(idx2);
 
     incoming->RespondSuccess(resp);
   }
 
-  void DoPushTwoStrings(InboundCall* incoming) {
+  static void DoPushStrings(InboundCall* incoming) {
     Slice param(incoming->serialized_request());
-    PushTwoStringsRequestPB req;
+    PushStringsRequestPB req;
     if (!req.ParseFromArray(param.data(), param.size())) {
       LOG(FATAL) << "couldn't parse: " << param.ToDebugString();
     }
 
-    Slice sidecar1;
-    CHECK_OK(incoming->GetInboundSidecar(req.sidecar1_idx(), &sidecar1));
-
-    Slice sidecar2;
-    CHECK_OK(incoming->GetInboundSidecar(req.sidecar2_idx(), &sidecar2));
-
     // Check that reading non-existant sidecars doesn't work.
     Slice tmp;
-    CHECK(!incoming->GetInboundSidecar(req.sidecar2_idx() + 2, &tmp).ok());
+    CHECK(!incoming->GetInboundSidecar(req.sidecar_indexes_size() + 2, &tmp).ok());
 
-    PushTwoStringsResponsePB resp;
-    resp.set_size1(sidecar1.size());
-    resp.set_data1(reinterpret_cast<const char*>(sidecar1.data()), sidecar1.size());
-    resp.set_size2(sidecar2.size());
-    resp.set_data2(reinterpret_cast<const char*>(sidecar2.data()), sidecar2.size());
+    PushStringsResponsePB resp;
+    for (const auto& sidecar_idx : req.sidecar_indexes()) {
+      Slice sidecar;
+      CHECK_OK(incoming->GetInboundSidecar(sidecar_idx, &sidecar));
+
+      resp.add_sizes(sidecar.size());
+      resp.add_crcs(crc::Crc32c(sidecar.data(), sidecar.size()));
+    }
 
     // Drop the sidecars etc, just to confirm that it's safe to do so.
     CHECK_GT(incoming->GetTransferSize(), 0);
@@ -212,7 +219,7 @@ class GenericCalculatorService : public ServiceIf {
 
     LOG(INFO) << "got call: " << pb_util::SecureShortDebugString(req);
     SleepFor(MonoDelta::FromMicroseconds(req.sleep_micros()));
-    MonoDelta duration(MonoTime::Now().GetDeltaSince(incoming->GetTimeReceived()));
+    MonoDelta duration(MonoTime::Now() - incoming->GetTimeReceived());
     CHECK_GE(duration.ToMicroseconds(), req.sleep_micros());
     SleepResponsePB resp;
     incoming->RespondSuccess(resp);
@@ -281,11 +288,8 @@ class CalculatorService : public CalculatorServiceIf {
     }
 
     if (req->deferred()) {
-      // Spawn a new thread which does the sleep and responds later.
-      scoped_refptr<Thread> thread;
-      CHECK_OK(Thread::Create("rpc-test", "deferred",
-                              &CalculatorService::DoSleep, this, req, context,
-                              &thread));
+      std::thread t([this, req, context]() { this->DoSleep(req, context); });
+      t.detach();
       return;
     }
     DoSleep(req, context);
@@ -399,7 +403,7 @@ const char *GenericCalculatorService::kFullServiceName = "kudu.rpc.GenericCalcul
 const char *GenericCalculatorService::kAddMethodName = "Add";
 const char *GenericCalculatorService::kSleepMethodName = "Sleep";
 const char *GenericCalculatorService::kSleepWithSidecarMethodName = "SleepWithSidecar";
-const char *GenericCalculatorService::kPushTwoStringsMethodName = "PushTwoStrings";
+const char *GenericCalculatorService::kPushStringsMethodName = "PushStrings";
 const char *GenericCalculatorService::kSendTwoStringsMethodName = "SendTwoStrings";
 const char *GenericCalculatorService::kAddExactlyOnce = "AddExactlyOnce";
 
@@ -505,28 +509,29 @@ class RpcTestBase : public KuduTest {
     CHECK_EQ(0, second.compare(Slice(expected)));
   }
 
-  Status DoTestOutgoingSidecar(const Proxy &p, int size1, int size2) {
-    PushTwoStringsRequestPB request;
+  static Status DoTestOutgoingSidecar(const Proxy &p, int size1, int size2) {
+    return DoTestOutgoingSidecar(p, {std::string(size1, 'a'), std::string(size2, 'b')});
+  }
+
+  static Status DoTestOutgoingSidecar(const Proxy& p, const std::vector<std::string>& strings) {
+    PushStringsRequestPB request;
     RpcController controller;
 
-    int idx1;
-    std::string s1(size1, 'a');
-    CHECK_OK(controller.AddOutboundSidecar(RpcSidecar::FromSlice(Slice(s1)), &idx1));
+    for (const auto& s : strings) {
+      int idx;
+      CHECK_OK(controller.AddOutboundSidecar(RpcSidecar::FromSlice(Slice(s)), &idx));
+      request.add_sidecar_indexes(idx);
+    }
 
-    int idx2;
-    std::string s2(size2, 'b');
-    CHECK_OK(controller.AddOutboundSidecar(RpcSidecar::FromSlice(Slice(s2)), &idx2));
-
-    request.set_sidecar1_idx(idx1);
-    request.set_sidecar2_idx(idx2);
-
-    PushTwoStringsResponsePB resp;
-    KUDU_RETURN_NOT_OK(p.SyncRequest(GenericCalculatorService::kPushTwoStringsMethodName,
+    PushStringsResponsePB resp;
+    KUDU_RETURN_NOT_OK(p.SyncRequest(GenericCalculatorService::kPushStringsMethodName,
                                      request, &resp, &controller));
-    CHECK_EQ(size1, resp.size1());
-    CHECK_EQ(resp.data1(), s1);
-    CHECK_EQ(size2, resp.size2());
-    CHECK_EQ(resp.data2(), s2);
+    for (int i = 0; i < strings.size(); i++) {
+      CHECK_EQ(strings[i].size(), resp.sizes(i));
+      CHECK_EQ(crc::Crc32c(strings[i].data(), strings[i].size()),
+               resp.crcs(i));
+    }
+
     return Status::OK();
   }
 
@@ -534,9 +539,10 @@ class RpcTestBase : public KuduTest {
     CHECK_OK(DoTestOutgoingSidecar(p, size1, size2));
   }
 
-  void DoTestExpectTimeout(const Proxy& p,
-                           const MonoDelta& timeout,
-                           bool* is_negotiaton_error = nullptr) {
+  static void DoTestExpectTimeout(const Proxy& p,
+                                  const MonoDelta& timeout,
+                                  bool will_be_cancelled = false,
+                                  bool* is_negotiaton_error = nullptr) {
     SleepRequestPB req;
     SleepResponsePB resp;
     // Sleep for 500ms longer than the call timeout.
@@ -555,13 +561,22 @@ class RpcTestBase : public KuduTest {
     }
 
     int expected_millis = timeout.ToMilliseconds();
-    int elapsed_millis = sw.elapsed().wall_millis();
+    int elapsed_millis = static_cast<int>(sw.elapsed().wall_millis());
 
-    // We shouldn't timeout significantly faster than our configured timeout.
-    EXPECT_GE(elapsed_millis, expected_millis - 10);
+    // We shouldn't timeout significantly faster than our configured timeout, unless the
+    // rpc is cancelled.
+    if (!will_be_cancelled) {
+      EXPECT_GE(elapsed_millis, expected_millis - 10);
+    }
     // And we also shouldn't take the full time that we asked for
     EXPECT_LT(elapsed_millis * 1000, sleep_micros);
-    EXPECT_TRUE(s.IsTimedOut());
+    if (will_be_cancelled) {
+      // Cancellation is best effort, so even if we cancel the rpc it may still end up
+      // with a timed out status.
+      EXPECT_TRUE(s.IsAborted() || s.IsTimedOut()) << s.ToString();
+    } else {
+      EXPECT_TRUE(s.IsTimedOut()) << s.ToString();
+    }
     LOG(INFO) << "status: " << s.ToString() << ", seconds elapsed: " << sw.elapsed().wall_seconds();
   }
 
@@ -588,10 +603,10 @@ class RpcTestBase : public KuduTest {
 
   // Start a simple socket listening on a local port, returning the address.
   // This isn't an RPC server -- just a plain socket which can be helpful for testing.
-  Status StartFakeServer(Socket *listen_sock, Sockaddr *listen_addr) {
-    Sockaddr bind_addr;
+  static Status StartFakeServer(Socket *listen_sock, Sockaddr *listen_addr) {
+    Sockaddr bind_addr = Sockaddr::Wildcard();
     bind_addr.set_port(0);
-    RETURN_NOT_OK(listen_sock->Init(0));
+    RETURN_NOT_OK(listen_sock->Init(bind_addr.family(), 0));
     RETURN_NOT_OK(listen_sock->BindAndListen(bind_addr, 1));
     RETURN_NOT_OK(listen_sock->GetSocketAddress(listen_addr));
     LOG(INFO) << "Bound to: " << listen_addr->ToString();
@@ -616,6 +631,10 @@ class RpcTestBase : public KuduTest {
                            const std::string& rpc_ca_certificate_file = "",
                            const std::string& rpc_private_key_password_cmd = "",
                            const std::shared_ptr<Messenger>& messenger = nullptr) {
+    // Default to binding on wildcard unless specified as an in-out parameter.
+    if (!server_addr->is_initialized()) {
+      *server_addr = Sockaddr::Wildcard();
+    }
     if (!messenger) {
       RETURN_NOT_OK(CreateMessenger(
           "TestServer", &server_messenger_, n_server_reactor_threads_, enable_ssl,
@@ -625,13 +644,13 @@ class RpcTestBase : public KuduTest {
       server_messenger_ = messenger;
     }
     std::shared_ptr<AcceptorPool> pool;
-    RETURN_NOT_OK(server_messenger_->AddAcceptorPool(Sockaddr(), &pool));
+    RETURN_NOT_OK(server_messenger_->AddAcceptorPool(*server_addr, &pool));
     RETURN_NOT_OK(pool->Start(2));
     *server_addr = pool->bind_address();
     mem_tracker_ = MemTracker::CreateTracker(-1, "result_tracker");
     result_tracker_.reset(new ResultTracker(mem_tracker_));
 
-    gscoped_ptr<ServiceIf> service(new ServiceClass(metric_entity_, result_tracker_));
+    std::unique_ptr<ServiceIf> service(new ServiceClass(metric_entity_, result_tracker_));
     service_name_ = service->service_name();
     scoped_refptr<MetricEntity> metric_entity = server_messenger_->metric_entity();
     service_pool_ = new ServicePool(std::move(service), metric_entity, service_queue_length_);
@@ -658,4 +677,3 @@ class RpcTestBase : public KuduTest {
 
 } // namespace rpc
 } // namespace kudu
-#endif

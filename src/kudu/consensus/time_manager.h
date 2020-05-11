@@ -21,10 +21,8 @@
 
 #include <gtest/gtest_prod.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/timestamp.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
@@ -32,6 +30,9 @@
 namespace kudu {
 
 class CountDownLatch;
+namespace clock {
+class Clock;
+}  // namespace clock
 
 namespace consensus {
 class ReplicateMsg;
@@ -69,11 +70,11 @@ class ReplicateMsg;
 //       This anomaly can cause non-repeatable reads in certain conditions.
 //
 // This class is thread safe.
-class TimeManager : public RefCountedThreadSafe<TimeManager> {
+class TimeManager {
  public:
 
   // Constructs a TimeManager in non-leader mode.
-  TimeManager(scoped_refptr<clock::Clock> clock,  Timestamp initial_safe_time);
+  TimeManager(clock::Clock* clock, Timestamp initial_safe_time);
 
   // Sets this TimeManager to leader mode.
   void SetLeaderMode();
@@ -119,9 +120,6 @@ class TimeManager : public RefCountedThreadSafe<TimeManager> {
   // Returns Status::OK() if it safe time advanced past 'timestamp' before 'deadline'
   // Returns Status::TimeOut() if deadline elapsed without safe time moving enough.
   // Returns Status::ServiceUnavailable() is the request should be retried somewhere else.
-  //
-  // TODO(KUDU-1127) make this return another status if safe time is too far back in the past
-  // or hasn't moved in a long time.
   Status WaitUntilSafe(Timestamp timestamp, const MonoTime& deadline);
 
   // Returns the current safe time.
@@ -195,7 +193,7 @@ class TimeManager : public RefCountedThreadSafe<TimeManager> {
   mutable simple_spinlock lock_;
 
   // Vector of waiters to be notified when the safe time advances.
-  mutable std::vector<WaitingState*> waiters_;
+  std::vector<WaitingState*> waiters_;
 
   // The last serial timestamp that was assigned.
   Timestamp last_serial_ts_assigned_;
@@ -211,7 +209,7 @@ class TimeManager : public RefCountedThreadSafe<TimeManager> {
   // The current mode of the TimeManager.
   Mode mode_;
 
-  const scoped_refptr<clock::Clock> clock_;
+  clock::Clock* clock_;
   const std::string local_peer_uuid_;
 };
 

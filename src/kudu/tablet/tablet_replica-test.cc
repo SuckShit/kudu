@@ -18,6 +18,7 @@
 #include "kudu/tablet/tablet_replica.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -28,7 +29,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
@@ -47,14 +47,11 @@
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/callback.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/result_tracker.h"
+#include "kudu/tablet/tablet-harness.h"
 #include "kudu/tablet/tablet-test-util.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_bootstrap.h"
@@ -79,7 +76,9 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/threadpool.h"
 
+DECLARE_bool(enable_maintenance_manager);
 DECLARE_int32(flush_threshold_mb);
+DECLARE_int32(tablet_history_max_age_sec);
 
 METRIC_DECLARE_entity(tablet);
 
@@ -109,9 +108,6 @@ using std::string;
 using std::unique_ptr;
 
 namespace kudu {
-
-class MemTracker;
-
 namespace tablet {
 
 static Schema GetTestSchema() {
@@ -121,7 +117,8 @@ static Schema GetTestSchema() {
 class TabletReplicaTest : public KuduTabletTest {
  public:
   TabletReplicaTest()
-      : KuduTabletTest(GetTestSchema()),
+      : KuduTabletTest(GetTestSchema(),
+                       TabletHarness::Options::ClockType::HYBRID_CLOCK),
         insert_counter_(0),
         delete_counter_(0),
         dns_resolver_(new DnsResolver) {
@@ -145,15 +142,18 @@ class TabletReplicaTest : public KuduTabletTest {
     }
 
     // "Bootstrap" and start the TabletReplica.
+    const auto& tablet_id = tablet()->tablet_id();
     tablet_replica_.reset(
       new TabletReplica(tablet()->shared_metadata(),
                         cmeta_manager_,
                         *config_peer,
                         apply_pool_.get(),
-                        Bind(&TabletReplicaTest::TabletReplicaStateChangedCallback,
-                             Unretained(this),
-                             tablet()->tablet_id())));
-    ASSERT_OK(tablet_replica_->Init(raft_pool_.get()));
+                        [this, tablet_id](const string& reason) {
+                          this->TabletReplicaStateChangedCallback(tablet_id, reason);
+                        }));
+    ASSERT_OK(tablet_replica_->Init({ /*quiescing*/nullptr,
+                                      /*num_leaders*/nullptr,
+                                      raft_pool_.get() }));
     // Make TabletReplica use the same LogAnchorRegistry as the Tablet created by the harness.
     // TODO(mpercy): Refactor TabletHarness to allow taking a
     // LogAnchorRegistry, while also providing TabletMetadata for consumption
@@ -179,9 +179,14 @@ class TabletReplicaTest : public KuduTabletTest {
 
   Status StartReplica(const ConsensusBootstrapInfo& info) {
     scoped_refptr<Log> log;
-    RETURN_NOT_OK(Log::Open(LogOptions(), fs_manager(), tablet()->tablet_id(),
-                            *tablet()->schema(), tablet()->metadata()->schema_version(),
-                            metric_entity_.get(), &log));
+    RETURN_NOT_OK(Log::Open(LogOptions(),
+                            fs_manager(),
+                            /*file_cache*/nullptr,
+                            tablet()->tablet_id(),
+                            *tablet()->schema(),
+                            tablet()->metadata()->schema_version(),
+                            metric_entity_.get(),
+                            &log));
     tablet_replica_->SetBootstrapping();
     return tablet_replica_->Start(info,
                                   tablet(),
@@ -224,13 +229,14 @@ class TabletReplicaTest : public KuduTabletTest {
     ASSERT_OK(BootstrapTablet(tablet_replica_->tablet_metadata(),
                               cmeta->CommittedConfig(),
                               clock(),
-                              shared_ptr<MemTracker>(),
-                              scoped_refptr<ResultTracker>(),
+                              /*mem_tracker*/nullptr,
+                              /*result_tracker*/nullptr,
                               &metric_registry_,
+                              /*file_cache*/nullptr,
                               tablet_replica_,
+                              tablet_replica_->log_anchor_registry(),
                               &tablet,
                               &log,
-                              tablet_replica_->log_anchor_registry(),
                               &bootstrap_info));
     ASSERT_OK(tablet_replica_->Start(bootstrap_info,
                                      tablet,
@@ -286,7 +292,7 @@ class TabletReplicaTest : public KuduTabletTest {
                                                                          resp.get()));
 
     CountDownLatch rpc_latch(1);
-    tx_state->set_completion_callback(gscoped_ptr<TransactionCompletionCallback>(
+    tx_state->set_completion_callback(unique_ptr<TransactionCompletionCallback>(
         new LatchTransactionCompletionCallback<WriteResponsePB>(&rpc_latch, resp.get())));
 
     RETURN_NOT_OK(replica->SubmitWrite(std::move(tx_state)));
@@ -310,7 +316,7 @@ class TabletReplicaTest : public KuduTabletTest {
     unique_ptr<AlterSchemaTransactionState> tx_state(
         new AlterSchemaTransactionState(replica, &req, resp.get()));
     CountDownLatch rpc_latch(1);
-    tx_state->set_completion_callback(gscoped_ptr<TransactionCompletionCallback>(
+    tx_state->set_completion_callback(unique_ptr<TransactionCompletionCallback>(
           new LatchTransactionCompletionCallback<AlterSchemaResponsePB>(&rpc_latch, resp.get())));
     RETURN_NOT_OK(replica->SubmitAlterSchema(std::move(tx_state)));
     rpc_latch.Wait();
@@ -339,22 +345,20 @@ class TabletReplicaTest : public KuduTabletTest {
   // Execute insert requests and roll log after each one.
   Status ExecuteInsertsAndRollLogs(int num_inserts) {
     for (int i = 0; i < num_inserts; i++) {
-      gscoped_ptr<WriteRequestPB> req(new WriteRequestPB());
-      RETURN_NOT_OK(GenerateSequentialInsertRequest(GetTestSchema(), req.get()));
-      RETURN_NOT_OK(ExecuteWriteAndRollLog(tablet_replica_.get(), *req));
+      WriteRequestPB req;
+      RETURN_NOT_OK(GenerateSequentialInsertRequest(GetTestSchema(), &req));
+      RETURN_NOT_OK(ExecuteWriteAndRollLog(tablet_replica_.get(), req));
     }
-
     return Status::OK();
   }
 
   // Execute delete requests and roll log after each one.
   Status ExecuteDeletesAndRollLogs(int num_deletes) {
     for (int i = 0; i < num_deletes; i++) {
-      gscoped_ptr<WriteRequestPB> req(new WriteRequestPB());
-      CHECK_OK(GenerateSequentialDeleteRequest(req.get()));
-      CHECK_OK(ExecuteWriteAndRollLog(tablet_replica_.get(), *req));
+      WriteRequestPB req;
+      RETURN_NOT_OK(GenerateSequentialDeleteRequest(&req));
+      RETURN_NOT_OK(ExecuteWriteAndRollLog(tablet_replica_.get(), req));
     }
-
     return Status::OK();
   }
 
@@ -409,7 +413,7 @@ class DelayedApplyTransaction : public WriteTransaction {
         apply_continue_(DCHECK_NOTNULL(apply_continue)) {
   }
 
-  virtual Status Apply(gscoped_ptr<CommitMsg>* commit_msg) override {
+  virtual Status Apply(unique_ptr<CommitMsg>* commit_msg) override {
     apply_started_->CountDown();
     LOG(INFO) << "Delaying apply...";
     apply_continue_->Wait();
@@ -575,8 +579,8 @@ TEST_F(TabletReplicaTest, TestActiveTransactionPreventsLogGC) {
   CountDownLatch rpc_latch(1);
   CountDownLatch apply_started(1);
   CountDownLatch apply_continue(1);
-  gscoped_ptr<WriteRequestPB> req(new WriteRequestPB());
-  gscoped_ptr<WriteResponsePB> resp(new WriteResponsePB());
+  unique_ptr<WriteRequestPB> req(new WriteRequestPB());
+  unique_ptr<WriteResponsePB> resp(new WriteResponsePB());
   {
     // Long-running mutation.
     ASSERT_OK(GenerateSequentialDeleteRequest(req.get()));
@@ -585,17 +589,17 @@ TEST_F(TabletReplicaTest, TestActiveTransactionPreventsLogGC) {
                                                                          nullptr, // No RequestIdPB
                                                                          resp.get()));
 
-    tx_state->set_completion_callback(gscoped_ptr<TransactionCompletionCallback>(
+    tx_state->set_completion_callback(unique_ptr<TransactionCompletionCallback>(
         new LatchTransactionCompletionCallback<WriteResponsePB>(&rpc_latch, resp.get())));
 
-    gscoped_ptr<DelayedApplyTransaction> transaction(
+    unique_ptr<DelayedApplyTransaction> transaction(
         new DelayedApplyTransaction(&apply_started,
                                     &apply_continue,
                                     std::move(tx_state)));
 
     scoped_refptr<TransactionDriver> driver;
-    ASSERT_OK(tablet_replica_->NewLeaderTransactionDriver(transaction.PassAs<Transaction>(),
-                                                       &driver));
+    ASSERT_OK(tablet_replica_->NewLeaderTransactionDriver(std::move(transaction),
+                                                          &driver));
 
     ASSERT_OK(driver->ExecuteAsync());
     apply_started.Wait();
@@ -778,8 +782,9 @@ TEST_F(TabletReplicaTest, TestLiveRowCountMetric) {
   ConsensusBootstrapInfo info;
   ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
 
+  // We don't care what the function is, since the metric is already instantiated.
   auto live_row_count = METRIC_live_row_count.InstantiateFunctionGauge(
-      tablet_replica_->tablet()->GetMetricEntity(), Callback<uint64_t(void)>());
+      tablet_replica_->tablet()->GetMetricEntity(), [](){ return 0; });
   ASSERT_EQ(0, live_row_count->value());
 
   // Insert some rows.
@@ -792,6 +797,61 @@ TEST_F(TabletReplicaTest, TestLiveRowCountMetric) {
   const int kNumDelete = rand.Next() % kNumInsert;
   ASSERT_OK(ExecuteDeletesAndRollLogs(kNumDelete));
   ASSERT_EQ(kNumInsert - kNumDelete, live_row_count->value());
+}
+
+TEST_F(TabletReplicaTest, TestRestartAfterGCDeletedRowsets) {
+  FLAGS_enable_maintenance_manager = false;
+  FLAGS_tablet_history_max_age_sec = 1;
+  const int kNumRows = 10;
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(StartReplicaAndWaitUntilLeader(info));
+  auto* tablet = tablet_replica_->tablet();
+  // Metrics are already registered so pass a dummy lambda.
+  auto live_row_count = METRIC_live_row_count.InstantiateFunctionGauge(
+      tablet->GetMetricEntity(), [] () { return 0; });
+
+  // Insert some rows and flush so we get a DRS, and then delete them so we
+  // have an ancient, fully deleted DRS.
+  ASSERT_OK(ExecuteInsertsAndRollLogs(kNumRows));
+  ASSERT_OK(tablet->Flush());
+  ASSERT_OK(ExecuteDeletesAndRollLogs(kNumRows));
+  ASSERT_EQ(1, tablet->num_rowsets());
+  ASSERT_EQ(0, live_row_count->value());
+  SleepFor(MonoDelta::FromSeconds(FLAGS_tablet_history_max_age_sec));
+
+  // Insert some fresh rows so we can validate that we don't GC everything.
+  ASSERT_OK(ExecuteInsertsAndRollLogs(kNumRows));
+  ASSERT_OK(tablet->Flush());
+  ASSERT_EQ(2, tablet->num_rowsets());
+  ASSERT_EQ(kNumRows, live_row_count->value());
+
+  // Now GC what we can. The first rowset should be gone.
+  ASSERT_OK(tablet->DeleteAncientDeletedRowsets());
+  ASSERT_EQ(1, tablet->num_rowsets());
+  ASSERT_EQ(kNumRows, live_row_count->value());
+  ASSERT_OK(ExecuteDeletesAndRollLogs(kNumRows));
+  ASSERT_EQ(0, live_row_count->value());
+
+  // Restart and ensure we can rebuild our DMS okay.
+  NO_FATALS(RestartReplica());
+  tablet = tablet_replica_->tablet();
+  ASSERT_EQ(1, tablet->num_rowsets());
+  live_row_count = METRIC_live_row_count.InstantiateFunctionGauge(
+      tablet->GetMetricEntity(), [] () { return 0; });
+  ASSERT_EQ(0, live_row_count->value());
+
+  // Now do that again but with deltafiles.
+  ASSERT_OK(tablet->FlushBiggestDMS());
+  NO_FATALS(RestartReplica());
+  tablet = tablet_replica_->tablet();
+  ASSERT_EQ(1, tablet->num_rowsets());
+
+  // Wait for our deleted rowset to become ancient. Since we just started up,
+  // we shouldn't have read any delta stats, so running the GC won't pick up
+  // our deleted DRS.
+  SleepFor(MonoDelta::FromSeconds(FLAGS_tablet_history_max_age_sec));
+  ASSERT_OK(tablet->DeleteAncientDeletedRowsets());
+  ASSERT_EQ(1, tablet->num_rowsets());
 }
 
 } // namespace tablet

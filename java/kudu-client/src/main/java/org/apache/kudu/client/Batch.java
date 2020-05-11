@@ -27,8 +27,8 @@ import com.google.common.base.MoreObjects;
 import com.google.common.collect.Iterables;
 import com.google.protobuf.Message;
 import com.google.protobuf.UnsafeByteOperations;
+import io.netty.util.Timer;
 import org.apache.yetus.audience.InterfaceAudience;
-import org.jboss.netty.util.Timer;
 
 import org.apache.kudu.WireProtocol.AppStatusPB.ErrorCode;
 import org.apache.kudu.client.Statistics.Statistic;
@@ -142,6 +142,9 @@ class Batch extends KuduRpc<BatchResponse> {
                              (long)builder.getRowOperations().getIndirectData().size();
     builder.setTabletId(UnsafeByteOperations.unsafeWrap(getTablet().getTabletIdAsBytes()));
     builder.setExternalConsistencyMode(externalConsistencyMode.pbVersion());
+    if (this.propagatedTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
+      builder.setPropagatedTimestamp(this.propagatedTimestamp);
+    }
     if (authzToken != null) {
       builder.setAuthzToken(authzToken);
     }

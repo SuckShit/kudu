@@ -19,11 +19,14 @@
 
 #include "kudu/tools/tool_test_util.h"
 
+#include <cstdio>
 #include <ostream>
 #include <vector>
 
 #include <glog/logging.h>
 
+#include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/env.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
@@ -31,6 +34,8 @@
 
 using std::string;
 using std::vector;
+using strings::Split;
+using strings::Substitute;
 
 namespace kudu {
 namespace tools {
@@ -50,8 +55,10 @@ Status RunKuduTool(const vector<string>& args, string* out, string* err,
                    const std::string& in) {
   vector<string> total_args = { GetKuduToolAbsolutePath() };
 
-  // Speed up filesystem-based operations.
+  // Some scenarios might add unsafe flags for testing purposes.
   total_args.emplace_back("--unlock_unsafe_flags");
+
+  // Speed up filesystem-based operations.
   total_args.emplace_back("--never_fsync");
 
   // Do not colorize glog's output (i.e. messages logged via LOG()) even
@@ -60,8 +67,23 @@ Status RunKuduTool(const vector<string>& args, string* out, string* err,
   // (e.g., the exact location of some substring/character in the output line).
   total_args.emplace_back("--nocolorlogtostderr");
 
+  // Kudu masters and tablet servers run as a part of external mini-cluster use
+  // shorter keys. Newer OS distros have OpenSSL built with the default security
+  // level higher than 0, so it's necessary to override it on the client
+  // side as well to allow clients to accept and verify TLS certificates.
+  total_args.emplace_back("--openssl_security_level_override=0");
+
   total_args.insert(total_args.end(), args.begin(), args.end());
   return Subprocess::Call(total_args, in, out, err);
+}
+
+Status RunActionPrependStdoutStderr(const string& arg_str) {
+  string stdout;
+  string stderr;
+  RETURN_NOT_OK_PREPEND(RunKuduTool(Split(arg_str, " ", strings::SkipEmpty()),
+                                    &stdout, &stderr),
+      Substitute("error running '$0': stdout: $1, stderr: $2", arg_str, stdout, stderr));
+  return Status::OK();
 }
 
 } // namespace tools

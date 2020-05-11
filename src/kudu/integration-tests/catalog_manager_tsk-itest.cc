@@ -17,8 +17,8 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <memory>
 #include <ostream>
@@ -32,12 +32,11 @@
 #include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/consensus.proxy.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/sys_catalog.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
@@ -121,7 +120,7 @@ class CatalogManagerTskITest : public KuduTest {
 
     // Create a table.
     auto schema = KuduSchema::FromSchema(CreateKeyValueTestSchema());
-    gscoped_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
+    unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
 
     ASSERT_OK(table_creator->table_name(kTableName)
               .set_range_partition_columns({ "key" })

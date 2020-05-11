@@ -43,13 +43,13 @@
 #include "kudu/fs/fs_report.h"
 #include "kudu/fs/log_block_manager.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/array_view.h" // IWYU pragma: keep
 #include "kudu/util/env.h"
+#include "kudu/util/file_cache.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
@@ -61,11 +61,11 @@
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 using google::protobuf::util::MessageDifferencer;
 using std::shared_ptr;
 using std::string;
+using std::thread;
 using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
@@ -119,11 +119,12 @@ template <typename T>
 class BlockManagerTest : public KuduTest {
  public:
   BlockManagerTest() :
-    test_tablet_name_("test_tablet"),
-    test_block_opts_(CreateBlockOptions({ test_tablet_name_ })),
-    test_error_manager_(new FsErrorManager()),
-    bm_(CreateBlockManager(scoped_refptr<MetricEntity>(),
-                           shared_ptr<MemTracker>())) {
+      test_tablet_name_("test_tablet"),
+      test_block_opts_(CreateBlockOptions({ test_tablet_name_ })),
+      file_cache_("test_cache", env_, 1, scoped_refptr<MetricEntity>()),
+      bm_(CreateBlockManager(scoped_refptr<MetricEntity>(),
+                             shared_ptr<MemTracker>())) {
+    CHECK_OK(file_cache_.Init());
   }
 
   virtual void SetUp() override {
@@ -159,7 +160,7 @@ class BlockManagerTest : public KuduTest {
                         const shared_ptr<MemTracker>& parent_mem_tracker) {
     if (!dd_manager_) {
       DataDirManagerOptions opts;
-      opts.block_manager_type = block_manager_type<T>();
+      opts.dir_type = block_manager_type<T>();
       // Create a new directory manager if necessary.
       CHECK_OK(DataDirManager::CreateNewForTests(env_, { test_dir_ },
           opts, &dd_manager_));
@@ -167,8 +168,8 @@ class BlockManagerTest : public KuduTest {
     BlockManagerOptions opts;
     opts.metric_entity = metric_entity;
     opts.parent_mem_tracker = parent_mem_tracker;
-    return new T(env_, this->dd_manager_.get(), test_error_manager_.get(),
-                 std::move(opts));
+    return new T(env_, this->dd_manager_.get(), &error_manager_,
+                 &file_cache_, std::move(opts));
   }
 
   Status ReopenBlockManager(const scoped_refptr<MetricEntity>& metric_entity,
@@ -180,14 +181,14 @@ class BlockManagerTest : public KuduTest {
     // manager first to enforce this.
     bm_.reset();
     DataDirManagerOptions opts;
-    opts.block_manager_type = block_manager_type<T>();
+    opts.dir_type = block_manager_type<T>();
     opts.metric_entity = metric_entity;
     if (create) {
       RETURN_NOT_OK(DataDirManager::CreateNewForTests(
-          env_, paths, std::move(opts), &dd_manager_));
+          env_, paths, opts, &dd_manager_));
     } else {
       RETURN_NOT_OK(DataDirManager::OpenExistingForTests(
-          env_, paths, std::move(opts), &dd_manager_));
+          env_, paths, opts, &dd_manager_));
     }
     bm_.reset(CreateBlockManager(metric_entity, parent_mem_tracker));
     RETURN_NOT_OK(bm_->Open(nullptr));
@@ -222,17 +223,20 @@ class BlockManagerTest : public KuduTest {
   // hierarchy, ignoring '.', '..', and file 'kInstanceMetadataFileName'.
   Status CountFiles(const string& root, int* num_files) {
     *num_files = 0;
-    RETURN_NOT_OK(env_->Walk(root, Env::PRE_ORDER,
-                             Bind(BlockManagerTest::CountFilesCb, num_files)));
-    return Status::OK();
+    return env_->Walk(
+        root, Env::PRE_ORDER,
+        [num_files](Env::FileType type, const string& dirname, const string& basename) {
+          return CountFilesCb(num_files, type, dirname, basename);
+        });
   }
 
   // Keep an internal copy of the data dir group to act as metadata.
   DataDirGroupPB test_group_pb_;
   string test_tablet_name_;
   CreateBlockOptions test_block_opts_;
-  unique_ptr<FsErrorManager> test_error_manager_;
+  FsErrorManager error_manager_;
   unique_ptr<DataDirManager> dd_manager_;
+  FileCache file_cache_;
   unique_ptr<T> bm_;
 };
 
@@ -313,7 +317,7 @@ void BlockManagerTest<LogBlockManager>::RunBlockDistributionTest(const vector<st
 template <>
 void BlockManagerTest<FileBlockManager>::RunMultipathTest(const vector<string>& paths) {
   // Ensure that each path has an instance file and that it's well-formed.
-  for (const string& path : dd_manager_->GetDataDirs()) {
+  for (const string& path : dd_manager_->GetDirs()) {
     vector<string> children;
     ASSERT_OK(env_->GetChildren(path, &children));
     ASSERT_EQ(3, children.size());
@@ -808,15 +812,14 @@ TYPED_TEST(BlockManagerTest, ConcurrentCloseReadableBlockTest) {
   unique_ptr<ReadableBlock> reader;
   ASSERT_OK(this->bm_->OpenBlock(writer->id(), &reader));
 
-  vector<scoped_refptr<Thread> > threads;
-  for (int i = 0; i < 100; i++) {
-    scoped_refptr<Thread> t;
-    ASSERT_OK(Thread::Create("test", Substitute("t$0", i),
-                             &CloseHelper, reader.get(), &t));
-    threads.push_back(t);
+  constexpr int kNumThreads = 100;
+  vector<thread> threads;
+  threads.reserve(kNumThreads);
+  for (int i = 0; i < kNumThreads; i++) {
+    threads.emplace_back([&reader]() { CloseHelper(reader.get()); });
   }
-  for (const scoped_refptr<Thread>& t : threads) {
-    t->Join();
+  for (auto& t : threads) {
+    t.join();
   }
 }
 
@@ -938,7 +941,7 @@ TYPED_TEST(BlockManagerTest, TestMetadataOkayDespiteFailure) {
 
   // Creates a block with the given 'test_data', writing the result
   // to 'out' on success.
-  auto create_a_block = [&](BlockId* out, const string& test_data) -> Status {
+  auto create_a_block = [&](BlockId* out, const string& test_data) {
     unique_ptr<WritableBlock> block;
     RETURN_NOT_OK(this->bm_->CreateBlock(this->test_block_opts_, &block));
     for (int i = 0; i < kNumAppends; i++) {
@@ -954,7 +957,7 @@ TYPED_TEST(BlockManagerTest, TestMetadataOkayDespiteFailure) {
   // Reads a block given by 'id', comparing its contents. Note that
   // we need to compare with both kLongTestData and kShortTestData as we
   // do not know the blocks' content ahead.
-  auto read_a_block = [&](const BlockId& id) -> Status {
+  auto read_a_block = [&](const BlockId& id) {
     unique_ptr<ReadableBlock> block;
     RETURN_NOT_OK(this->bm_->OpenBlock(id, &block));
     uint64_t size;
@@ -1094,8 +1097,10 @@ TYPED_TEST(BlockManagerTest, ConcurrentCloseFinalizedWritableBlockTest) {
     }
   };
 
-  vector<std::thread> threads;
-  for (int i = 0; i < 100; i++) {
+  constexpr int kNumThreads = 100;
+  vector<thread> threads;
+  threads.reserve(kNumThreads);
+  for (int i = 0; i < kNumThreads; i++) {
     threads.emplace_back(write_data);
   }
   for (auto& t : threads) {

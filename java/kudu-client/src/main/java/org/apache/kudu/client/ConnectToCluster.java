@@ -17,6 +17,7 @@
 
 package org.apache.kudu.client;
 
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -30,8 +31,8 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
+import io.netty.util.Timer;
 import org.apache.yetus.audience.InterfaceAudience;
-import org.jboss.netty.util.Timer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,6 +41,7 @@ import org.apache.kudu.consensus.Metadata.RaftPeerPB.Role;
 import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
 import org.apache.kudu.rpc.RpcHeader.ErrorStatusPB.RpcErrorCodePB;
 import org.apache.kudu.util.NetUtil;
+import org.apache.kudu.util.Pair;
 
 /**
  * Class responsible for fanning out RPCs to all of the configured masters,
@@ -52,7 +54,6 @@ final class ConnectToCluster {
 
   private final List<HostAndPort> masterAddrs;
   private final Deferred<ConnectToClusterResponse> responseD;
-  private final int numMasters;
 
   // Used to avoid calling 'responseD' twice.
   private final AtomicBoolean responseDCalled = new AtomicBoolean(false);
@@ -69,6 +70,8 @@ final class ConnectToCluster {
    * list of masters in the cluster, it is stored here. Otherwise, null.
    */
   private AtomicReference<List<HostPortPB>> knownMasters = new AtomicReference<>();
+
+  private int numMasters;
 
   /**
    * Creates an object that holds the state needed to retrieve master table's location.
@@ -167,11 +170,31 @@ final class ConnectToCluster {
     // waits until it gets a good response before firing the returned
     // deferred.
     List<Deferred<ConnectToMasterResponsePB>> deferreds = new ArrayList<>();
+    List<Pair<InetAddress, HostAndPort>> masterAddrsWithNames = new ArrayList<>();
     for (HostAndPort hostAndPort : masterAddrs) {
+      InetAddress[] inetAddrs = NetUtil.getAllInetAddresses(hostAndPort.getHost());
+      if (inetAddrs != null) {
+        if (inetAddrs.length > 1) {
+          LOG.info("Specified master server address {} resolved to multiple IPs {}. " +
+                   "Connecting to each one of them.", hostAndPort.getHost(), inetAddrs);
+        }
+        for (InetAddress addr : inetAddrs) {
+          masterAddrsWithNames.add(
+              new Pair<>(addr, new HostAndPort(addr.getHostAddress(), hostAndPort.getPort())));
+        }
+      } else {
+        masterAddrsWithNames.add(new Pair<>(null, hostAndPort));
+      }
+    }
+
+    this.numMasters = masterAddrsWithNames.size();
+    for (Pair<InetAddress, HostAndPort> masterPair : masterAddrsWithNames) {
+      InetAddress addr = masterPair.getFirst();
+      HostAndPort hostAndPort = masterPair.getSecond();
       Deferred<ConnectToMasterResponsePB> d;
-      AsyncKuduClient client = masterTable.getAsyncClient();
-      RpcProxy proxy = client.newMasterRpcProxy(hostAndPort, credentialsPolicy);
-      if (proxy != null) {
+      if (addr != null) {
+        AsyncKuduClient client = masterTable.getAsyncClient();
+        RpcProxy proxy = client.newMasterRpcProxy(hostAndPort, addr, credentialsPolicy);
         d = connectToMaster(masterTable, proxy, parentRpc, client.getTimer(), defaultTimeoutMs);
       } else {
         String message = "Couldn't resolve this master's address " + hostAndPort.toString();
@@ -253,7 +276,7 @@ final class ConnectToCluster {
 
         List<HostPortPB> knownMastersLocal = knownMasters.get();
         if (knownMastersLocal != null &&
-            knownMastersLocal.size() != numMasters) {
+            knownMastersLocal.size() > numMasters) {
           String msg = String.format(
               "Could not connect to a leader master. " +
               "Client configured with %s master(s) (%s) but cluster indicates it expects " +

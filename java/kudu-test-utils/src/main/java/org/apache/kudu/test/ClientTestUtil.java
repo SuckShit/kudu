@@ -22,6 +22,7 @@ import static org.junit.Assert.assertEquals;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.sql.Date;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -59,6 +60,7 @@ import org.apache.kudu.client.RowResult;
 import org.apache.kudu.client.RowResultIterator;
 import org.apache.kudu.client.Upsert;
 import org.apache.kudu.util.CharUtil;
+import org.apache.kudu.util.DateUtil;
 import org.apache.kudu.util.DecimalUtil;
 
 /**
@@ -220,7 +222,8 @@ public abstract class ClientTestUtil {
             new ColumnSchema.ColumnSchemaBuilder("decimal", Type.DECIMAL)
               .typeAttributes(DecimalUtil.typeAttributes(5, 3)).build(),
             new ColumnSchema.ColumnSchemaBuilder("varchar", Type.VARCHAR)
-              .typeAttributes(CharUtil.typeAttributes(10)).build());
+              .typeAttributes(CharUtil.typeAttributes(10)).build(),
+            new ColumnSchema.ColumnSchemaBuilder("date", Type.DATE).build());
 
     return new Schema(columns);
   }
@@ -228,7 +231,7 @@ public abstract class ClientTestUtil {
   public static PartialRow getPartialRowWithAllTypes() {
     Schema schema = getSchemaWithAllTypes();
     // Ensure we aren't missing any types
-    assertEquals(14, schema.getColumnCount());
+    assertEquals(15, schema.getColumnCount());
 
     PartialRow row = schema.newPartialRow();
     row.addByte("int8", (byte) 42);
@@ -236,6 +239,7 @@ public abstract class ClientTestUtil {
     row.addInt("int32", 44);
     row.addLong("int64", 45);
     row.addTimestamp("timestamp", new Timestamp(1234567890));
+    row.addDate("date", DateUtil.epochDaysToSqlDate(0));
     row.addBoolean("bool", true);
     row.addFloat("float", 52.35F);
     row.addDouble("double", 53.35);
@@ -462,6 +466,13 @@ public abstract class ClientTestUtil {
         .key(true).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.UNIXTIME_MICROS)
         .nullable(true).build());
+    return new Schema(columns);
+  }
+
+  public static Schema createSchemaWithDateColumns() {
+    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>();
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.DATE).key(true).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.DATE).nullable(true).build());
     return new Schema(columns);
   }
 

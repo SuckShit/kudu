@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -26,7 +27,6 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -42,8 +42,6 @@
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/ref_counted_replicate.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -51,14 +49,12 @@
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/metrics.h"
 #include "kudu/util/random.h"
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 DEFINE_int32(num_writer_threads, 4, "Number of threads writing to the log");
 DEFINE_int32(num_reader_threads, 1, "Number of threads accessing the log while writes are ongoing");
@@ -69,16 +65,18 @@ DEFINE_bool(verify_log, true, "Whether to verify the log by reading it after the
 DECLARE_int32(log_thread_idle_threshold_ms);
 DECLARE_int32(log_inject_thread_lifecycle_latency_ms);
 
+using kudu::consensus::OpId;
+using kudu::consensus::ReplicateRefPtr;
+using kudu::consensus::ReplicateMsg;
+using kudu::consensus::WRITE_OP;
+using kudu::consensus::make_scoped_refptr_replicate;
+using std::map;
+using std::shared_ptr;
+using std::thread;
+using std::vector;
+
 namespace kudu {
 namespace log {
-
-using std::shared_ptr;
-using std::vector;
-using consensus::OpId;
-using consensus::ReplicateRefPtr;
-using consensus::ReplicateMsg;
-using consensus::WRITE_OP;
-using consensus::make_scoped_refptr_replicate;
 
 namespace {
 
@@ -97,7 +95,8 @@ class CustomLatchCallback : public RefCountedThreadSafe<CustomLatchCallback> {
   }
 
   StatusCallback AsStatusCallback() {
-    return Bind(&CustomLatchCallback::StatusCB, this);
+    scoped_refptr<CustomLatchCallback> self(this);
+    return [self](const Status& s) { self->StatusCB(s); };
   }
 
  private:
@@ -170,19 +169,17 @@ class MultiThreadedLogTest : public LogTestBase {
 
   void Run() {
     for (int i = 0; i < FLAGS_num_writer_threads; i++) {
-      scoped_refptr<kudu::Thread> new_thread;
-      CHECK_OK(kudu::Thread::Create("test", "inserter",
-          &MultiThreadedLogTest::LogWriterThread, this, i, &new_thread));
-      threads_.push_back(new_thread);
+      threads_.emplace_back([this, i]() { this->LogWriterThread(i); });
     }
 
     // Start a thread which calls some read-only methods on the log
     // to check for races against writers.
     std::atomic<bool> stop_reader(false);
-    vector<std::thread> reader_threads;
+    vector<thread> reader_threads;
+    reader_threads.reserve(FLAGS_num_reader_threads);
     for (int i = 0; i < FLAGS_num_reader_threads; i++) {
       reader_threads.emplace_back([&]() {
-          std::map<int64_t, int64_t> map;
+          map<int64_t, int64_t> map;
           while (!stop_reader) {
             log_->GetReplaySizeMap(&map);
             log_->GetGCableDataSize(RetentionIndexes(FLAGS_num_batches_per_thread));
@@ -191,8 +188,8 @@ class MultiThreadedLogTest : public LogTestBase {
     }
 
     // Wait for the writers to finish.
-    for (scoped_refptr<kudu::Thread>& thread : threads_) {
-      ASSERT_OK(ThreadJoiner(thread.get()).Join());
+    for (auto& t : threads_) {
+      t.join();
     }
 
     // Then stop the reader and join on it as well.
@@ -204,7 +201,12 @@ class MultiThreadedLogTest : public LogTestBase {
 
   void VerifyLog() {
     shared_ptr<LogReader> reader;
-    ASSERT_OK(LogReader::Open(fs_manager_.get(), nullptr, kTestTablet, nullptr, &reader));
+    ASSERT_OK(LogReader::Open(fs_manager_.get(),
+                              /*index*/nullptr,
+                              kTestTablet,
+                              metric_entity_tablet_,
+                              file_cache_.get(),
+                              &reader));
     SegmentSequence segments;
     reader->GetSegmentsSnapshot(&segments);
 
@@ -221,7 +223,7 @@ class MultiThreadedLogTest : public LogTestBase {
  private:
   ThreadSafeRandom random_;
   simple_spinlock lock_;
-  vector<scoped_refptr<kudu::Thread> > threads_;
+  vector<thread> threads_;
 };
 
 TEST_F(MultiThreadedLogTest, TestAppends) {

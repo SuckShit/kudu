@@ -110,8 +110,10 @@ class DiagnosticsLog::SymbolSet {
 };
 
 DiagnosticsLog::DiagnosticsLog(string log_dir,
+                               string program_name,
                                MetricRegistry* metric_registry) :
     log_dir_(std::move(log_dir)),
+    program_name_(std::move(program_name)),
     metric_registry_(metric_registry),
     wake_(&lock_),
     metrics_log_interval_(MonoDelta::FromSeconds(60)),
@@ -134,12 +136,11 @@ void DiagnosticsLog::DumpStacksNow(std::string reason) {
 
 
 Status DiagnosticsLog::Start() {
-  unique_ptr<RollingLog> l(new RollingLog(Env::Default(), log_dir_, "diagnostics"));
+  unique_ptr<RollingLog> l(new RollingLog(Env::Default(), log_dir_, program_name_, "diagnostics"));
   RETURN_NOT_OK_PREPEND(l->Open(), "unable to open diagnostics log");
   log_ = std::move(l);
   Status s = Thread::Create("server", "diag-logger",
-                            &DiagnosticsLog::RunThread,
-                            this, &thread_);
+                            [this]() { this->RunThread(); }, &thread_);
   if (!s.ok()) {
     // Don't leave the log open if we failed to start our thread.
     log_.reset();

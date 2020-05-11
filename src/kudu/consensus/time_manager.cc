@@ -15,17 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/consensus/time_manager.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <mutex>
 #include <ostream>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
+#include "kudu/clock/clock.h"
 #include "kudu/consensus/consensus.pb.h"
-#include "kudu/consensus/time_manager.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -72,12 +73,12 @@ ExternalConsistencyMode TimeManager::GetMessageConsistencyMode(const ReplicateMs
   return CLIENT_PROPAGATED;
 }
 
-TimeManager::TimeManager(scoped_refptr<Clock> clock, Timestamp initial_safe_time)
+TimeManager::TimeManager(Clock* clock, Timestamp initial_safe_time)
   : last_serial_ts_assigned_(initial_safe_time),
     last_safe_ts_(initial_safe_time),
     last_advanced_safe_time_(MonoTime::Now()),
     mode_(NON_LEADER),
-    clock_(std::move(clock)) {}
+    clock_(clock) {}
 
 void TimeManager::SetLeaderMode() {
   Lock l(lock_);
@@ -93,9 +94,10 @@ void TimeManager::SetNonLeaderMode() {
 Status TimeManager::AssignTimestamp(ReplicateMsg* message) {
   Lock l(lock_);
   if (PREDICT_FALSE(mode_ == NON_LEADER)) {
-    return Status::IllegalState(Substitute("Cannot assign timestamp to transaction. Tablet is not "
-                                           "in leader mode. Last heard from a leader: $0 secs ago.",
-                                           last_advanced_safe_time_.ToString()));
+    return Status::IllegalState(Substitute(
+        "Cannot assign timestamp to transaction. Tablet is not "
+        "in leader mode. Last heard from a leader: $0 ago.",
+        (MonoTime::Now() - last_advanced_safe_time_).ToString()));
   }
   Timestamp t;
   switch (GetMessageConsistencyMode(*message)) {
@@ -263,17 +265,15 @@ void TimeManager::AdvanceSafeTimeAndWakeUpWaitersUnlocked(Timestamp safe_time) {
   last_safe_ts_ = safe_time;
   last_advanced_safe_time_ = MonoTime::Now();
 
-  if (PREDICT_FALSE(!waiters_.empty())) {
-    auto iter = waiters_.begin();
-    while (iter != waiters_.end()) {
-      WaitingState* waiter = *iter;
-      if (IsTimestampSafeUnlocked(waiter->timestamp)) {
-        iter = waiters_.erase(iter);
-        waiter->latch->CountDown();
-        continue;
-      }
-      iter++;
+  auto iter = waiters_.begin();
+  while (iter != waiters_.end()) {
+    WaitingState* waiter = *iter;
+    if (IsTimestampSafeUnlocked(waiter->timestamp)) {
+      iter = waiters_.erase(iter);
+      waiter->latch->CountDown();
+      continue;
     }
+    ++iter;
   }
 }
 

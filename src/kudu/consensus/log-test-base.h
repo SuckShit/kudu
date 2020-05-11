@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_CONSENSUS_LOG_TEST_BASE_H
-#define KUDU_CONSENSUS_LOG_TEST_BASE_H
+#pragma once
 
 #include "kudu/consensus/log.h"
 
@@ -37,7 +36,6 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid_util.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -45,6 +43,7 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/env_util.h"
+#include "kudu/util/file_cache.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
@@ -52,6 +51,7 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+METRIC_DECLARE_entity(server);
 METRIC_DECLARE_entity(tablet);
 
 namespace kudu {
@@ -66,7 +66,7 @@ constexpr bool APPEND_ASYNC = false;
 // Append a single batch of 'count' NoOps to the log.
 // If 'size' is not NULL, increments it by the expected increase in log size.
 // Increments 'op_id''s index once for each operation logged.
-inline Status AppendNoOpsToLogSync(const scoped_refptr<clock::Clock>& clock,
+inline Status AppendNoOpsToLogSync(clock::Clock* clock,
                                    Log* log,
                                    consensus::OpId* op_id,
                                    int count,
@@ -104,7 +104,7 @@ inline Status AppendNoOpsToLogSync(const scoped_refptr<clock::Clock>& clock,
   return s.Wait();
 }
 
-inline Status AppendNoOpToLogSync(const scoped_refptr<clock::Clock>& clock,
+inline Status AppendNoOpToLogSync(clock::Clock* clock,
                                   Log* log,
                                   consensus::OpId* op_id,
                                   int* size = nullptr) {
@@ -154,13 +154,20 @@ class LogTestBase : public KuduTest {
   void SetUp() override {
     KuduTest::SetUp();
     current_index_ = kStartIndex;
-    fs_manager_.reset(new FsManager(env_, GetTestPath("fs_root")));
-    metric_registry_.reset(new MetricRegistry());
-    metric_entity_ = METRIC_ENTITY_tablet.Instantiate(metric_registry_.get(), "log-test-base");
+    fs_manager_.reset(new FsManager(env_, FsManagerOpts(GetTestPath("fs_root"))));
+    metric_registry_.reset(new MetricRegistry);
+    metric_entity_tablet_ = METRIC_ENTITY_tablet.Instantiate(
+        metric_registry_.get(), "tablet");
+    metric_entity_server_ = METRIC_ENTITY_server.Instantiate(
+        metric_registry_.get(), "server");
+    // Capacity was chosen arbitrarily: high enough to cache multiple files, but
+    // low enough to see some eviction.
+    file_cache_.reset(new FileCache("log-test-base", env_, 5, metric_entity_server_));
+    ASSERT_OK(file_cache_->Init());
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
     ASSERT_OK(fs_manager_->Open());
 
-    clock_.reset(new clock::HybridClock());
+    clock_.reset(new clock::HybridClock(metric_entity_server_));
     ASSERT_OK(clock_->Init());
   }
 
@@ -172,10 +179,11 @@ class LogTestBase : public KuduTest {
     Schema schema_with_ids = SchemaBuilder(schema_).Build();
     return Log::Open(options_,
                      fs_manager_.get(),
+                     file_cache_.get(),
                      kTestTablet,
                      schema_with_ids,
                      0, // schema_version
-                     metric_entity_.get(),
+                     metric_entity_tablet_.get(),
                      &log_);
   }
 
@@ -244,7 +252,7 @@ class LogTestBase : public KuduTest {
     // AsyncAppendReplicates does not free the ReplicateMsg on completion, so we
     // need to pass it through to our callback.
     return log_->AsyncAppendReplicates(
-        { replicate }, Bind(&LogTestBase::CheckReplicateResult, replicate));
+        { replicate }, [replicate](const Status& s) { CheckReplicateResult(replicate, s); });
   }
 
   static void CheckCommitResult(const Status& s) {
@@ -270,7 +278,7 @@ class LogTestBase : public KuduTest {
                       int rs_id,
                       int dms_id,
                       bool sync = APPEND_SYNC) {
-    gscoped_ptr<consensus::CommitMsg> commit(new consensus::CommitMsg);
+    std::unique_ptr<consensus::CommitMsg> commit(new consensus::CommitMsg);
     commit->set_op_type(consensus::WRITE_OP);
 
     commit->mutable_commited_op_id()->CopyFrom(original_opid);
@@ -291,7 +299,7 @@ class LogTestBase : public KuduTest {
   // indicating that the associated writes failed due to
   // "NotFound" errors.
   Status AppendCommitWithNotFoundOpResults(const consensus::OpId& original_opid) {
-    gscoped_ptr<consensus::CommitMsg> commit(new consensus::CommitMsg);
+    std::unique_ptr<consensus::CommitMsg> commit(new consensus::CommitMsg);
     commit->set_op_type(consensus::WRITE_OP);
     commit->mutable_commited_op_id()->CopyFrom(original_opid);
 
@@ -305,7 +313,7 @@ class LogTestBase : public KuduTest {
     return AppendCommit(std::move(commit));
   }
 
-  Status AppendCommit(gscoped_ptr<consensus::CommitMsg> commit,
+  Status AppendCommit(std::unique_ptr<consensus::CommitMsg> commit,
                       bool sync = APPEND_SYNC) {
     if (sync) {
       Synchronizer s;
@@ -313,7 +321,7 @@ class LogTestBase : public KuduTest {
       return s.Wait();
     }
     return log_->AsyncAppendCommit(std::move(commit),
-                                   Bind(&LogTestBase::CheckCommitResult));
+                                   [](const Status& s) { CheckCommitResult(s); });
   }
 
     // Appends 'count' ReplicateMsgs and the corresponding CommitMsgs to the log
@@ -332,7 +340,7 @@ class LogTestBase : public KuduTest {
   // If non-NULL, and if the write is successful, 'size' is incremented
   // by the size of the written operation.
   Status AppendNoOp(consensus::OpId* op_id, int* size = nullptr) {
-    return AppendNoOpToLogSync(clock_, log_.get(), op_id, size);
+    return AppendNoOpToLogSync(clock_.get(), log_.get(), op_id, size);
   }
 
   // Append a number of no-op entries to the log.
@@ -374,19 +382,19 @@ class LogTestBase : public KuduTest {
   };
 
   const Schema schema_;
-  gscoped_ptr<FsManager> fs_manager_;
-  gscoped_ptr<MetricRegistry> metric_registry_;
-  scoped_refptr<MetricEntity> metric_entity_;
+  std::unique_ptr<FsManager> fs_manager_;
+  std::unique_ptr<MetricRegistry> metric_registry_;
+  std::unique_ptr<FileCache> file_cache_;
+  scoped_refptr<MetricEntity> metric_entity_tablet_;
+  scoped_refptr<MetricEntity> metric_entity_server_;
   scoped_refptr<Log> log_;
   int64_t current_index_;
   LogOptions options_;
   // Reusable entries vector that deletes the entries on destruction.
   LogEntries entries_;
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
-  scoped_refptr<clock::Clock> clock_;
+  std::unique_ptr<clock::Clock> clock_;
 };
 
 } // namespace log
 } // namespace kudu
-
-#endif

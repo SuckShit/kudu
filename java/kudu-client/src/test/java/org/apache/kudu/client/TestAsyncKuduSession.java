@@ -34,6 +34,8 @@ import com.stumbleupon.async.Deferred;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.Schema;
 import org.apache.kudu.WireProtocol.AppStatusPB;
@@ -41,6 +43,8 @@ import org.apache.kudu.test.KuduTestHarness;
 import org.apache.kudu.tserver.Tserver.TabletServerErrorPB;
 
 public class TestAsyncKuduSession {
+  private static final Logger LOG = LoggerFactory.getLogger(TestAsyncKuduSession.class);
+
   private static final String TABLE_NAME = TestAsyncKuduSession.class.getName();
   private static final Schema SCHEMA = getBasicSchema();
   private static final String INJECTED_TS_ERROR = "injected error for test";
@@ -160,16 +164,22 @@ public class TestAsyncKuduSession {
   public void testInsertIntoUnavailableTablet() throws Exception {
     harness.killAllTabletServers();
     session.setTimeoutMillis(1);
+    // Test AUTO_FLUSH_SYNC (the default).
     OperationResponse response = session.apply(createInsert(1)).join();
     assertTrue(response.hasRowError());
+    LOG.debug("response error: {}", response.getRowError());
     assertTrue(response.getRowError().getErrorStatus().isTimedOut());
 
+    // Test MANUAL_FLUSH.
     session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
     Insert insert = createInsert(1);
     session.apply(insert);
     List<OperationResponse> responses = session.flush().join();
     assertEquals(1, responses.size());
-    assertTrue(responses.get(0).getRowError().getErrorStatus().isTimedOut());
+    response = responses.get(0);
+    assertTrue(response.hasRowError());
+    LOG.debug("response error: {}", response.getRowError());
+    assertTrue(response.getRowError().getErrorStatus().isTimedOut());
   }
 
   /**

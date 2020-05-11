@@ -17,9 +17,9 @@
 #include "kudu/consensus/consensus_queue.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <functional>
-#include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -29,7 +29,6 @@
 #include <boost/optional/optional.hpp>
 #include <boost/optional/optional_io.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 
 #include "kudu/common/common.pb.h"
 #include "kudu/common/timestamp.h"
@@ -38,8 +37,6 @@
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/consensus/time_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
@@ -48,6 +45,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flag_validators.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/pb_util.h"
@@ -73,18 +71,36 @@ DEFINE_int32(consensus_inject_latency_ms_in_notifications, 0,
 TAG_FLAG(consensus_inject_latency_ms_in_notifications, hidden);
 TAG_FLAG(consensus_inject_latency_ms_in_notifications, unsafe);
 
-DECLARE_int32(consensus_rpc_timeout_ms);
-DECLARE_bool(safe_time_advancement_without_writes);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
+DECLARE_bool(safe_time_advancement_without_writes);
+DECLARE_int32(consensus_rpc_timeout_ms);
+DECLARE_int64(rpc_max_message_size);
 
 using kudu::log::Log;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
+using std::atomic;
 using std::string;
 using std::unique_ptr;
 using std::unordered_map;
 using std::vector;
 using strings::Substitute;
+
+static bool ValidateMaxMessageSizeFlags() {
+  static const int64_t kSizeDelta = 1024;
+  const int64_t raft_max_size = FLAGS_consensus_max_batch_size_bytes;
+  const int64_t rpc_max_size = FLAGS_rpc_max_message_size;
+  if (raft_max_size + kSizeDelta > rpc_max_size) {
+    LOG(ERROR) << strings::Substitute(
+        "--consensus_max_batch_size_bytes is set too high compared with "
+        "--rpc_max_message_size; either increase --rpc_max_message_size "
+        "at least up to $0 or decrease --consensus_max_batch_size_bytes "
+        "down to $1", raft_max_size + kSizeDelta, rpc_max_size - kSizeDelta);
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(max_message_size_flags, ValidateMaxMessageSizeFlags);
 
 namespace kudu {
 namespace consensus {
@@ -128,6 +144,7 @@ PeerMessageQueue::TrackedPeer::TrackedPeer(RaftPeerPB peer_pb)
       last_exchange_status(PeerStatus::NEW),
       last_communication_time(MonoTime::Now()),
       wal_catchup_possible(true),
+      remote_server_quiescing(false),
       last_overall_health_status(HealthReportPB::UNKNOWN),
       status_log_throttler(std::make_shared<logging::LogThrottler>()),
       last_seen_term_(0) {
@@ -154,19 +171,21 @@ PeerMessageQueue::Metrics::Metrics(const scoped_refptr<MetricEntity>& metric_ent
 
 PeerMessageQueue::PeerMessageQueue(const scoped_refptr<MetricEntity>& metric_entity,
                                    scoped_refptr<log::Log> log,
-                                   scoped_refptr<TimeManager> time_manager,
+                                   TimeManager* time_manager,
                                    RaftPeerPB local_peer_pb,
                                    string tablet_id,
                                    unique_ptr<ThreadPoolToken> raft_pool_observers_token,
+                                   const atomic<bool>* server_quiescing,
                                    OpId last_locally_replicated,
                                    const OpId& last_locally_committed)
     : raft_pool_observers_token_(std::move(raft_pool_observers_token)),
+      server_quiescing_(server_quiescing),
       local_peer_pb_(std::move(local_peer_pb)),
       tablet_id_(std::move(tablet_id)),
       successor_watch_in_progress_(false),
       log_cache_(metric_entity, std::move(log), local_peer_pb_.permanent_uuid(), tablet_id_),
       metrics_(metric_entity),
-      time_manager_(std::move(time_manager)) {
+      time_manager_(time_manager) {
   DCHECK(local_peer_pb_.has_permanent_uuid());
   DCHECK(local_peer_pb_.has_last_known_addr());
   DCHECK(last_locally_replicated.IsInitialized());
@@ -356,12 +375,13 @@ void PeerMessageQueue::LocalPeerAppendFinished(const OpId& id,
   }
   ResponseFromPeer(local_peer_pb_.permanent_uuid(), fake_response);
 
-  callback.Run(status);
+  callback(status);
 }
 
 Status PeerMessageQueue::AppendOperation(const ReplicateRefPtr& msg) {
-  return AppendOperations({ msg }, Bind(CrashIfNotOkStatusCB,
-                                        "Enqueued replicate operation failed to write to WAL"));
+  return AppendOperations({ msg }, [](const Status& s) {
+    CrashIfNotOkStatusCB("Enqueued replicate operation failed to write to WAL", s);
+  });
 }
 
 Status PeerMessageQueue::AppendOperations(const vector<ReplicateRefPtr>& msgs,
@@ -403,11 +423,10 @@ Status PeerMessageQueue::AppendOperations(const vector<ReplicateRefPtr>& msgs,
   // for the log buffer to empty, it may need to call LocalPeerAppendFinished()
   // which also needs queue_lock_.
   lock.unlock();
-  RETURN_NOT_OK(log_cache_.AppendOperations(msgs,
-                                            Bind(&PeerMessageQueue::LocalPeerAppendFinished,
-                                                 Unretained(this),
-                                                 last_id,
-                                                 log_append_callback)));
+  RETURN_NOT_OK(log_cache_.AppendOperations(
+      msgs, [this, last_id, log_append_callback](const Status& s) {
+        this->LocalPeerAppendFinished(last_id, log_append_callback, s);
+      }));
   lock.lock();
   DCHECK(last_id.IsInitialized());
   queue_state_.last_appended = last_id;
@@ -800,7 +819,7 @@ void PeerMessageQueue::AdvanceQueueWatermark(const char* type,
                                              int num_peers_required,
                                              ReplicaTypes replica_types,
                                              const TrackedPeer* who_caused) {
-
+  DCHECK(queue_lock_.is_locked());
   VLOG_WITH_PREFIX_UNLOCKED(2)
       << Substitute("Updating $0 watermark: Peer ($1) changed from $2 to $3. "
                     "Current value: $4",
@@ -1049,16 +1068,25 @@ void PeerMessageQueue::PromoteIfNeeded(TrackedPeer* peer, const TrackedPeer& pre
 void PeerMessageQueue::TransferLeadershipIfNeeded(const TrackedPeer& peer,
                                                   const ConsensusStatusPB& status) {
   DCHECK(queue_lock_.is_locked());
-  if (!successor_watch_in_progress_) {
+  bool server_quiescing = server_quiescing_ && *server_quiescing_;
+  // Only transfer leadership if the local peer has begun looking for a
+  // successor, or if the server is quiescing. Otherwise, exit early.
+  if (!successor_watch_in_progress_ && !server_quiescing) {
     return;
   }
 
-  if (designated_successor_uuid_ && peer.uuid() != designated_successor_uuid_.get()) {
-    return;
-  }
-
+  // Do some basic sanity checks that we can actually transfer leadership to
+  // the given peer.
   if (queue_state_.mode != PeerMessageQueue::LEADER ||
-      peer.last_exchange_status != PeerStatus::OK) {
+      local_peer_pb_.permanent_uuid() == peer.uuid() ||
+      peer.last_exchange_status != PeerStatus::OK ||
+      peer.remote_server_quiescing) {
+    return;
+  }
+
+  // If looking for a specific successor, ignore peers as appropriate.
+  if (successor_watch_in_progress_ &&
+      designated_successor_uuid_ && peer.uuid() != designated_successor_uuid_.get()) {
     return;
   }
 
@@ -1126,6 +1154,10 @@ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
     // want to immediately send another request as we attempt to sync the log
     // offset between the local leader and the remote peer.
     UpdateExchangeStatus(peer, prev_peer_state, response, &send_more_immediately);
+
+    // If the peer is hosted on a server that is quiescing, note that now.
+    peer->remote_server_quiescing = response.has_server_quiescing() &&
+                                    response.server_quiescing();
 
     // If the reported last-received op for the replica is in our local log,
     // then resume sending entries from that point onward. Otherwise, resume
@@ -1421,59 +1453,65 @@ bool PeerMessageQueue::IsOpInLog(const OpId& desired_op) const {
 }
 
 void PeerMessageQueue::NotifyObserversOfCommitIndexChange(int64_t new_commit_index) {
-  WARN_NOT_OK(raft_pool_observers_token_->SubmitClosure(
-      Bind(&PeerMessageQueue::NotifyObserversTask, Unretained(this),
-           [=](PeerMessageQueueObserver* observer) {
-             observer->NotifyCommitIndex(new_commit_index);
-           })),
+  WARN_NOT_OK(raft_pool_observers_token_->Submit(
+      [=](){ this->NotifyObserversTask(
+          [=](PeerMessageQueueObserver* observer) {
+            observer->NotifyCommitIndex(new_commit_index);
+          });
+      }),
       LogPrefixUnlocked() + "Unable to notify RaftConsensus of commit index change.");
 }
 
 void PeerMessageQueue::NotifyObserversOfTermChange(int64_t term) {
-  WARN_NOT_OK(raft_pool_observers_token_->SubmitClosure(
-      Bind(&PeerMessageQueue::NotifyObserversTask, Unretained(this),
-           [=](PeerMessageQueueObserver* observer) {
-             observer->NotifyTermChange(term);
-           })),
+  WARN_NOT_OK(raft_pool_observers_token_->Submit(
+      [=](){ this->NotifyObserversTask(
+          [=](PeerMessageQueueObserver* observer) {
+            observer->NotifyTermChange(term);
+          });
+      }),
       LogPrefixUnlocked() + "Unable to notify RaftConsensus of term change.");
 }
 
 void PeerMessageQueue::NotifyObserversOfFailedFollower(const string& uuid,
                                                        int64_t term,
                                                        const string& reason) {
-  WARN_NOT_OK(raft_pool_observers_token_->SubmitClosure(
-      Bind(&PeerMessageQueue::NotifyObserversTask, Unretained(this),
-           [=](PeerMessageQueueObserver* observer) {
-             observer->NotifyFailedFollower(uuid, term, reason);
-           })),
+  WARN_NOT_OK(raft_pool_observers_token_->Submit(
+      [=](){ this->NotifyObserversTask(
+          [=](PeerMessageQueueObserver* observer) {
+            observer->NotifyFailedFollower(uuid, term, reason);
+          });
+      }),
       LogPrefixUnlocked() + "Unable to notify RaftConsensus of abandoned follower.");
 }
 
 void PeerMessageQueue::NotifyObserversOfPeerToPromote(const string& peer_uuid) {
-  WARN_NOT_OK(raft_pool_observers_token_->SubmitClosure(
-      Bind(&PeerMessageQueue::NotifyObserversTask, Unretained(this),
-           [=](PeerMessageQueueObserver* observer) {
-             observer->NotifyPeerToPromote(peer_uuid);
-           })),
+  WARN_NOT_OK(raft_pool_observers_token_->Submit(
+      [=](){ this->NotifyObserversTask(
+          [=](PeerMessageQueueObserver* observer) {
+            observer->NotifyPeerToPromote(peer_uuid);
+          });
+      }),
       LogPrefixUnlocked() + "Unable to notify RaftConsensus of peer to promote.");
 }
 
 void PeerMessageQueue::NotifyObserversOfSuccessor(const string& peer_uuid) {
   DCHECK(queue_lock_.is_locked());
-  WARN_NOT_OK(raft_pool_observers_token_->SubmitClosure(
-      Bind(&PeerMessageQueue::NotifyObserversTask, Unretained(this),
-           [=](PeerMessageQueueObserver* observer) {
-             observer->NotifyPeerToStartElection(peer_uuid);
-           })),
+  WARN_NOT_OK(raft_pool_observers_token_->Submit(
+      [=](){ this->NotifyObserversTask(
+          [=](PeerMessageQueueObserver* observer) {
+            observer->NotifyPeerToStartElection(peer_uuid);
+          });
+      }),
       LogPrefixUnlocked() + "Unable to notify RaftConsensus of available successor.");
 }
 
 void PeerMessageQueue::NotifyObserversOfPeerHealthChange() {
-  WARN_NOT_OK(raft_pool_observers_token_->SubmitClosure(
-      Bind(&PeerMessageQueue::NotifyObserversTask, Unretained(this),
-           [](PeerMessageQueueObserver* observer) {
-             observer->NotifyPeerHealthChange();
-           })),
+  WARN_NOT_OK(raft_pool_observers_token_->Submit(
+      [=](){ this->NotifyObserversTask(
+          [](PeerMessageQueueObserver* observer) {
+            observer->NotifyPeerHealthChange();
+          });
+      }),
       LogPrefixUnlocked() + "Unable to notify RaftConsensus peer health change.");
 }
 

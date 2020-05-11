@@ -66,15 +66,14 @@ ColumnPredicate::ColumnPredicate(PredicateType predicate_type,
 
 ColumnPredicate::ColumnPredicate(PredicateType predicate_type,
                                  ColumnSchema column,
-                                 std::vector<BloomFilterInner>* bfs,
+                                 vector<BlockBloomFilter*> bfs,
                                  const void* lower,
                                  const void* upper)
     : predicate_type_(predicate_type),
       column_(move(column)),
       lower_(lower),
-      upper_(upper) {
-  bloom_filters_.swap(*bfs);
-}
+      upper_(upper),
+      bloom_filters_(move(bfs)) {}
 
 ColumnPredicate ColumnPredicate::Equality(ColumnSchema column, const void* value) {
   CHECK(value != nullptr);
@@ -111,12 +110,12 @@ ColumnPredicate ColumnPredicate::InList(ColumnSchema column,
 }
 
 ColumnPredicate ColumnPredicate::InBloomFilter(ColumnSchema column,
-                                               std::vector<BloomFilterInner>* bfs,
+                                               std::vector<BlockBloomFilter*> bfs,
                                                const void* lower,
                                                const void* upper) {
-  CHECK(bfs != nullptr);
-  CHECK(!bfs->empty());
-  ColumnPredicate pred(PredicateType::InBloomFilter, move(column), bfs, lower, upper);
+  CHECK(!bfs.empty());
+  ColumnPredicate pred(PredicateType::InBloomFilter, move(column), move(bfs), lower,
+                       upper);
   pred.Simplify();
   return pred;
 }
@@ -681,7 +680,7 @@ int ApplyPredicatePrimitive(const ColumnBlock& block, uint8_t* __restrict__ sel_
   }
   if (block.is_nullable()) {
     for (int i = 0; i < n_chunks; i++) {
-      sel_bitmap[i] &= block.null_bitmap()[i];
+      sel_bitmap[i] &= block.non_null_bitmap()[i];
     }
   }
   return n_chunks * 8;
@@ -723,9 +722,9 @@ template<bool IS_NOT_NULL>
 void ApplyNullPredicate(const ColumnBlock& block, uint8_t* __restrict__ sel_vec) {
   int n_bytes = KUDU_ALIGN_UP(block.nrows(), 8) / 8;
   for (int i = 0; i < n_bytes; i++) {
-    uint8_t null_byte = block.null_bitmap()[i];
-    if (!IS_NOT_NULL) null_byte = ~null_byte;
-    sel_vec[i] &= null_byte;
+    uint8_t non_null_byte = block.non_null_bitmap()[i];
+    if (!IS_NOT_NULL) non_null_byte = ~non_null_byte;
+    sel_vec[i] &= non_null_byte;
   }
 }
 } // anonymous namespace
@@ -874,8 +873,9 @@ string ColumnPredicate::ToString() const {
     case PredicateType::InBloomFilter: {
       return strings::Substitute("`$0` IS InBloomFilter", column_.name());
     };
+    default:
+      LOG(FATAL) << "unknown predicate type";
   }
-  LOG(FATAL) << "unknown predicate type";
 }
 
 bool ColumnPredicate::operator==(const ColumnPredicate& other) const {
@@ -886,7 +886,15 @@ bool ColumnPredicate::operator==(const ColumnPredicate& other) const {
   switch (predicate_type_) {
     case PredicateType::Equality: return column_.type_info()->Compare(lower_, other.lower_) == 0;
     case PredicateType::InBloomFilter: {
-      if (bloom_filters_ != other.bloom_filters()) {
+      if (bloom_filters_.size() != other.bloom_filters().size()) {
+        return false;
+      }
+      // Compare the actual BlockBloomFilters pointed by the vectors.
+      if (!std::equal(bloom_filters_.begin(), bloom_filters_.end(),
+                      other.bloom_filters().begin(),
+                      [] (const BlockBloomFilter* lhs, const BlockBloomFilter* rhs) {
+                        return *lhs == *rhs;
+                      })) {
         return false;
       }
       FALLTHROUGH_INTENDED;

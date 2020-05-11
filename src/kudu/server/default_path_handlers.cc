@@ -22,13 +22,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
-#include <boost/bind.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -65,6 +65,8 @@
 #include "kudu/util/faststring.h"
 #endif
 
+using google::CommandLineFlagInfo;
+using google::GetCommandLineFlagInfo;
 using std::ifstream;
 using std::ostringstream;
 using std::shared_ptr;
@@ -76,6 +78,27 @@ DEFINE_int64(web_log_bytes, 1024 * 1024,
     "The maximum number of bytes to display on the debug webserver's log page");
 TAG_FLAG(web_log_bytes, advanced);
 TAG_FLAG(web_log_bytes, runtime);
+
+DEFINE_string(metrics_default_level, "debug",
+              "The default severity level to use when filtering the metrics. "
+              "Valid choices are 'debug', 'info', and 'warn'. "
+              "The levels are ordered and lower levels include the levels above them. "
+              "This value can be overridden by passing the level query parameter to the "
+              "'/metrics' endpoint.");
+TAG_FLAG(metrics_default_level, advanced);
+TAG_FLAG(metrics_default_level, runtime);
+TAG_FLAG(metrics_default_level, evolving);
+DEFINE_validator(metrics_default_level, [](const char* flag_name, const string& value) {
+  if (boost::iequals(value, "debug") ||
+      boost::iequals(value, "info") ||
+      boost::iequals(value, "warn")) {
+    return true;
+  }
+  LOG(ERROR) << Substitute("unknown value for --$0 flag: '$1' "
+                           "(expected one of 'debug', 'info', or 'warn')",
+                           flag_name, value);
+  return false;
+});
 
 // For configuration dashboard
 DECLARE_bool(webserver_require_spnego);
@@ -267,48 +290,113 @@ static void MemTrackersHandler(const Webserver::WebRequest& /*req*/,
   *output << "</tbody></table>\n";
 }
 
+static const char* const kName = "name";
+static const char* const kValue = "value";
+static const char* const kId = "id";
+static const char* const kComment = "comment";
+static const char* const kSecure = "secure";
+
+static void FillSecurityConfigs(EasyJson* output) {
+  EasyJson configs = output->Set("security_configs", EasyJson::kArray);
+
+  EasyJson rpc_encryption = configs.PushBack(EasyJson::kObject);
+  rpc_encryption[kName] = "RPC Encryption";
+  rpc_encryption[kValue] = FLAGS_rpc_encryption;
+  rpc_encryption[kSecure] = boost::iequals(FLAGS_rpc_encryption, "required");
+  rpc_encryption[kId] = "rpc_encryption";
+  rpc_encryption[kComment] =
+      "Configure with --rpc_encryption. Most secure value is 'required'.";
+
+  EasyJson rpc_authentication = configs.PushBack(EasyJson::kObject);
+  rpc_authentication[kName] = "RPC Authentication";
+  rpc_authentication[kValue] = FLAGS_rpc_authentication;
+  rpc_authentication[kSecure] = boost::iequals(FLAGS_rpc_authentication, "required");
+  rpc_authentication[kId] = "rpc_authentication";
+  rpc_authentication[kComment] =
+      "Configure with --rpc_authentication. Most secure value is 'required'.";
+
+  EasyJson webserver_encryption = configs.PushBack(EasyJson::kObject);
+  webserver_encryption[kName] = "Webserver Encryption";
+  webserver_encryption[kValue] = FLAGS_webserver_certificate_file.empty() ? "off" : "on";
+  webserver_encryption[kSecure] = !FLAGS_webserver_certificate_file.empty();
+  webserver_encryption[kId] = "webserver_encryption";
+  webserver_encryption[kComment] =
+      "Configure with --webserver_certificate_file and --webserver_private_key_file.";
+
+  EasyJson webserver_redaction = configs.PushBack(EasyJson::kObject);
+  webserver_redaction[kName] = "Webserver Redaction";
+  webserver_redaction[kValue] = FLAGS_redact;
+  webserver_redaction[kSecure] = boost::iequals(FLAGS_redact, "all");
+  webserver_redaction[kId] = "webserver_redaction";
+  webserver_redaction[kComment] =
+      "Configure with --redact. Most secure value is 'all'.";
+
+  EasyJson webserver_spnego = configs.PushBack(EasyJson::kObject);
+  webserver_spnego[kName] = "Webserver Kerberos Authentication via SPNEGO";
+  webserver_spnego[kValue] = FLAGS_webserver_require_spnego ? "on" : "off";
+  webserver_spnego[kSecure] = FLAGS_webserver_require_spnego;
+  webserver_spnego[kId] = "webserver_spnego";
+  webserver_spnego[kComment] = "Configure with --webserver_require_spnego.";
+}
+
+// Information on the configured and the effective time source for a server.
+static void FillTimeSourceConfigs(EasyJson* output) {
+  CommandLineFlagInfo flag_info;
+  auto rc = GetCommandLineFlagInfo("time_source", &flag_info);
+  CHECK(rc) << "could not get information on 'time_source' flag";
+
+  EasyJson configs = output->Set("time_source_configs", EasyJson::kArray);
+  EasyJson time_source_configured = configs.PushBack(EasyJson::kObject);
+  time_source_configured[kName] = "Configured Time Source";
+  time_source_configured[kValue] = flag_info.current_value;
+  time_source_configured[kId] = "time_source_configured";
+  time_source_configured[kComment] =
+      "Time source for HybridClock timestamps generated by Kudu masters and "
+      "tablet servers. Configurable via the --time_source flag.";
+
+  // In case if the time source configured as 'auto', the default value of the
+  // flag is updated to reflect the auto-selected/effective one. In all other
+  // cases, the effective time source is the same as the configured one.
+  const bool is_auto_source = (flag_info.current_value == "auto");
+  const string time_source = is_auto_source ? flag_info.default_value
+                                            : flag_info.current_value;
+  EasyJson time_source_effective = configs.PushBack(EasyJson::kObject);
+  time_source_effective[kName] = "Effective Time Source";
+  time_source_effective[kValue] = time_source;
+  time_source_effective[kId] = "time_source_effective";
+  time_source_effective[kComment] =
+      "Effective Time Source: the system auto-selects the best option "
+      "depending on the hosting environment when configured with "
+      "--time_source=auto. Otherwise, the Effective Time Source is the same "
+      "as the Configured Time Source.";
+
+  // In case if the effective time source is 'builtin', provide information
+  // on the configured NTP servers.
+  if (time_source == "builtin") {
+    CommandLineFlagInfo flag_info;
+    auto rc = GetCommandLineFlagInfo("builtin_ntp_servers", &flag_info);
+    CHECK(rc) << "could not get information on 'builtin_ntp_servers' flag";
+    const string ntp_servers = is_auto_source ? flag_info.default_value
+                                              : flag_info.current_value;
+    EasyJson builtin_ntp_servers = configs.PushBack(EasyJson::kObject);
+    builtin_ntp_servers[kName] = "NTP Servers for Built-in NTP Client";
+    builtin_ntp_servers[kValue] = ntp_servers;
+    builtin_ntp_servers[kId] = "builtin_ntp_servers";
+    builtin_ntp_servers[kComment] =
+        "Effective list of NTP servers used by the built-in NTP client. "
+        "Configurable via --builtin_ntp_servers. If Kudu is configured with "
+        "--time_source=auto and the Effective Time Source is auto-selected "
+        "to be 'builtin', Kudu uses dedicated NTP servers provided by the "
+        "hosting environment, overriding the list of NTP servers configured "
+        "via --builtin_ntp_servers.";
+  }
+}
+
 static void ConfigurationHandler(const Webserver::WebRequest& /* req */,
                                  Webserver::WebResponse* resp) {
   EasyJson* output = &resp->output;
-  EasyJson security_configs = output->Set("security_configs", EasyJson::kArray);
-
-  EasyJson rpc_encryption = security_configs.PushBack(EasyJson::kObject);
-  rpc_encryption["name"] = "RPC Encryption";
-  rpc_encryption["value"] = FLAGS_rpc_encryption;
-  rpc_encryption["secure"] = boost::iequals(FLAGS_rpc_encryption, "required");
-  rpc_encryption["id"] = "rpc_encryption";
-  rpc_encryption["explanation"] = "Configure with --rpc_encryption. Most secure value is "
-                                  "'required'.";
-
-  EasyJson rpc_authentication = security_configs.PushBack(EasyJson::kObject);
-  rpc_authentication["name"] = "RPC Authentication";
-  rpc_authentication["value"] = FLAGS_rpc_authentication;
-  rpc_authentication["secure"] = boost::iequals(FLAGS_rpc_authentication, "required");
-  rpc_authentication["id"] = "rpc_authentication";
-  rpc_authentication["explanation"] = "Configure with --rpc_authentication. Most secure value is "
-                                      "'required'.";
-
-  EasyJson webserver_encryption = security_configs.PushBack(EasyJson::kObject);
-  webserver_encryption["name"] = "Webserver Encryption";
-  webserver_encryption["value"] = FLAGS_webserver_certificate_file.empty() ? "off" : "on";
-  webserver_encryption["secure"] = !FLAGS_webserver_certificate_file.empty();
-  webserver_encryption["id"] = "webserver_encryption";
-  webserver_encryption["explanation"] = "Configure with --webserver_certificate_file and "
-                                        "--webserver_private_key_file.";
-
-  EasyJson webserver_redaction = security_configs.PushBack(EasyJson::kObject);
-  webserver_redaction["name"] = "Webserver Redaction";
-  webserver_redaction["value"] = FLAGS_redact;
-  webserver_redaction["secure"] = boost::iequals(FLAGS_redact, "all");
-  webserver_redaction["id"] = "webserver_redaction";
-  webserver_redaction["explanation"] = "Configure with --redact. Most secure value is 'all'.";
-
-  EasyJson webserver_spnego = security_configs.PushBack(EasyJson::kObject);
-  webserver_spnego["name"] = "Webserver Kerberos Authentication via SPNEGO";
-  webserver_spnego["value"] = FLAGS_webserver_require_spnego ? "on" : "off";
-  webserver_spnego["secure"] = FLAGS_webserver_require_spnego;
-  webserver_spnego["id"] = "webserver_spnego";
-  webserver_spnego["explanation"] = "Configure with --webserver_require_spnego.";
+  FillSecurityConfigs(output);
+  FillTimeSourceConfigs(output);
 }
 
 void AddDefaultPathHandlers(Webserver* webserver) {
@@ -322,11 +410,9 @@ void AddDefaultPathHandlers(Webserver* webserver) {
                                             styled, on_nav_bar);
   webserver->RegisterPathHandler("/config", "Configuration", ConfigurationHandler,
                                   styled, on_nav_bar);
-
   webserver->RegisterPrerenderedPathHandler("/stacks", "Stacks", StacksHandler,
                                             /*is_styled=*/false,
                                             /*is_on_nav_bar=*/true);
-
   AddPprofPathHandlers(webserver);
 }
 
@@ -356,7 +442,7 @@ static void WriteMetricsAsJson(const MetricRegistry* const metrics,
   filters.entity_ids = ParseArray(req.parsed_args, "ids");
   filters.entity_attrs = ParseArray(req.parsed_args, "attributes");
   filters.entity_metrics = ParseArray(req.parsed_args, "metrics");
-  filters.entity_level = FindWithDefault(req.parsed_args, "level", "debug");
+  filters.entity_level = FindWithDefault(req.parsed_args, "level", FLAGS_metrics_default_level);
   vector<string> merge_rules = ParseArray(req.parsed_args, "merge_rules");
   for (const auto& merge_rule : merge_rules) {
     vector<string> values;
@@ -384,8 +470,10 @@ static void WriteMetricsAsJson(const MetricRegistry* const metrics,
 }
 
 void RegisterMetricsJsonHandler(Webserver* webserver, const MetricRegistry* const metrics) {
-  Webserver::PrerenderedPathHandlerCallback callback = boost::bind(WriteMetricsAsJson, metrics,
-                                                                   _1, _2);
+  auto callback = [metrics](const Webserver::WebRequest& req,
+                            Webserver::PrerenderedWebResponse* resp) {
+    WriteMetricsAsJson(metrics, req, resp);
+  };
   bool not_styled = false;
   bool not_on_nav_bar = false;
   bool is_on_nav_bar = true;

@@ -14,13 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
-#ifndef KUDU_CONSENSUS_LEADER_ELECTION_H
-#define KUDU_CONSENSUS_LEADER_ELECTION_H
+#pragma once
 
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -28,7 +27,6 @@
 #include "kudu/consensus/consensus_peers.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/raft_consensus.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/rpc_controller.h"
@@ -51,6 +49,7 @@ class VoteCounter {
  public:
   // Create new VoteCounter with the given majority size.
   VoteCounter(int num_voters, int majority_size);
+  VoteCounter(VoteCounter&&) = default;
 
   // Register a peer's vote.
   //
@@ -98,8 +97,8 @@ class VoteCounter {
 // The result of a leader election.
 struct ElectionResult {
  public:
-  ElectionResult(VoteRequestPB vote_request, ElectionVote decision,
-                 ConsensusTerm highest_term, const std::string& message);
+  ElectionResult(VoteRequestPB request, ElectionVote election_decision,
+                 ConsensusTerm highest_term, std::string msg);
 
   // The vote request that was sent to the voters for this election.
   const VoteRequestPB vote_request;
@@ -149,7 +148,7 @@ class LeaderElection : public RefCountedThreadSafe<LeaderElection> {
   LeaderElection(RaftConfigPB config,
                  PeerProxyFactory* proxy_factory,
                  VoteRequestPB request,
-                 gscoped_ptr<VoteCounter> vote_counter,
+                 VoteCounter vote_counter,
                  MonoDelta timeout,
                  ElectionDecisionCallback decision_callback);
 
@@ -161,7 +160,7 @@ class LeaderElection : public RefCountedThreadSafe<LeaderElection> {
 
   struct VoterState {
     std::string peer_uuid;
-    gscoped_ptr<PeerProxy> proxy;
+    std::unique_ptr<PeerProxy> proxy;
 
     // If constructing the proxy failed (e.g. due to a DNS resolution issue)
     // then 'proxy' will be NULL, and 'proxy_status' will contain the error.
@@ -174,7 +173,8 @@ class LeaderElection : public RefCountedThreadSafe<LeaderElection> {
     std::string PeerInfo() const;
   };
 
-  typedef std::unordered_map<std::string, VoterState*> VoterStateMap;
+  typedef std::unordered_map<std::string, std::unique_ptr<VoterState>>
+      VoterStateMap;
   typedef simple_spinlock Lock;
 
   // This class is refcounted.
@@ -211,7 +211,7 @@ class LeaderElection : public RefCountedThreadSafe<LeaderElection> {
 
   // The result returned by the ElectionDecisionCallback.
   // NULL if not yet known.
-  gscoped_ptr<ElectionResult> result_;
+  std::unique_ptr<ElectionResult> result_;
 
   // Whether we have responded via the callback yet.
   bool has_responded_;
@@ -226,7 +226,7 @@ class LeaderElection : public RefCountedThreadSafe<LeaderElection> {
   const VoteRequestPB request_;
 
   // Object to count the votes.
-  const gscoped_ptr<VoteCounter> vote_counter_;
+  VoteCounter vote_counter_;
 
   // Timeout for sending RPCs.
   const MonoDelta timeout_;
@@ -243,5 +243,3 @@ class LeaderElection : public RefCountedThreadSafe<LeaderElection> {
 
 } // namespace consensus
 } // namespace kudu
-
-#endif /* KUDU_CONSENSUS_LEADER_ELECTION_H */

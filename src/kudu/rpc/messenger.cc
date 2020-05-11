@@ -22,12 +22,10 @@
 #include <mutex>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <utility>
 
 #include <glog/logging.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
@@ -58,11 +56,8 @@
 using std::string;
 using std::shared_ptr;
 using std::make_shared;
+using std::unique_ptr;
 using strings::Substitute;
-
-namespace boost {
-template <typename Signature> class function;
-}
 
 namespace kudu {
 namespace rpc {
@@ -312,7 +307,7 @@ Status Messenger::AddAcceptorPool(const Sockaddr &accept_addr,
   }
 
   Socket sock;
-  RETURN_NOT_OK(sock.Init(0));
+  RETURN_NOT_OK(sock.Init(accept_addr.family(), 0));
   RETURN_NOT_OK(sock.SetReuseAddr(true));
   if (reuseport_) {
     RETURN_NOT_OK(sock.SetReusePort(true));
@@ -368,7 +363,7 @@ void Messenger::QueueOutboundCall(const shared_ptr<OutboundCall> &call) {
   reactor->QueueOutboundCall(call);
 }
 
-void Messenger::QueueInboundCall(gscoped_ptr<InboundCall> call) {
+void Messenger::QueueInboundCall(unique_ptr<InboundCall> call) {
   // This lock acquisition spans the entirety of the function to avoid having to
   // take a ref on the RpcService. In doing so, we guarantee that the service
   // isn't shut down here, which would be problematic because shutdown is a
@@ -459,7 +454,7 @@ Status Messenger::DumpConnections(const DumpConnectionsRequestPB& req,
   return Status::OK();
 }
 
-void Messenger::ScheduleOnReactor(const boost::function<void(const Status&)>& func,
+void Messenger::ScheduleOnReactor(std::function<void(const Status&)> func,
                                   MonoDelta when) {
   DCHECK(!reactors_.empty());
 
@@ -475,7 +470,7 @@ void Messenger::ScheduleOnReactor(const boost::function<void(const Status&)>& fu
     chosen = reactors_[rand() % reactors_.size()];
   }
 
-  DelayedTask* task = new DelayedTask(func, when);
+  DelayedTask* task = new DelayedTask(std::move(func), when);
   chosen->ScheduleReactorTask(task);
 }
 

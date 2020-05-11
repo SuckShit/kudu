@@ -22,7 +22,6 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -31,7 +30,6 @@
 #include <gtest/gtest.h>
 
 #include "kudu/clock/clock.h"
-#include "kudu/clock/logical_clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/partial_row.h"
@@ -58,7 +56,6 @@
 #include "kudu/consensus/ref_counted_replicate.h"
 #include "kudu/fs/data_dirs.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/result_tracker.h"
@@ -78,33 +75,26 @@
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 
+using kudu::consensus::ConsensusBootstrapInfo;
+using kudu::consensus::ConsensusMetadata;
+using kudu::consensus::ConsensusMetadataManager;
+using kudu::consensus::MakeOpId;
+using kudu::consensus::OpId;
+using kudu::consensus::ReplicateMsg;
+using kudu::consensus::ReplicateRefPtr;
+using kudu::consensus::kMinimumTerm;
+using kudu::consensus::make_scoped_refptr_replicate;
+using kudu::log::LogAnchorRegistry;
+using kudu::log::LogTestBase;
+using kudu::pb_util::SecureShortDebugString;
+using kudu::tserver::WriteRequestPB;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
-
-class MemTracker;
-
 namespace tablet {
-
-using clock::Clock;
-using clock::LogicalClock;
-using consensus::ConsensusBootstrapInfo;
-using consensus::ConsensusMetadata;
-using consensus::ConsensusMetadataManager;
-using consensus::MakeOpId;
-using consensus::OpId;
-using consensus::ReplicateMsg;
-using consensus::ReplicateRefPtr;
-using consensus::kMinimumTerm;
-using consensus::make_scoped_refptr_replicate;
-using log::Log;
-using log::LogAnchorRegistry;
-using log::LogTestBase;
-using pb_util::SecureShortDebugString;
-using tserver::WriteRequestPB;
 
 class BootstrapTest : public LogTestBase {
  protected:
@@ -165,19 +155,24 @@ class BootstrapTest : public LogTestBase {
     scoped_refptr<ConsensusMetadata> cmeta;
     RETURN_NOT_OK(cmeta_manager_->Load(meta->tablet_id(), &cmeta));
 
+    // Close the existing log to evict any segments from the file cache so that
+    // bootstrap won't access any stale (cached) segments.
+    RETURN_NOT_OK(log_->Close());
+
     scoped_refptr<LogAnchorRegistry> log_anchor_registry(new LogAnchorRegistry());
     // Now attempt to recover the log
     RETURN_NOT_OK(BootstrapTablet(
         meta,
         cmeta->CommittedConfig(),
-        scoped_refptr<Clock>(LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
-        shared_ptr<MemTracker>(),
-        scoped_refptr<rpc::ResultTracker>(),
-        nullptr,
-        nullptr, // no status listener
+        clock_.get(),
+        /*mem_tracker*/nullptr,
+        /*result_tracker*/nullptr,
+        metric_registry_.get(),
+        file_cache_.get(),
+        /*tablet_replica*/nullptr,
+        std::move(log_anchor_registry),
         tablet,
         &log_,
-        log_anchor_registry,
         boot_info));
 
     return Status::OK();
@@ -531,7 +526,7 @@ TEST_F(BootstrapTest, TestOutOfOrderCommits) {
   ASSERT_OK(AppendReplicateBatch(replicate));
 
   // Now commit the mutate before the insert (in the log).
-  gscoped_ptr<consensus::CommitMsg> mutate_commit(new consensus::CommitMsg);
+  unique_ptr<consensus::CommitMsg> mutate_commit(new consensus::CommitMsg);
   mutate_commit->set_op_type(consensus::WRITE_OP);
   mutate_commit->mutable_commited_op_id()->CopyFrom(mutate_opid);
   TxResultPB* result = mutate_commit->mutable_result();
@@ -541,7 +536,7 @@ TEST_F(BootstrapTest, TestOutOfOrderCommits) {
 
   ASSERT_OK(AppendCommit(std::move(mutate_commit)));
 
-  gscoped_ptr<consensus::CommitMsg> insert_commit(new consensus::CommitMsg);
+  unique_ptr<consensus::CommitMsg> insert_commit(new consensus::CommitMsg);
   insert_commit->set_op_type(consensus::WRITE_OP);
   insert_commit->mutable_commited_op_id()->CopyFrom(insert_opid);
   result = insert_commit->mutable_result();
@@ -595,7 +590,7 @@ TEST_F(BootstrapTest, TestMissingCommitMessage) {
   ASSERT_OK(AppendReplicateBatch(replicate));
 
   // Now commit the mutate before the insert (in the log).
-  gscoped_ptr<consensus::CommitMsg> mutate_commit(new consensus::CommitMsg);
+  unique_ptr<consensus::CommitMsg> mutate_commit(new consensus::CommitMsg);
   mutate_commit->set_op_type(consensus::WRITE_OP);
   mutate_commit->mutable_commited_op_id()->CopyFrom(mutate_opid);
   TxResultPB* result = mutate_commit->mutable_result();
@@ -647,14 +642,14 @@ TEST_F(BootstrapTest, TestConsensusOnlyOperationOutOfOrderTimestamp) {
 
   // Now commit in OpId order.
   // NO_OP...
-  gscoped_ptr<consensus::CommitMsg> mutate_commit(new consensus::CommitMsg);
+  unique_ptr<consensus::CommitMsg> mutate_commit(new consensus::CommitMsg);
   mutate_commit->set_op_type(consensus::NO_OP);
   *mutate_commit->mutable_commited_op_id() = noop_replicate->get()->id();
 
   ASSERT_OK(AppendCommit(std::move(mutate_commit)));
 
   // ...and WRITE_OP...
-  mutate_commit = gscoped_ptr<consensus::CommitMsg>(new consensus::CommitMsg);
+  mutate_commit = unique_ptr<consensus::CommitMsg>(new consensus::CommitMsg);
   mutate_commit->set_op_type(consensus::WRITE_OP);
   *mutate_commit->mutable_commited_op_id() = write_replicate->get()->id();
   TxResultPB* result = mutate_commit->mutable_result();
@@ -722,13 +717,13 @@ TEST_F(BootstrapTest, TestKudu2509) {
   ASSERT_OK(AppendReplicateBatch(replicate));
 
   // Now commit the mutate before the insert (in the log).
-  gscoped_ptr<consensus::CommitMsg> mutate_commit(new consensus::CommitMsg);
+  unique_ptr<consensus::CommitMsg> mutate_commit(new consensus::CommitMsg);
   mutate_commit->set_op_type(consensus::WRITE_OP);
   mutate_commit->mutable_commited_op_id()->CopyFrom(mutate_opid);
   mutate_commit->mutable_result()->add_ops()->add_mutated_stores()->set_mrs_id(1);
   ASSERT_OK(AppendCommit(std::move(mutate_commit)));
 
-  gscoped_ptr<consensus::CommitMsg> insert_commit(new consensus::CommitMsg);
+  unique_ptr<consensus::CommitMsg> insert_commit(new consensus::CommitMsg);
   insert_commit->set_op_type(consensus::WRITE_OP);
   insert_commit->mutable_commited_op_id()->CopyFrom(insert_opid);
   insert_commit->mutable_result()->add_ops()->add_mutated_stores()->set_mrs_id(1);

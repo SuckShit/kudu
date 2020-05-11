@@ -21,7 +21,6 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
@@ -29,7 +28,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
-#include "kudu/fs/data_dirs.h"
+#include "kudu/fs/dir_manager.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
@@ -44,12 +43,14 @@ DECLARE_bool(enable_data_block_fsync);
 namespace kudu {
 
 class BlockId;
+class FileCache;
 class InstanceMetadataPB;
 class MemTracker;
 
 namespace fs {
 
 class BlockManager;
+class DataDirManager;
 class FsManagerTestBase_TestDuplicatePaths_Test;
 class FsManagerTestBase_TestEIOWhileRunningUpdateDirsTool_Test;
 class FsManagerTestBase_TestIsolatedMetadataDir_Test;
@@ -71,6 +72,7 @@ namespace tserver {
 class MiniTabletServerTest_TestFsLayoutEndToEnd_Test;
 } // namespace tserver
 
+// Options that control the behavior of FsManager.
 struct FsManagerOpts {
   // Creates a new FsManagerOpts with default values.
   FsManagerOpts();
@@ -121,6 +123,18 @@ struct FsManagerOpts {
   //
   // Defaults to UPDATE_AND_IGNORE_FAILURES.
   fs::UpdateInstanceBehavior update_instances;
+
+  // The file cache to be used for long-lived opened files (e.g. in the block
+  // manager). If null, opened files will not be cached.
+  //
+  // Defaults to null.
+  FileCache* file_cache;
+
+  // Whether or not to skip opening the block manager. FsManager operations that
+  // require the block manager will crash.
+  //
+  // Default to false.
+  bool skip_block_manager;
 };
 
 // FsManager provides helpers to read data and metadata files,
@@ -137,9 +151,6 @@ class FsManager {
  public:
   static const char *kWalFileNamePrefix;
   static const char *kWalsRecoveryDirSuffix;
-
-  // Only for unit tests.
-  FsManager(Env* env, const std::string& root_path);
 
   FsManager(Env* env, FsManagerOpts opts);
   ~FsManager();
@@ -280,6 +291,7 @@ class FsManager {
   }
 
   fs::BlockManager* block_manager() {
+    DCHECK(block_manager_);
     return block_manager_.get();
   }
 

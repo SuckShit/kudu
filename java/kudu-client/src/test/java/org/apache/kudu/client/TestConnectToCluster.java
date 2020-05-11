@@ -22,6 +22,8 @@ import static org.apache.kudu.consensus.Metadata.RaftPeerPB.Role.LEADER;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
+import java.util.List;
+
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.stumbleupon.async.Callback;
@@ -32,8 +34,9 @@ import org.junit.Test;
 
 import org.apache.kudu.consensus.Metadata;
 import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
+import org.apache.kudu.test.KuduTestHarness;
+import org.apache.kudu.test.KuduTestHarness.MasterServerConfig;
 import org.apache.kudu.test.cluster.MiniKuduCluster;
-import org.apache.kudu.test.junit.RetryRule;
 
 public class TestConnectToCluster {
 
@@ -43,7 +46,7 @@ public class TestConnectToCluster {
       new HostAndPort("2", 9000));
 
   @Rule
-  public RetryRule retryRule = new RetryRule();
+  public KuduTestHarness harness = new KuduTestHarness();
 
   /**
    * Test that the client properly falls back to the old GetMasterRegistration
@@ -51,18 +54,11 @@ public class TestConnectToCluster {
    * ConnectToMaster RPC.
    */
   @Test(timeout = 60000)
+  @MasterServerConfig(flags = { "--master_support_connect_to_master_rpc=0" })
   public void testFallbackConnectRpc() throws Exception {
-    try (MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
-         .addMasterServerFlag("--master_support_connect_to_master_rpc=0")
-         .numMasterServers(1)
-         .numTabletServers(0)
-         .build();
-         KuduClient c = new KuduClient.KuduClientBuilder(cluster.getMasterAddressesAsString())
-             .build()) {
-      // Call some method which uses the master. This forces us to connect
-      // and verifies that the fallback works.
-      c.listTabletServers();
-    }
+    // Call some method which uses the master. This forces us to connect
+    // and verifies that the fallback works.
+    harness.getClient().listTabletServers();
   }
 
   /**
@@ -74,26 +70,21 @@ public class TestConnectToCluster {
   @Test(timeout = 60000)
   public void testConnectToOneOfManyMasters() throws Exception {
     int successes = 0;
-    try (MiniKuduCluster cluster = new MiniKuduCluster.MiniKuduClusterBuilder()
-         .numMasterServers(3)
-         .numTabletServers(0)
-         .build()) {
-      String[] masterAddrs = cluster.getMasterAddressesAsString().split(",", -1);
-      assertEquals(3, masterAddrs.length);
-      for (String masterAddr : masterAddrs) {
-        try (KuduClient c = new KuduClient.KuduClientBuilder(masterAddr).build()) {
-          // Call some method which uses the master. This forces us to connect.
-          c.listTabletServers();
-          successes++;
-        } catch (Exception e) {
-          Assert.assertTrue("unexpected exception: " + e.toString(),
-              e.toString().matches(
-                  ".*Client configured with 1 master\\(s\\) " +
-                  "\\(.+?\\) but cluster indicates it expects 3 master\\(s\\) " +
-                  "\\(.+?,.+?,.+?\\).*"));
-          Assert.assertThat(Joiner.on("\n").join(e.getStackTrace()),
-              CoreMatchers.containsString("testConnectToOneOfManyMasters"));
-        }
+    String[] masterAddrs = harness.getMasterAddressesAsString().split(",", -1);
+    assertEquals(3, masterAddrs.length);
+    for (String masterAddr : masterAddrs) {
+      try (KuduClient c = new KuduClient.KuduClientBuilder(masterAddr).build()) {
+        // Call some method which uses the master. This forces us to connect.
+        c.listTabletServers();
+        successes++;
+      } catch (Exception e) {
+        Assert.assertTrue("unexpected exception: " + e.toString(),
+            e.toString().matches(
+                ".*Client configured with 1 master\\(s\\) " +
+                "\\(.+?\\) but cluster indicates it expects 3 master\\(s\\) " +
+                "\\(.+?,.+?,.+?\\).*"));
+        Assert.assertThat(Joiner.on("\n").join(e.getStackTrace()),
+            CoreMatchers.containsString("testConnectToOneOfManyMasters"));
       }
     }
 
@@ -125,68 +116,76 @@ public class TestConnectToCluster {
 
     // Normal case.
     runTest(
-        makeCTMR(LEADER),
-        makeCTMR(FOLLOWER),
-        makeCTMR(FOLLOWER),
+        makeCTMR(LEADER, MASTERS),
+        makeCTMR(FOLLOWER, MASTERS),
+        makeCTMR(FOLLOWER, MASTERS),
         successResponse);
 
     // Permutation works too.
     runTest(
-        makeCTMR(FOLLOWER),
-        makeCTMR(LEADER),
-        makeCTMR(FOLLOWER),
+        makeCTMR(FOLLOWER, MASTERS),
+        makeCTMR(LEADER, MASTERS),
+        makeCTMR(FOLLOWER, MASTERS),
         successResponse);
 
     // Multiple leaders, that's fine since it might be a TOCTOU situation, or one master
     // is confused. Raft handles this if the client then tries to do something that requires a
     // replication on the master-side.
     runTest(
-        makeCTMR(LEADER),
-        makeCTMR(LEADER),
-        makeCTMR(FOLLOWER),
+        makeCTMR(LEADER, MASTERS),
+        makeCTMR(LEADER, MASTERS),
+        makeCTMR(FOLLOWER, MASTERS),
         successResponse);
 
     // Mixed bag, still works because there's a leader.
     runTest(
         reusableNRE,
-        makeCTMR(FOLLOWER),
-        makeCTMR(LEADER),
+        makeCTMR(FOLLOWER, MASTERS),
+        makeCTMR(LEADER, MASTERS),
         successResponse);
 
     // All unreachable except one leader, still good.
     runTest(
         reusableNRE,
         reusableNRE,
-        makeCTMR(LEADER),
+        makeCTMR(LEADER, MASTERS),
         successResponse);
 
     // Permutation of the previous.
     runTest(
         reusableNRE,
-        makeCTMR(LEADER),
+        makeCTMR(LEADER, MASTERS),
         reusableNRE,
+        successResponse);
+
+    // Client try to connect three masters, but the cluster is configure with only one master.
+    // If connect to a leader master, success.
+    runTest(
+        reusableNRE,
+        reusableNRE,
+        makeCTMR(LEADER, ImmutableList.of(MASTERS.get(0))),
         successResponse);
 
     // Retry cases.
 
     // Just followers means we retry.
     runTest(
-        makeCTMR(FOLLOWER),
-        makeCTMR(FOLLOWER),
-        makeCTMR(FOLLOWER),
+        makeCTMR(FOLLOWER, MASTERS),
+        makeCTMR(FOLLOWER, MASTERS),
+        makeCTMR(FOLLOWER, MASTERS),
         retryResponse);
 
     // One NRE but we have responsive masters, retry.
     runTest(
-        makeCTMR(FOLLOWER),
-        makeCTMR(FOLLOWER),
+        makeCTMR(FOLLOWER, MASTERS),
+        makeCTMR(FOLLOWER, MASTERS),
         reusableNRE,
         retryResponse);
 
     // One good master but no leader, retry.
     runTest(
         reusableNRE,
-        makeCTMR(FOLLOWER),
+        makeCTMR(FOLLOWER, MASTERS),
         reusableNRE,
         retryResponse);
 
@@ -194,7 +193,7 @@ public class TestConnectToCluster {
     runTest(
         reusableRE,
         reusableNRE,
-        makeCTMR(FOLLOWER),
+        makeCTMR(FOLLOWER, MASTERS),
         retryResponse);
 
     // All recoverable means retry.
@@ -209,6 +208,14 @@ public class TestConnectToCluster {
         reusableRE,
         reusableNRE,
         reusableNRE,
+        retryResponse);
+
+    // Client try to connect three masters, but the cluster is configure with only one master.
+    // If the master hasn't become a leader, retry.
+    runTest(
+        reusableNRE,
+        reusableNRE,
+        makeCTMR(FOLLOWER, ImmutableList.of(MASTERS.get(0))),
         retryResponse);
 
     // Failure case.
@@ -265,9 +272,14 @@ public class TestConnectToCluster {
     }
   }
 
-  private static ConnectToMasterResponsePB makeCTMR(Metadata.RaftPeerPB.Role role) {
-    return ConnectToMasterResponsePB.newBuilder()
-        .setRole(role)
-        .build();
+  // Helper method to make a ConnectToMasterResponsePB.
+  private static ConnectToMasterResponsePB makeCTMR(Metadata.RaftPeerPB.Role role,
+                                                    List<HostAndPort> masters) {
+    ConnectToMasterResponsePB.Builder b = ConnectToMasterResponsePB.newBuilder();
+    b.setRole(role);
+    for (HostAndPort master : masters) {
+      b.addMasterAddrs(ProtobufHelper.hostAndPortToPB(master));
+    }
+    return b.build();
   }
 }

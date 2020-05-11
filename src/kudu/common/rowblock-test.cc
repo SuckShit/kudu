@@ -18,6 +18,7 @@
 #include "kudu/common/rowblock.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -59,29 +60,33 @@ TEST(TestSelectionVector, TestNonByteAligned) {
   ASSERT_EQ(sv.nrows(), sv.CountSelected());
   ASSERT_TRUE(sv.AnySelected());
 
-  vector<int> sel;
-  sv.GetSelectedRows(&sel);
-  ASSERT_EQ(sv.nrows(), sel.size());
+  {
+    SelectedRows sel = sv.GetSelectedRows();
+    ASSERT_TRUE(sel.all_selected());
+    ASSERT_EQ(sv.nrows(), sel.num_selected());
+  }
 
   for (size_t i = 0; i < sv.nrows(); i++) {
     sv.SetRowUnselected(i);
   }
   ASSERT_EQ(0, sv.CountSelected());
   ASSERT_FALSE(sv.AnySelected());
-  sv.GetSelectedRows(&sel);
-  ASSERT_EQ(0, sel.size());
+  SelectedRows sel = sv.GetSelectedRows();
+  ASSERT_EQ(0, sel.num_selected());
+  ASSERT_FALSE(sel.all_selected());
 }
 
 TEST(TestSelectionVector, TestGetSelectedRows) {
-  vector<int> expected = {1, 4, 9, 10, 18};
+  vector<uint16_t> expected = {1, 4, 9, 10, 18};
   SelectionVector sv(20);
   sv.SetAllFalse();
   for (int i : expected) {
     sv.SetRowSelected(i);
   }
-  vector<int> selected;
-  sv.GetSelectedRows(&selected);
-  ASSERT_EQ(expected, selected);
+  vector<uint16_t> selected;
+  SelectedRows sel = sv.GetSelectedRows();
+  ASSERT_FALSE(sel.all_selected());
+  ASSERT_EQ(expected, sel.indexes());
 }
 
 } // namespace kudu

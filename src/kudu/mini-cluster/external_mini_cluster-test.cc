@@ -118,8 +118,7 @@ INSTANTIATE_TEST_CASE_P(,
         ,
         ::testing::Values(BuiltInNtp::DISABLED,
                           BuiltInNtp::ENABLED_SINGLE_SERVER,
-                          BuiltInNtp::ENABLED_MULTIPLE_SERVERS,
-                          BuiltInNtp::DISABLED)
+                          BuiltInNtp::ENABLED_MULTIPLE_SERVERS)
 #endif // #if !defined(NO_CHRONY) ...
                           ));
 

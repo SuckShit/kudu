@@ -19,9 +19,10 @@ package org.apache.kudu.util;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.sql.Date;
+import java.util.Base64;
 import java.util.List;
 import java.util.Random;
-import javax.xml.bind.DatatypeConverter;
 
 import com.google.common.base.Preconditions;
 import org.apache.yetus.audience.InterfaceAudience;
@@ -103,6 +104,9 @@ public class DataGenerator {
         case INT32:
           row.addInt(i, random.nextInt());
           break;
+        case DATE:
+          row.addDate(i, randomDate(random));
+          break;
         case INT64:
         case UNIXTIME_MICROS:
           row.addLong(i, random.nextLong());
@@ -133,6 +137,16 @@ public class DataGenerator {
   }
 
   /**
+   * Utility method to return a random integer value which can be converted into
+   * correct Kudu Date value
+   */
+  public static Date randomDate(Random random) {
+    final int bound = DateUtil.MAX_DATE_VALUE - DateUtil.MIN_DATE_VALUE + 1;
+    int days = random.nextInt(bound) + DateUtil.MIN_DATE_VALUE;
+    return DateUtil.epochDaysToSqlDate(days);
+  }
+
+  /**
    * Utility method to return a random decimal value.
    */
   public static BigDecimal randomDecimal(ColumnTypeAttributes attributes, Random random) {
@@ -148,7 +162,7 @@ public class DataGenerator {
   public static String randomString(int length, Random random) {
     byte[] bytes = new byte[length];
     random.nextBytes(bytes);
-    return DatatypeConverter.printBase64Binary(bytes);
+    return Base64.getEncoder().encodeToString(bytes);
   }
 
   /**

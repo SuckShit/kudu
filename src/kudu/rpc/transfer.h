@@ -14,16 +14,13 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#pragma once
 
-#ifndef KUDU_RPC_TRANSFER_H
-#define KUDU_RPC_TRANSFER_H
-
-#include <array>
-#include <cstddef>
+#include <climits>
 #include <cstdint>
-#include <limits.h>
 #include <string>
 
+#include <boost/container/small_vector.hpp>
 #include <boost/intrusive/list_hook.hpp>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
@@ -47,15 +44,18 @@ struct TransferCallbacks;
 class TransferLimits {
  public:
   enum {
-    kMaxSidecars = 10,
-    kMaxPayloadSlices = kMaxSidecars + 2, // (header + msg)
+    kMaxSidecars = 10000,
     kMaxTotalSidecarBytes = INT_MAX
   };
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(TransferLimits);
 };
 
-typedef std::array<Slice, TransferLimits::kMaxPayloadSlices> TransferPayload;
+// To avoid heap allocation in the common case, assume that most transfer
+// payloads will contain 4 or fewer slices (header, body protobuf, and maybe
+// two sidecars). For more complex responses with more slices, a heap allocation
+// is worth the cost.
+typedef boost::container::small_vector<Slice, 4> TransferPayload;
 
 // This class is used internally by the RPC layer to represent an inbound
 // transfer in progress.
@@ -67,9 +67,15 @@ class InboundTransfer {
  public:
 
   InboundTransfer();
+  explicit InboundTransfer(faststring initial_buf);
 
-  // read from the socket into our buffer
-  Status ReceiveBuffer(Socket &socket);
+  // Read from the socket into our buffer.
+  //
+  // If this is the last read of the transfer (i.e. if TransferFinished() is true
+  // after this call returns OK), up to 4 extra bytes may have been read
+  // from the socket and stored in 'extra_4'. In that case, any previous content of
+  // 'extra_4' is replaced by this extra bytes.
+  Status ReceiveBuffer(Socket *socket, faststring* extra_4);
 
   // Return true if any bytes have yet been sent.
   bool TransferStarted() const;
@@ -91,6 +97,7 @@ class InboundTransfer {
 
   faststring buf_;
 
+  // 0 indicates not yet set
   uint32_t total_length_;
   uint32_t cur_offset_;
 
@@ -120,14 +127,12 @@ class OutboundTransfer : public boost::intrusive::list_base_hook<> {
 
   // Create an outbound transfer for a call request.
   static OutboundTransfer* CreateForCallRequest(int32_t call_id,
-                                                const TransferPayload &payload,
-                                                size_t n_payload_slices,
+                                                TransferPayload payload,
                                                 TransferCallbacks *callbacks);
 
   // Create an outbound transfer for a call response.
   // See above for details.
-  static OutboundTransfer* CreateForCallResponse(const TransferPayload &payload,
-                                                 size_t n_payload_slices,
+  static OutboundTransfer* CreateForCallResponse(TransferPayload payload,
                                                  TransferCallbacks *callbacks);
 
   // Destruct the transfer. A transfer object should never be deallocated
@@ -165,14 +170,11 @@ class OutboundTransfer : public boost::intrusive::list_base_hook<> {
 
  private:
   OutboundTransfer(int32_t call_id,
-                   const TransferPayload& payload,
-                   size_t n_payload_slices,
+                   TransferPayload payload,
                    TransferCallbacks *callbacks);
 
-  // Slices to send. Uses an array here instead of a vector to avoid an expensive
-  // vector construction (improved performance a couple percent).
+  // Slices to send.
   TransferPayload payload_slices_;
-  size_t n_payload_slices_;
 
   // The current slice that is being sent.
   int32_t cur_slice_idx_;
@@ -209,4 +211,3 @@ struct TransferCallbacks {
 
 } // namespace rpc
 } // namespace kudu
-#endif

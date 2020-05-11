@@ -19,6 +19,7 @@
 
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <ostream>
@@ -29,15 +30,16 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/quorum_util.h"
@@ -66,6 +68,7 @@
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tablet_server_options.h"
 #include "kudu/tserver/ts_tablet_manager.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/jsonwriter.h"
 #include "kudu/util/metrics.h"
@@ -87,8 +90,9 @@ DECLARE_double(leader_failure_max_missed_heartbeat_periods);
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(metrics_retirement_age_ms);
 DECLARE_int32(raft_heartbeat_interval_ms);
+DECLARE_int32(tablet_open_inject_latency_ms);
 DEFINE_int32(num_election_test_loops, 3,
-             "Number of random EmulateElection() loops to execute in "
+             "Number of random EmulateElectionForTests() loops to execute in "
              "TestReportNewLeaderOnLeaderChange");
 
 using kudu::client::KuduClient;
@@ -290,7 +294,7 @@ class LeadershipChangeReportingTest : public TsTabletManagerITest {
     NO_FATALS(StartCluster(std::move(opts)));
 
     // We need to control elections precisely for this test since we're using
-    // EmulateElection() with a distributed consensus configuration.
+    // EmulateElectionForTests() with a distributed consensus configuration.
     FLAGS_enable_leader_failure_detection = false;
     FLAGS_catalog_manager_wait_for_new_tablets_to_elect_leader = false;
 
@@ -342,7 +346,7 @@ class LeadershipChangeReportingTest : public TsTabletManagerITest {
     int leader_idx = rand() % tablet_replicas_.size();
     LOG(INFO) << "Electing peer " << leader_idx << "...";
     RaftConsensus* con = CHECK_NOTNULL(tablet_replicas_[leader_idx]->consensus());
-    RETURN_NOT_OK(con->EmulateElection());
+    RETURN_NOT_OK(con->EmulateElectionForTests());
     LOG(INFO) << "Waiting for servers to agree...";
     RETURN_NOT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(5), ts_map_,
         tablet_replicas_[leader_idx]->tablet_id(), min_term));
@@ -713,7 +717,7 @@ TEST_F(TsTabletManagerITest, TestTableStats) {
       FLAGS_raft_heartbeat_interval_ms * FLAGS_leader_failure_max_missed_heartbeat_periods;
 
   // Get the LEADER master.
-  const auto GetLeaderMaster = [&] () -> Master* {
+  const auto GetLeaderMaster = [&] () {
     int idx = 0;
     Master* master = nullptr;
     Status s = cluster_->GetLeaderMasterIndex(&idx);
@@ -723,7 +727,7 @@ TEST_F(TsTabletManagerITest, TestTableStats) {
     return CHECK_NOTNULL(master);
   };
   // Get the LEADER master's service proxy.
-  const auto GetLeaderMasterServiceProxy = [&] () -> shared_ptr<MasterServiceProxy> {
+  const auto GetLeaderMasterServiceProxy = [&]() {
     const auto& addr = GetLeaderMaster()->first_rpc_address();
     shared_ptr<MasterServiceProxy> proxy(
         new MasterServiceProxy(client_messenger_, addr, addr.host()));
@@ -816,7 +820,18 @@ TEST_F(TsTabletManagerITest, TestTableStats) {
         // Step down.
         itest::TServerDetails* tserver =
             CHECK_NOTNULL(FindOrDie(ts_map, replica->permanent_uuid()));
-        ASSERT_OK(LeaderStepDown(tserver, replica->tablet_id(), MonoDelta::FromSeconds(10)));
+        TabletServerErrorPB error;
+        auto s = LeaderStepDown(tserver, replica->tablet_id(),
+                                MonoDelta::FromSeconds(10), &error);
+        // In rare cases, the leader replica can change its role right before
+        // the step-down request is received.
+        if (s.IsIllegalState() &&
+            error.code() == TabletServerErrorPB::NOT_THE_LEADER) {
+          LOG(INFO) << Substitute("T:$0 P:$1: not a leader replica anymore",
+                                  replica->tablet_id(), replica->permanent_uuid());
+          continue;
+        }
+        ASSERT_OK(s);
         SleepFor(MonoDelta::FromMilliseconds(kMaxElectionTime));
         // Check stats after every election.
         NO_FATALS(CheckStats(kRowsCount));
@@ -898,6 +913,69 @@ TEST_F(TsTabletManagerITest, TestTableStats) {
     NO_FATALS(GetMetricsString(&metrics_str));
     ASSERT_STR_NOT_CONTAINS(metrics_str, kNewTableName);
   }
+}
+
+TEST_F(TsTabletManagerITest, TestDeleteTableDuringTabletCopy) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  const int kNumTabletServers = 3;
+  const int kNumReplicas = 3;
+  {
+    InternalMiniClusterOptions opts;
+    opts.num_tablet_servers = kNumTabletServers;
+    NO_FATALS(StartCluster(std::move(opts)));
+  }
+  string tablet_id;
+  client::sp::shared_ptr<KuduTable> table;
+  itest::TabletServerMap ts_map;
+  ASSERT_OK(CreateTabletServerMap(cluster_->master_proxy(), client_messenger_, &ts_map));
+  ValueDeleter deleter(&ts_map);
+
+  auto tserver_tablets_count = [&](int index) {
+    return cluster_->mini_tablet_server(index)->ListTablets().size();
+  };
+
+  // Inject latency to test whether we could delete copying tablet.
+  FLAGS_tablet_open_inject_latency_ms = 50;
+
+  // Create a table with one tablet.
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+      .schema(&schema_)
+      .set_range_partition_columns({})
+      .num_replicas(kNumReplicas)
+      .Create());
+  ASSERT_EVENTUALLY([&] {
+    for (int i = 0; i < kNumTabletServers; ++i) {
+      ASSERT_EQ(1, tserver_tablets_count(i));
+    }
+  });
+  tablet_id = cluster_->mini_tablet_server(0)->ListTablets()[0];
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+
+  // Get the leader and follower tablet servers.
+  itest::TServerDetails* leader_ts;
+  ASSERT_OK(FindTabletLeader(ts_map, tablet_id, kTimeout, &leader_ts));
+  int leader_index = cluster_->tablet_server_index_by_uuid(leader_ts->uuid());
+  int follower_index = (leader_index + 1) % kNumTabletServers;
+  MiniTabletServer* follower = cluster_->mini_tablet_server(follower_index);
+  itest::TServerDetails* follower_ts = ts_map[follower->uuid()];
+
+  // Tombstone the tablet on the follower.
+  ASSERT_OK(itest::DeleteTabletWithRetries(follower_ts, tablet_id,
+                                           tablet::TabletDataState::TABLET_DATA_TOMBSTONED,
+                                           kTimeout));
+  // Copy tablet from leader_ts to follower_ts.
+  HostPort leader_addr = HostPortFromPB(leader_ts->registration.rpc_addresses(0));
+  ASSERT_OK(itest::StartTabletCopy(follower_ts, tablet_id, leader_ts->uuid(),
+                                   leader_addr, std::numeric_limits<int64_t>::max(), kTimeout));
+
+  // Delete table during tablet copying.
+  ASSERT_OK(itest::DeleteTable(cluster_->master_proxy(), table->id(), kTableName, kTimeout));
+
+  // Finally all tablets deleted.
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(0, tserver_tablets_count(follower_index));
+  });
 }
 
 } // namespace tserver

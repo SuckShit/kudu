@@ -32,6 +32,7 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/tablet_copy_client.h"
 #include "kudu/tserver/tablet_replica_lookup.h"
 #include "kudu/tserver/tserver.pb.h"
@@ -48,16 +49,13 @@ class optional;
 }
 
 namespace kudu {
-class TableExtraConfigPB;
-}  // namespace kudu
-
-namespace kudu {
 
 class FsManager;
 class NodeInstancePB;
 class Partition;
 class PartitionSchema;
 class Schema;
+class TableExtraConfigPB;
 class ThreadPool;
 
 namespace consensus {
@@ -73,7 +71,6 @@ class TabletReportPB;
 
 namespace tablet {
 class TabletMetadata;
-class TabletReplica;
 }
 
 namespace tserver {
@@ -143,7 +140,7 @@ class TSTabletManager : public tserver::TabletReplicaLookupIf {
   void DeleteTabletAsync(const std::string& tablet_id,
                          tablet::TabletDataState delete_type,
                          const boost::optional<int64_t>& cas_config_index,
-                         std::function<void(const Status&, TabletServerErrorPB::Code)> cb);
+                         const std::function<void(const Status&, TabletServerErrorPB::Code)>& cb);
 
   // Delete the specified tablet synchronously.
   // See DeleteTabletAsync() for more information.
@@ -401,11 +398,13 @@ class TSTabletManager : public tserver::TabletReplicaLookupIf {
   // Thread pool used to delete tablets asynchronously.
   std::unique_ptr<ThreadPool> delete_tablet_pool_;
 
-  FunctionGaugeDetacher metric_detacher_;
-
   // Ensures that we only update stats from a single thread at a time.
   mutable rw_spinlock lock_update_;
   MonoTime next_update_time_;
+
+  // NOTE: it's important that this is the first member to be destructed. This
+  // ensures we do not attempt to collect metrics while calling the destructor.
+  FunctionGaugeDetacher metric_detacher_;
 
   DISALLOW_COPY_AND_ASSIGN(TSTabletManager);
 };
@@ -416,6 +415,7 @@ class TransitionInProgressDeleter : public RefCountedThreadSafe<TransitionInProg
  public:
   TransitionInProgressDeleter(TransitionInProgressMap* map, RWMutex* lock,
                               std::string entry);
+  void Destroy();
 
  private:
   friend class RefCountedThreadSafe<TransitionInProgressDeleter>;
@@ -424,6 +424,7 @@ class TransitionInProgressDeleter : public RefCountedThreadSafe<TransitionInProg
   TransitionInProgressMap* const in_progress_;
   RWMutex* const lock_;
   const std::string entry_;
+  bool is_destroyed_;
 };
 
 } // namespace tserver

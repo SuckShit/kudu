@@ -54,17 +54,13 @@
 #include <ostream>
 #include <set>
 #include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
-#include <boost/function.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <google/protobuf/stubs/common.h>
 
@@ -86,9 +82,6 @@
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
@@ -101,13 +94,14 @@
 #include "kudu/gutil/walltime.h"
 #include "kudu/hms/hms_catalog.h"
 #include "kudu/master/authz_provider.h"
+#include "kudu/master/auto_rebalancer.h"
 #include "kudu/master/default_authz_provider.h"
 #include "kudu/master/hms_notification_log_listener.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master_cert_authority.h"
 #include "kudu/master/placement_policy.h"
-#include "kudu/master/sentry_authz_provider.h"
+#include "kudu/master/ranger_authz_provider.h"
 #include "kudu/master/sys_catalog.h"
 #include "kudu/master/table_metrics.h"
 #include "kudu/master/ts_descriptor.h"
@@ -134,6 +128,7 @@
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flag_validators.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
@@ -275,10 +270,28 @@ DEFINE_bool(mock_table_metrics_for_testing, false,
 TAG_FLAG(mock_table_metrics_for_testing, hidden);
 TAG_FLAG(mock_table_metrics_for_testing, runtime);
 
+DEFINE_bool(catalog_manager_support_on_disk_size, true,
+            "Whether to enable mock on disk size statistic for tables. For testing only.");
+TAG_FLAG(catalog_manager_support_on_disk_size, hidden);
+TAG_FLAG(catalog_manager_support_on_disk_size, runtime);
+
 DEFINE_bool(catalog_manager_support_live_row_count, true,
-            "Whether to enable mock live row count statistic for tables. For testing only");
+            "Whether to enable mock live row count statistic for tables. For testing only.");
 TAG_FLAG(catalog_manager_support_live_row_count, hidden);
 TAG_FLAG(catalog_manager_support_live_row_count, runtime);
+
+DEFINE_bool(catalog_manager_enable_chunked_tablet_reports, true,
+            "Whether to split the tablet report data received from one tablet "
+            "server into chunks when persisting it in the system catalog. "
+            "The chunking starts at around the maximum allowed RPC size "
+            "controlled by the --rpc_max_message_size flag. When the chunking "
+            "is disabled, a tablet report sent by a tablet server is rejected "
+            "if it would result in an oversized update on the system catalog "
+            "tablet. With the default settings for --rpc_max_message_size, "
+            "the latter can happen only in case of extremely high number "
+            "of tablet replicas per tablet server.");
+TAG_FLAG(catalog_manager_enable_chunked_tablet_reports, advanced);
+TAG_FLAG(catalog_manager_enable_chunked_tablet_reports, runtime);
 
 DEFINE_int64(on_disk_size_for_testing, 0,
              "Mock the on disk size of metrics for testing.");
@@ -290,10 +303,31 @@ DEFINE_int64(live_row_count_for_testing, 0,
 TAG_FLAG(live_row_count_for_testing, hidden);
 TAG_FLAG(live_row_count_for_testing, runtime);
 
+DEFINE_bool(auto_rebalancing_enabled, false,
+            "Whether auto-rebalancing is enabled.");
+TAG_FLAG(auto_rebalancing_enabled, advanced);
+TAG_FLAG(auto_rebalancing_enabled, experimental);
+
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_int64(tsk_rotation_seconds);
 
 METRIC_DEFINE_entity(table);
+
+DECLARE_string(ranger_config_path);
+
+// Validates that if auto-rebalancing is enabled, the cluster uses 3-4-3 replication
+// (the --raft_prepare_replacement_before_eviction flag must be set to true).
+static bool Validate343SchemeEnabledForAutoRebalancing()  {
+  if (FLAGS_auto_rebalancing_enabled &&
+      !FLAGS_raft_prepare_replacement_before_eviction) {
+    LOG(ERROR) << "If enabling auto-rebalancing, Kudu must be configured"
+                  " with --raft_prepare_replacement_before_eviction.";
+    return false;
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(auto_rebalancing_flags,
+                     Validate343SchemeEnabledForAutoRebalancing);
 
 using base::subtle::NoBarrier_CompareAndSwap;
 using base::subtle::NoBarrier_Load;
@@ -547,7 +581,7 @@ class CatalogManagerBgTasks {
 
 Status CatalogManagerBgTasks::Init() {
   RETURN_NOT_OK(kudu::Thread::Create("catalog manager", "bgtasks",
-      &CatalogManagerBgTasks::Run, this, &thread_));
+                                     [this]() { this->Run(); }, &thread_));
   return Status::OK();
 }
 
@@ -733,8 +767,9 @@ CatalogManager::CatalogManager(Master* master)
       leader_ready_term_(-1),
       hms_notification_log_event_id_(-1),
       leader_lock_(RWMutex::Priority::PREFER_WRITING) {
-  if (SentryAuthzProvider::IsEnabled()) {
-    authz_provider_.reset(new SentryAuthzProvider(master_->metric_entity()));
+  if (RangerAuthzProvider::IsEnabled()) {
+    authz_provider_.reset(new RangerAuthzProvider(master_->fs_manager()->env(),
+                                                  master_->metric_entity()));
   } else {
     authz_provider_.reset(new DefaultAuthzProvider);
   }
@@ -768,16 +803,21 @@ Status CatalogManager::Init(bool is_first_run) {
   RETURN_NOT_OK_PREPEND(sys_catalog_->WaitUntilRunning(),
                         "Failed waiting for the catalog tablet to run");
 
-  if (hms::HmsCatalog::IsEnabled()) {
-    vector<HostPortPB> master_addrs_pb;
-    RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addrs_pb));
+  if (FLAGS_auto_rebalancing_enabled) {
+    unique_ptr<AutoRebalancerTask> task(
+        new AutoRebalancerTask(this, master_->ts_manager()));
+    RETURN_NOT_OK_PREPEND(task->Init(), "failed to initialize auto-rebalancing task");
+    auto_rebalancer_ = std::move(task);
+  }
 
+  RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addresses_));
+  if (hms::HmsCatalog::IsEnabled()) {
     string master_addresses = JoinMapped(
-        master_addrs_pb,
-        [] (const HostPortPB& hostport) {
-          return Substitute("$0:$1", hostport.host(), hostport.port());
-        },
-        ",");
+      master_addresses_,
+      [] (const HostPort& hostport) {
+        return Substitute("$0:$1", hostport.host(), hostport.port());
+      },
+      ",");
 
     // The leader_lock_ isn't really intended for this (it's for serializing
     // new leadership initialization against regular catalog manager operations)
@@ -811,8 +851,7 @@ Status CatalogManager::Init(bool is_first_run) {
 }
 
 Status CatalogManager::ElectedAsLeaderCb() {
-  return leader_election_pool_->SubmitClosure(
-      Bind(&CatalogManager::PrepareForLeadershipTask, Unretained(this)));
+  return leader_election_pool_->Submit([this]() { this->PrepareForLeadershipTask(); });
 }
 
 Status CatalogManager::WaitUntilCaughtUpAsLeader(const MonoDelta& timeout) {
@@ -1089,7 +1128,7 @@ void CatalogManager::PrepareForLeadershipTask() {
         "Loading table and tablet metadata into memory";
     LOG(INFO) << kLoadMetaOpDescription << "...";
     LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kLoadMetaOpDescription) {
-      if (!check(std::bind(&CatalogManager::VisitTablesAndTabletsUnlocked, this),
+      if (!check([this]() { return this->VisitTablesAndTabletsUnlocked(); },
                  *consensus, term, kLoadMetaOpDescription).ok()) {
         return;
       }
@@ -1100,7 +1139,7 @@ void CatalogManager::PrepareForLeadershipTask() {
         "Initializing Kudu internal certificate authority";
     LOG(INFO) << kCaInitOpDescription << "...";
     LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kCaInitOpDescription) {
-      if (!check(std::bind(&CatalogManager::InitCertAuthority, this),
+      if (!check([this]() { return this->InitCertAuthority(); },
                  *consensus, term, kCaInitOpDescription).ok()) {
         return;
       }
@@ -1109,7 +1148,7 @@ void CatalogManager::PrepareForLeadershipTask() {
     static const char* const kTskOpDescription = "Loading token signing keys";
     LOG(INFO) << kTskOpDescription << "...";
     LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kTskOpDescription) {
-      if (!check(std::bind(&CatalogManager::InitTokenSigner, this),
+      if (!check([this]() { return this->InitTokenSigner(); },
                  *consensus, term, kTskOpDescription).ok()) {
         return;
       }
@@ -1119,9 +1158,10 @@ void CatalogManager::PrepareForLeadershipTask() {
         "Initializing in-progress tserver states";
     LOG(INFO) << kTServerStatesDescription << "...";
     LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kTServerStatesDescription) {
-      if (!check(std::bind(&TSManager::ReloadTServerStates, master_->ts_manager(),
-                           sys_catalog_.get()),
-                 *consensus, term, kTServerStatesDescription).ok()) {
+      if (!check([this]() {
+            return this->master_->ts_manager()->ReloadTServerStates(this->sys_catalog_.get());
+          },
+          *consensus, term, kTServerStatesDescription).ok()) {
         return;
       }
     }
@@ -1131,8 +1171,8 @@ void CatalogManager::PrepareForLeadershipTask() {
           "Loading latest processed Hive Metastore notification log event ID";
       LOG(INFO) << kNotificationLogEventIdDescription << "...";
       LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kNotificationLogEventIdDescription) {
-        if (!check(std::bind(&CatalogManager::InitLatestNotificationLogEventId, this),
-                   *consensus, term, kNotificationLogEventIdDescription).ok()) {
+      if (!check([this]() { return this->InitLatestNotificationLogEventId(); },
+                 *consensus, term, kNotificationLogEventIdDescription).ok()) {
           return;
         }
       }
@@ -1245,7 +1285,7 @@ Status CatalogManager::VisitTablesAndTablets() {
 Status CatalogManager::InitSysCatalogAsync(bool is_first_run) {
   std::lock_guard<LockType> l(lock_);
   unique_ptr<SysCatalogTable> new_catalog(new SysCatalogTable(
-      master_, Bind(&CatalogManager::ElectedAsLeaderCb, Unretained(this))));
+      master_, [this]() { return this->ElectedAsLeaderCb(); }));
   if (is_first_run) {
     RETURN_NOT_OK(new_catalog->CreateNew(master_->fs_manager()));
   } else {
@@ -1293,6 +1333,10 @@ void CatalogManager::Shutdown() {
   if (hms_catalog_) {
     hms_notification_log_listener_->Shutdown();
     hms_catalog_->Stop();
+  }
+
+  if (auto_rebalancer_) {
+    auto_rebalancer_->Shutdown();
   }
 
   // Mark all outstanding table tasks as aborted and wait for them to fail.
@@ -1718,15 +1762,17 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   });
 
   // f. Write table and tablets to sys-catalog.
-  SysCatalogTable::Actions actions;
-  actions.table_to_add = table;
-  actions.tablets_to_add = tablets;
-  Status s = sys_catalog_->Write(actions);
-  if (!s.ok()) {
-    s = s.CloneAndPrepend("an error occurred while writing to the sys-catalog");
-    LOG(WARNING) << s.ToString();
-    CheckIfNoLongerLeaderAndSetupError(s, resp);
-    return s;
+  {
+    SysCatalogTable::Actions actions;
+    actions.table_to_add = table;
+    actions.tablets_to_add = tablets;
+    Status s = sys_catalog_->Write(std::move(actions));
+    if (PREDICT_FALSE(!s.ok())) {
+      s = s.CloneAndPrepend("an error occurred while writing to the sys-catalog");
+      LOG(WARNING) << s.ToString();
+      CheckIfNoLongerLeaderAndSetupError(s, resp);
+      return s;
+    }
   }
   TRACE("Wrote table and tablets to system table");
 
@@ -2066,16 +2112,19 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
 
     // 3. Update sys-catalog with the removed table and tablet state.
     TRACE("Removing table and tablets from system table");
-    SysCatalogTable::Actions actions;
-    actions.hms_notification_log_event_id = hms_notification_log_event_id;
-    actions.table_to_update = table;
-    actions.tablets_to_update.assign(tablets.begin(), tablets.end());
-    Status s = sys_catalog_->Write(actions);
-    if (!s.ok()) {
-      s = s.CloneAndPrepend("an error occurred while updating the sys-catalog");
-      LOG(WARNING) << s.ToString();
-      CheckIfNoLongerLeaderAndSetupError(s, resp);
-      return s;
+    {
+      SysCatalogTable::Actions actions;
+      actions.hms_notification_log_event_id =
+          std::move(hms_notification_log_event_id);
+      actions.table_to_update = table;
+      actions.tablets_to_update.assign(tablets.begin(), tablets.end());
+      Status s = sys_catalog_->Write(std::move(actions));
+      if (PREDICT_FALSE(!s.ok())) {
+        s = s.CloneAndPrepend("an error occurred while updating the sys-catalog");
+        LOG(WARNING) << s.ToString();
+        CheckIfNoLongerLeaderAndSetupError(s, resp);
+        return s;
+      }
     }
 
     // 4. Remove the table from the by-name map.
@@ -2665,40 +2714,43 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
                                            LocalTimeAsString()));
   }
 
-  // 8. Update sys-catalog with the new table schema and tablets to add/drop.
-  TRACE("Updating metadata on disk");
-  string deletion_msg = "Partition dropped at " + LocalTimeAsString();
-  SysCatalogTable::Actions actions;
-  actions.hms_notification_log_event_id = hms_notification_log_event_id;
-  if (!tablets_to_add.empty() || has_metadata_changes) {
-    // If anything modified the table's persistent metadata, then sync it to the sys catalog.
-    actions.table_to_update = table;
-  }
-  actions.tablets_to_add = tablets_to_add;
-
+  const string deletion_msg = "Partition dropped at " + LocalTimeAsString();
   TabletMetadataGroupLock tablets_to_add_lock(LockMode::WRITE);
   TabletMetadataGroupLock tablets_to_drop_lock(LockMode::RELEASED);
-  tablets_to_add_lock.AddMutableInfos(tablets_to_add);
-  tablets_to_drop_lock.AddMutableInfos(tablets_to_drop);
-  tablets_to_drop_lock.Lock(LockMode::WRITE);
-  for (auto& tablet : tablets_to_drop) {
-    tablet->mutable_metadata()->mutable_dirty()->set_state(SysTabletsEntryPB::DELETED,
-                                                           deletion_msg);
-  }
-  actions.tablets_to_update = tablets_to_drop;
 
-  Status s = sys_catalog_->Write(actions);
-  if (!s.ok()) {
-    s = s.CloneAndPrepend("an error occurred while updating the sys-catalog");
-    LOG(WARNING) << s.ToString();
-    CheckIfNoLongerLeaderAndSetupError(s, resp);
-    return s;
+  // 8. Update sys-catalog with the new table schema and tablets to add/drop.
+  TRACE("Updating metadata on disk");
+  {
+    SysCatalogTable::Actions actions;
+    actions.hms_notification_log_event_id =
+        std::move(hms_notification_log_event_id);
+    if (!tablets_to_add.empty() || has_metadata_changes) {
+      // If anything modified the table's persistent metadata, then sync it to the sys catalog.
+      actions.table_to_update = table;
+    }
+    actions.tablets_to_add = tablets_to_add;
+
+    tablets_to_add_lock.AddMutableInfos(tablets_to_add);
+    tablets_to_drop_lock.AddMutableInfos(tablets_to_drop);
+    tablets_to_drop_lock.Lock(LockMode::WRITE);
+    for (auto& tablet : tablets_to_drop) {
+      tablet->mutable_metadata()->mutable_dirty()->set_state(
+          SysTabletsEntryPB::DELETED, deletion_msg);
+    }
+    actions.tablets_to_update = tablets_to_drop;
+
+    Status s = sys_catalog_->Write(std::move(actions));
+    if (PREDICT_FALSE(!s.ok())) {
+      s = s.CloneAndPrepend("an error occurred while updating the sys-catalog");
+      LOG(WARNING) << s.ToString();
+      CheckIfNoLongerLeaderAndSetupError(s, resp);
+      return s;
+    }
   }
 
   // 9. Commit the in-memory state.
+  TRACE("Committing alterations to in-memory state");
   {
-    TRACE("Committing alterations to in-memory state");
-
     // Commit new tablet in-memory state. This doesn't require taking the global
     // lock since the new tablets are not yet visible, because they haven't been
     // added to the table or tablet index.
@@ -2940,12 +2992,16 @@ Status CatalogManager::GetTableStatistics(const GetTableStatisticsRequestPB* req
                                           &table, &l));
 
   if (PREDICT_FALSE(FLAGS_mock_table_metrics_for_testing)) {
-    resp->set_on_disk_size(FLAGS_on_disk_size_for_testing);
+    if (FLAGS_catalog_manager_support_on_disk_size) {
+      resp->set_on_disk_size(FLAGS_on_disk_size_for_testing);
+    }
     if (FLAGS_catalog_manager_support_live_row_count) {
       resp->set_live_row_count(FLAGS_live_row_count_for_testing);
     }
   } else {
-    resp->set_on_disk_size(table->GetMetrics()->on_disk_size->value());
+    if (table->GetMetrics()->TableSupportsOnDiskSize()) {
+      resp->set_on_disk_size(table->GetMetrics()->on_disk_size->value());
+    }
     if (table->GetMetrics()->TableSupportsLiveRowCount()) {
       resp->set_live_row_count(table->GetMetrics()->live_row_count->value());
     }
@@ -3121,7 +3177,7 @@ class PickLeaderReplica : public TSPicker {
 class RetryingTSRpcTask : public MonitoredTask {
  public:
   RetryingTSRpcTask(Master *master,
-                    gscoped_ptr<TSPicker> replica_picker,
+                    unique_ptr<TSPicker> replica_picker,
                     scoped_refptr<TableInfo> table)
     : master_(master),
       replica_picker_(std::move(replica_picker)),
@@ -3144,6 +3200,9 @@ class RetryingTSRpcTask : public MonitoredTask {
     return static_cast<State>(NoBarrier_Load(&state_));
   }
 
+  // Return the id of the tablet that is the subject of the async request.
+  virtual string tablet_id() const = 0;
+
   MonoTime start_timestamp() const override { return start_ts_; }
   MonoTime completion_timestamp() const override { return end_ts_; }
   const scoped_refptr<TableInfo>& table() const { return table_ ; }
@@ -3161,9 +3220,6 @@ class RetryingTSRpcTask : public MonitoredTask {
   //
   // Runs on the reactor thread, so must not block or perform any IO.
   virtual void HandleResponse(int attempt) = 0;
-
-  // Return the id of the tablet that is the subject of the async request.
-  virtual string tablet_id() const = 0;
 
   // Overridable log prefix with reasonable default.
   virtual string LogPrefix() const {
@@ -3191,7 +3247,7 @@ class RetryingTSRpcTask : public MonitoredTask {
   void RpcCallback();
 
   Master * const master_;
-  const gscoped_ptr<TSPicker> replica_picker_;
+  const unique_ptr<TSPicker> replica_picker_;
   const scoped_refptr<TableInfo> table_;
 
   MonoTime start_ts_;
@@ -3299,7 +3355,7 @@ bool RetryingTSRpcTask::RescheduleWithBackoffDelay() {
   VLOG(1) << Substitute("Scheduling retry of $0 with a delay of $1 ms (attempt = $2)",
                         description(), delay_millis, attempt_);
   master_->messenger()->ScheduleOnReactor(
-      boost::bind(&RetryingTSRpcTask::RunDelayedTask, this, _1),
+      [this](const Status& s) { this->RunDelayedTask(s); },
       MonoDelta::FromMilliseconds(delay_millis));
   return true;
 }
@@ -3322,13 +3378,7 @@ void RetryingTSRpcTask::RunDelayedTask(const Status& status) {
 
 void RetryingTSRpcTask::UnregisterAsyncTask() {
   end_ts_ = MonoTime::Now();
-  if (table_ != nullptr) {
-    table_->RemoveTask(this);
-  } else {
-    // This is a floating task (since the table does not exist)
-    // created as response to a tablet report.
-    Release();  // May call "delete this";
-  }
+  table_->RemoveTask(tablet_id(), this);
 }
 
 Status RetryingTSRpcTask::ResetTSProxy() {
@@ -3372,7 +3422,7 @@ class RetrySpecificTSRpcTask : public RetryingTSRpcTask {
                          const string& permanent_uuid,
                          const scoped_refptr<TableInfo>& table)
     : RetryingTSRpcTask(master,
-                        gscoped_ptr<TSPicker>(new PickSpecificUUID(permanent_uuid)),
+                        unique_ptr<TSPicker>(new PickSpecificUUID(permanent_uuid)),
                         table),
       permanent_uuid_(permanent_uuid) {
   }
@@ -3444,7 +3494,7 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
                           type_name(), target_ts_desc_->ToString(), attempt,
                           SecureDebugString(req_));
     ts_proxy_->CreateTabletAsync(req_, &resp_, &rpc_,
-                                 boost::bind(&AsyncCreateReplica::RpcCallback, this));
+                                 [this]() { this->RpcCallback(); });
     return true;
   }
 
@@ -3475,7 +3525,7 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
   }
 
   string description() const override {
-    return tablet_id_ + " Delete Tablet RPC for TS=" + permanent_uuid_;
+    return "DeleteTablet RPC for tablet " + tablet_id_ + " on TS " + permanent_uuid_;
   }
 
  protected:
@@ -3494,10 +3544,17 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
               target_ts_desc_->ToString(), tablet_id_, status.ToString());
           MarkComplete();
           break;
+        // Do not retry on a CAS error
         case TabletServerErrorPB::CAS_FAILED:
           LOG(WARNING) << Substitute("TS $0: delete failed for tablet $1 "
               "because of a CAS failure. No further retry: $2",
               target_ts_desc_->ToString(), tablet_id_, status.ToString());
+          MarkFailed();
+          break;
+        case TabletServerErrorPB::ALREADY_INPROGRESS:
+          LOG(WARNING) << Substitute("TS $0: delete failed for tablet $1 "
+            "because tablet deleting was already in progress. No further retry: $2",
+            target_ts_desc_->ToString(), tablet_id_, status.ToString());
           MarkComplete();
           break;
         default:
@@ -3535,7 +3592,7 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
                           type_name(), target_ts_desc_->ToString(), attempt,
                           SecureDebugString(req));
     ts_proxy_->DeleteTabletAsync(req, &resp_, &rpc_,
-                                 boost::bind(&AsyncDeleteReplica::RpcCallback, this));
+                                 [this]() { this->RpcCallback(); });
     return true;
   }
 
@@ -3558,7 +3615,7 @@ class AsyncAlterTable : public RetryingTSRpcTask {
   AsyncAlterTable(Master *master,
                   scoped_refptr<TabletInfo> tablet)
     : RetryingTSRpcTask(master,
-                        gscoped_ptr<TSPicker>(new PickLeaderReplica(tablet)),
+                        unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
                         tablet->table()),
       tablet_(std::move(tablet)) {
   }
@@ -3566,7 +3623,8 @@ class AsyncAlterTable : public RetryingTSRpcTask {
   string type_name() const override { return "AlterTable"; }
 
   string description() const override {
-    return tablet_->ToString() + " Alter Table RPC";
+    return Substitute("AlterTable RPC for tablet $0 (table $1, current schema version=$2)",
+                      tablet_->id(), table_->ToString(), table_->schema_version());
   }
 
  private:
@@ -3621,7 +3679,7 @@ class AsyncAlterTable : public RetryingTSRpcTask {
                           type_name(), target_ts_desc_->ToString(), attempt,
                           SecureDebugString(req));
     ts_proxy_->AlterSchemaAsync(req, &resp_, &rpc_,
-                                boost::bind(&AsyncAlterTable::RpcCallback, this));
+                                [this]() { this->RpcCallback(); });
     return true;
   }
 
@@ -3657,7 +3715,7 @@ AsyncChangeConfigTask::AsyncChangeConfigTask(Master* master,
                                              ConsensusStatePB cstate,
                                              consensus::ChangeConfigType change_config_type)
     : RetryingTSRpcTask(master,
-                        gscoped_ptr<TSPicker>(new PickLeaderReplica(tablet)),
+                        unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
                         tablet->table()),
       tablet_(std::move(tablet)),
       cstate_(std::move(cstate)),
@@ -3851,7 +3909,7 @@ bool AsyncAddReplicaTask::SendRequest(int attempt) {
                         type_name(), target_ts_desc_->ToString(), attempt,
                         SecureDebugString(req));
   consensus_proxy_->ChangeConfigAsync(req, &resp_, &rpc_,
-                                      boost::bind(&AsyncAddReplicaTask::RpcCallback, this));
+                                      [this]() { this->RpcCallback(); });
   return true;
 }
 
@@ -3902,7 +3960,7 @@ bool AsyncEvictReplicaTask::SendRequest(int attempt) {
                         type_name(), target_ts_desc_->ToString(), attempt,
                         SecureDebugString(req));
   consensus_proxy_->ChangeConfigAsync(req, &resp_, &rpc_,
-                                      boost::bind(&AsyncEvictReplicaTask::RpcCallback, this));
+                                      [this]() { this->RpcCallback(); });
   return true;
 }
 
@@ -3938,7 +3996,7 @@ Status CatalogManager::ProcessTabletReport(
   unordered_map<string, scoped_refptr<TabletInfo>> tablet_infos;
 
   // Keeps track of all RPCs that should be sent when we're done.
-  vector<unique_ptr<RetryingTSRpcTask>> rpcs;
+  vector<scoped_refptr<RetryingTSRpcTask>> rpcs;
 
   // Locks the referenced tables (for READ) and tablets (for WRITE).
   //
@@ -4017,8 +4075,7 @@ Status CatalogManager::ProcessTabletReport(
         table->metadata().state().is_deleted()) {
       const string& msg = tablet->metadata().state().pb.state_msg();
       update->set_state_msg(msg);
-      LOG(INFO) << Substitute("Got report from deleted tablet $0 ($1): Sending "
-          "delete request for this tablet", tablet->ToString(), msg);
+      VLOG(1) << Substitute("Got report from deleted tablet $0 ($1)", tablet->ToString(), msg);
 
       // TODO(unknown): Cancel tablet creation, instead of deleting, in cases
       // where that might be possible (tablet creation timeout & replacement).
@@ -4251,14 +4308,21 @@ Status CatalogManager::ProcessTabletReport(
     }
 
     // 10. Process the report's tablet statistics.
-    if (report.has_stats() && report.has_consensus_state()) {
-      DCHECK_EQ(ts_desc->permanent_uuid(), report.consensus_state().leader_uuid());
-
-      // Now the tserver only reports the LEADER replicas its own.
-      // First, update table's stats.
-      tablet->table()->UpdateMetrics(tablet_id, tablet->GetStats(), report.stats());
-      // Then, update tablet's stats.
-      tablet->UpdateStats(report.stats());
+    //
+    // The tserver only reports the LEADER replicas it owns.
+    if (report.has_consensus_state() &&
+        report.consensus_state().leader_uuid() == ts_desc->permanent_uuid()) {
+      if (report.has_stats()) {
+        // For the versions >= 1.11.x, the tserver reports stats. But keep in
+        // mind that 'live_row_count' is not supported for the legacy replicas.
+        tablet->table()->UpdateMetrics(tablet_id, tablet->GetStats(), report.stats());
+        tablet->UpdateStats(report.stats());
+      } else {
+        // For the versions < 1.11.x, the tserver doesn't report stats. Thus,
+        // the metrics from the stats should be hidden, for example, when it's
+        // in the upgrade/downgrade process or in a mixed environment.
+        tablet->table()->InvalidateMetrics(tablet_id);
+      }
     }
   }
 
@@ -4268,15 +4332,30 @@ Status CatalogManager::ProcessTabletReport(
   // 12. Write all tablet mutations to the catalog table.
   //
   // SysCatalogTable::Write will short-circuit the case where the data has not
-  // in fact changed since the previous version and avoid any unnecessary mutations.
-  SysCatalogTable::Actions actions;
-  actions.tablets_to_update = std::move(mutated_tablets);
-  Status s = sys_catalog_->Write(actions);
-  if (!s.ok()) {
-    LOG(ERROR) << Substitute(
-        "Error updating tablets from $0: $1. Tablet report was: $2",
-        ts_desc->permanent_uuid(), s.ToString(), SecureShortDebugString(full_report));
-    return s;
+  // in fact changed since the previous version and avoid any unnecessary
+  // mutations. The generated sequence of actions may be split into multiple
+  // writes to the system catalog tablet to keep the size of each write request
+  // under the specified threshold.
+  {
+    SysCatalogTable::Actions actions;
+    actions.tablets_to_update = std::move(mutated_tablets);
+    // Updating the status of replicas on the same tablet server can be safely
+    // chunked. Even if some chunks of the update fails, it should not lead to
+    // bigger inconsistencies than simply not updating the status of a single
+    // replica on that tablet server (i.e., rejecting the whole tablet report).
+    // In addition, the nature of such failures is transient, and it's expected
+    // that the next successfully processed tablet report from the tablet server
+    // will fix the partial update.
+    const auto write_mode = FLAGS_catalog_manager_enable_chunked_tablet_reports
+        ? SysCatalogTable::WriteMode::CHUNKED
+        : SysCatalogTable::WriteMode::ATOMIC;
+    auto s = sys_catalog_->Write(std::move(actions), write_mode);
+    if (PREDICT_FALSE(!s.ok())) {
+      LOG(ERROR) << Substitute(
+          "Error updating tablets from $0: $1. Tablet report was: $2",
+          ts_desc->permanent_uuid(), s.ToString(), SecureShortDebugString(full_report));
+      return s;
+    }
   }
 
   // Having successfully written the tablet mutations, this function cannot
@@ -4300,15 +4379,15 @@ Status CatalogManager::ProcessTabletReport(
 
   // 15. Send all queued RPCs.
   for (auto& rpc : rpcs) {
-    if (rpc->table() != nullptr) {
-      rpc->table()->AddTask(rpc.get());
-    } else {
-      // This is a floating task (since the table does not exist) created in
-      // response to a tablet report.
-      rpc->AddRef();
+    if (rpc->table()->ContainsTask(rpc->tablet_id(), rpc->description())) {
+      // There are some tasks with the same tablet_id, alter type (and permanent_uuid
+      // for some specific tasks) already running, here we just ignore the rpc to avoid
+      // sending duplicate requests, maybe it will be sent the next time the tserver heartbeats.
+      VLOG(1) << Substitute("Not sending duplicate request: $0", rpc->description());
+      continue;
     }
+    rpc->table()->AddTask(rpc->tablet_id(), rpc);
     WARN_NOT_OK(rpc->Run(), Substitute("Failed to send $0", rpc->description()));
-    rpc.release();
   }
 
   return Status::OK();
@@ -4333,11 +4412,13 @@ Status CatalogManager::StoreLatestNotificationLogEventId(int64_t event_id) {
   DCHECK(hms_catalog_);
   DCHECK_GT(event_id, hms_notification_log_event_id_);
   leader_lock_.AssertAcquiredForReading();
-  SysCatalogTable::Actions actions;
-  actions.hms_notification_log_event_id = event_id;
-  RETURN_NOT_OK_PREPEND(
-      sys_catalog()->Write(actions),
-      "Failed to update processed Hive Metastore notification log ID in the sys catalog table");
+  {
+    SysCatalogTable::Actions actions;
+    actions.hms_notification_log_event_id = event_id;
+    RETURN_NOT_OK_PREPEND(sys_catalog()->Write(std::move(actions)),
+                          "Failed to update processed Hive Metastore "
+                          "notification log ID in the sys catalog table");
+  }
   hms_notification_log_event_id_ = event_id;
   return Status::OK();
 }
@@ -4358,9 +4439,9 @@ void CatalogManager::SendAlterTableRequest(const scoped_refptr<TableInfo>& table
   table->GetAllTablets(&tablets);
 
   for (const scoped_refptr<TabletInfo>& tablet : tablets) {
-    auto call = new AsyncAlterTable(master_, tablet);
-    table->AddTask(call);
-    WARN_NOT_OK(call->Run(), "Failed to send alter table request");
+    scoped_refptr<AsyncAlterTable> task = new AsyncAlterTable(master_, tablet);
+    table->AddTask(tablet->id(), task);
+    WARN_NOT_OK(task->Run(), "Failed to send alter table request");
   }
 }
 
@@ -4391,11 +4472,11 @@ void CatalogManager::SendDeleteTabletRequest(const scoped_refptr<TabletInfo>& ta
       << "Sending DeleteTablet for " << cstate.committed_config().peers().size()
       << " replicas of tablet " << tablet->id();
   for (const auto& peer : cstate.committed_config().peers()) {
-    AsyncDeleteReplica* call = new AsyncDeleteReplica(
+    scoped_refptr<AsyncDeleteReplica> task = new AsyncDeleteReplica(
         master_, peer.permanent_uuid(), tablet->table(), tablet->id(),
         TABLET_DATA_DELETED, none, deletion_msg);
-    tablet->table()->AddTask(call);
-    WARN_NOT_OK(call->Run(), Substitute(
+    tablet->table()->AddTask(tablet->id(), task);
+    WARN_NOT_OK(task->Run(), Substitute(
         "Failed to send DeleteReplica request for tablet $0", tablet->id()));
   }
 }
@@ -4467,7 +4548,7 @@ Status CatalogManager::LoadTskEntries(set<string>* expired_entry_ids) {
   }
   if (expired_entry_ids) {
     set<string> ref(loader.expired_entry_ids());
-    expired_entry_ids->swap(ref);
+    *expired_entry_ids = std::move(ref);
   }
   return master_->token_signer()->ImportKeys(loader.entries());
 }
@@ -4490,8 +4571,14 @@ Status CatalogManager::LoadTspkEntries(vector<TokenSigningPublicKeyPB>* keys) {
 Status CatalogManager::DeleteTskEntries(const set<string>& entry_ids) {
   leader_lock_.AssertAcquiredForWriting();
   RETURN_NOT_OK(sys_catalog_->RemoveTskEntries(entry_ids));
-  LOG_WITH_PREFIX(INFO) << Substitute("Deleted TSKs: $0",
-                                      JoinStrings(entry_ids, ", "));
+  string msg = "Deleted TSKs: ";
+  msg += JoinMapped(
+      entry_ids,
+      [](const string& id) {
+        return Substitute("$0", SysCatalogTable::TskEntryIdToSeqNumber(id));
+      },
+      " ");
+  LOG_WITH_PREFIX(INFO) << msg;
   return Status::OK();
 }
 
@@ -4587,13 +4674,15 @@ void CatalogManager::HandleTabletSchemaVersionReport(
   l.mutable_data()->set_state(SysTablesEntryPB::RUNNING,
                               Substitute("Current schema version=$0", current_version));
 
-  SysCatalogTable::Actions actions;
-  actions.table_to_update = table;
-  Status s = sys_catalog_->Write(actions);
-  if (!s.ok()) {
-    LOG_WITH_PREFIX(WARNING)
-        << "An error occurred while updating sys-tables: " << s.ToString();
-    return;
+  {
+    SysCatalogTable::Actions actions;
+    actions.table_to_update = table;
+    Status s = sys_catalog_->Write(std::move(actions));
+    if (PREDICT_FALSE(!s.ok())) {
+      LOG_WITH_PREFIX(WARNING)
+          << "An error occurred while updating sys-tables: " << s.ToString();
+      return;
+    }
   }
 
   l.Commit();
@@ -4671,11 +4760,13 @@ Status CatalogManager::ProcessPendingAssignments(
   }
 
   // Update the sys catalog with the new set of tablets/metadata.
-  SysCatalogTable::Actions actions;
-  actions.tablets_to_add = deferred.tablets_to_add;
-  actions.tablets_to_update = deferred.tablets_to_update;
-  RETURN_NOT_OK_PREPEND(sys_catalog_->Write(actions),
-                        "error persisting updated tablet metadata");
+  {
+    SysCatalogTable::Actions actions;
+    actions.tablets_to_add = deferred.tablets_to_add;
+    actions.tablets_to_update = deferred.tablets_to_update;
+    RETURN_NOT_OK_PREPEND(sys_catalog_->Write(std::move(actions)),
+                          "error persisting updated tablet metadata");
+  }
 
   // Expose tablet metadata changes before the new tablets themselves.
   lock_out.Commit();
@@ -4777,10 +4868,9 @@ void CatalogManager::SendCreateTabletRequest(const scoped_refptr<TabletInfo>& ta
       tablet_lock.data().pb.consensus_state().committed_config();
   tablet->set_last_create_tablet_time(MonoTime::Now());
   for (const RaftPeerPB& peer : config.peers()) {
-    AsyncCreateReplica* task = new AsyncCreateReplica(master_,
-                                                      peer.permanent_uuid(),
-                                                      tablet, tablet_lock);
-    tablet->table()->AddTask(task);
+    scoped_refptr<AsyncCreateReplica> task = new AsyncCreateReplica(
+        master_, peer.permanent_uuid(), tablet, tablet_lock);
+    tablet->table()->AddTask(tablet->id(), task);
     WARN_NOT_OK(task->Run(), "Failed to send new tablet request");
   }
 }
@@ -4828,13 +4918,16 @@ Status CatalogManager::BuildLocationsForTablet(
 
     // Helper function to create a TSInfoPB.
     auto make_tsinfo_pb = [this, &peer]() {
-      unique_ptr<TSInfoPB> tsinfo_pb(new TSInfoPB());
+      unique_ptr<TSInfoPB> tsinfo_pb(new TSInfoPB);
       tsinfo_pb->set_permanent_uuid(peer.permanent_uuid());
       shared_ptr<TSDescriptor> ts_desc;
       if (master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid(), &ts_desc)) {
         ServerRegistrationPB reg;
         ts_desc->GetRegistration(&reg);
         tsinfo_pb->mutable_rpc_addresses()->Swap(reg.mutable_rpc_addresses());
+        if (reg.has_unix_domain_socket_path()) {
+          tsinfo_pb->set_unix_domain_socket_path(reg.unix_domain_socket_path());
+        }
         if (ts_desc->location()) tsinfo_pb->set_location(*(ts_desc->location()));
       } else {
         // If we've never received a heartbeat from the tserver, we'll fall back
@@ -4846,19 +4939,18 @@ Status CatalogManager::BuildLocationsForTablet(
       return tsinfo_pb;
     };
 
-    auto role = GetParticipantRole(peer, cstate);
+    const auto role = GetParticipantRole(peer, cstate);
     optional<string> dimension = none;
     if (l_tablet.data().pb.has_dimension_label()) {
       dimension = l_tablet.data().pb.dimension_label();
     }
     if (ts_infos_dict) {
-      int idx = *ComputePairIfAbsent(
+      const auto idx = *ComputePairIfAbsent(
           &ts_infos_dict->uuid_to_idx, peer.permanent_uuid(),
           [&]() -> pair<StringPiece, int> {
             auto& ts_info_pbs = ts_infos_dict->ts_info_pbs;
-            auto pb = make_tsinfo_pb();
-            int ts_info_idx = ts_info_pbs.size();
-            ts_info_pbs.emplace_back(pb.release());
+            auto ts_info_idx = ts_info_pbs.size();
+            ts_info_pbs.emplace_back(make_tsinfo_pb().release());
             return { ts_info_pbs.back()->permanent_uuid(), ts_info_idx };
           });
 
@@ -4955,15 +5047,17 @@ Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletRespo
                                                              replace_msg);
 
   // Persist the changes to the syscatalog table.
-  SysCatalogTable::Actions actions;
-  actions.tablets_to_add.push_back(new_tablet);
-  actions.tablets_to_update.push_back(old_tablet);
-  Status s = sys_catalog_->Write(actions);
-  if (!s.ok()) {
-    s = s.CloneAndPrepend("an error occurred while writing to the sys-catalog");
-    LOG(WARNING) << s.ToString();
-    CheckIfNoLongerLeaderAndSetupError(s, resp);
-    return s;
+  {
+    SysCatalogTable::Actions actions;
+    actions.tablets_to_add.push_back(new_tablet);
+    actions.tablets_to_update.push_back(old_tablet);
+    Status s = sys_catalog_->Write(std::move(actions));
+    if (PREDICT_FALSE(!s.ok())) {
+      s = s.CloneAndPrepend("an error occurred while writing to the sys-catalog");
+      LOG(WARNING) << s.ToString();
+      CheckIfNoLongerLeaderAndSetupError(s, resp);
+      return s;
+    }
   }
 
   // Now commit the in-memory state and modify the global tablet map.
@@ -5208,12 +5302,16 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
       initial_term_(-1) {
 
   // Check if the catalog manager is running.
-  std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
-  if (PREDICT_FALSE(catalog_->state_ != kRunning)) {
-    catalog_status_ = Status::ServiceUnavailable(
-        Substitute("Catalog manager is not initialized. State: $0",
-                   StateToString(catalog_->state_)));
-    return;
+  int64_t leader_ready_term;
+  {
+    std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
+    if (PREDICT_FALSE(catalog_->state_ != kRunning)) {
+      catalog_status_ = Status::ServiceUnavailable(
+          Substitute("Catalog manager is not initialized. State: $0",
+                     StateToString(catalog_->state_)));
+      return;
+    }
+    leader_ready_term = catalog_->leader_ready_term_;
   }
 
   ConsensusStatePB cstate;
@@ -5235,7 +5333,7 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
                    uuid, SecureShortDebugString(cstate)));
     return;
   }
-  if (PREDICT_FALSE(catalog_->leader_ready_term_ != cstate.current_term() ||
+  if (PREDICT_FALSE(leader_ready_term != initial_term_ ||
                     !leader_shared_lock_.owns_lock())) {
     leader_status_ = Status::ServiceUnavailable(
         "Leader not yet ready to serve requests");
@@ -5419,6 +5517,11 @@ string TableInfo::ToString() const {
   return Substitute("$0 [id=$1]", l.data().pb.name(), table_id_);
 }
 
+uint32_t TableInfo::schema_version() const {
+  TableMetadataLock l(this, LockMode::READ);
+  return l.data().pb.version();
+}
+
 void TableInfo::AddRemoveTablets(const vector<scoped_refptr<TabletInfo>>& tablets_to_add,
                                  const vector<scoped_refptr<TabletInfo>>& tablets_to_drop) {
   std::lock_guard<rw_spinlock> l(lock_);
@@ -5507,29 +5610,26 @@ bool TableInfo::IsCreateInProgress() const {
   return false;
 }
 
-void TableInfo::AddTask(MonitoredTask* task) {
-  task->AddRef();
-  {
-    std::lock_guard<rw_spinlock> l(lock_);
-    pending_tasks_.insert(task);
-  }
+void TableInfo::AddTask(const string& tablet_id, const scoped_refptr<MonitoredTask>& task) {
+  std::lock_guard<rw_spinlock> l(lock_);
+  pending_tasks_.emplace(tablet_id, task);
 }
 
-void TableInfo::RemoveTask(MonitoredTask* task) {
-  {
-    std::lock_guard<rw_spinlock> l(lock_);
-    pending_tasks_.erase(task);
+void TableInfo::RemoveTask(const string& tablet_id, MonitoredTask* task) {
+  std::lock_guard<rw_spinlock> l(lock_);
+  auto range = pending_tasks_.equal_range(tablet_id);
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second.get() == task) {
+      pending_tasks_.erase(it);
+      break;
+    }
   }
-
-  // Done outside the lock so that if Release() drops the last ref to this
-  // TableInfo, RemoveTask() won't unlock a freed lock.
-  task->Release();
 }
 
 void TableInfo::AbortTasks() {
   shared_lock<rw_spinlock> l(lock_);
-  for (MonitoredTask* task : pending_tasks_) {
-    task->Abort();
+  for (auto& task : pending_tasks_) {
+    task.second->Abort();
   }
 }
 
@@ -5547,10 +5647,24 @@ void TableInfo::WaitTasksCompletion() {
   }
 }
 
-void TableInfo::GetTaskList(vector<scoped_refptr<MonitoredTask>>* ret) {
+bool TableInfo::ContainsTask(const string& tablet_id, const string& task_description) {
   shared_lock<rw_spinlock> l(lock_);
-  for (MonitoredTask* task : pending_tasks_) {
-    ret->push_back(make_scoped_refptr(task));
+  auto range = pending_tasks_.equal_range(tablet_id);
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second->description() == task_description) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void TableInfo::GetTaskList(vector<scoped_refptr<MonitoredTask>>* tasks) {
+  tasks->clear();
+  {
+    shared_lock<rw_spinlock> l(lock_);
+    for (const auto& task : pending_tasks_) {
+      tasks->push_back(task.second);
+    }
   }
 }
 
@@ -5568,7 +5682,6 @@ void TableInfo::RegisterMetrics(MetricRegistry* metric_registry, const string& t
     attrs["table_name"] = table_name;
     metric_entity_ = METRIC_ENTITY_table.Instantiate(metric_registry, table_id_, attrs);
     metrics_.reset(new TableMetrics(metric_entity_));
-    METRIC_merged_entities_count_of_table.InstantiateHidden(metric_entity_, 1);
   }
 }
 
@@ -5581,52 +5694,114 @@ void TableInfo::UnregisterMetrics() {
 void TableInfo::UpdateMetrics(const string& tablet_id,
                               const tablet::ReportedTabletStatsPB& old_stats,
                               const tablet::ReportedTabletStatsPB& new_stats) {
-  if (metrics_) {
+  if (!metrics_) return;
+
+  if (PREDICT_TRUE(!metrics_->on_disk_size->IsInvisible())) {
     metrics_->on_disk_size->IncrementBy(
-        static_cast<int64_t>(new_stats.on_disk_size())
-        - static_cast<int64_t>(old_stats.on_disk_size()));
-    if (new_stats.has_live_row_count()) {
-      DCHECK(!metrics_->ContainsTabletNoLiveRowCount(tablet_id));
-
-      // The function "IncrementBy" makes the metric visible by validating the epoch.
-      // So, it's very important to skip calling it while the metric is invisible.
-      if (!metrics_->live_row_count->IsInvisible()) {
-        metrics_->live_row_count->IncrementBy(
-            static_cast<int64_t>(new_stats.live_row_count())
-            - static_cast<int64_t>(old_stats.live_row_count()));
+        static_cast<int64_t>(new_stats.on_disk_size()) -
+        static_cast<int64_t>(old_stats.on_disk_size()));
+  } else {
+    // When is the 'on disk size' invisible?
+    // 1. there is a tablet(legacy or not) under the old tserver version;
+    if (metrics_->ContainsTabletNoOnDiskSize(tablet_id)) {
+      metrics_->DeleteTabletNoOnDiskSize(tablet_id);
+      // The tserver version has been updated since the 'on_disk_size' of the
+      // tablet was not supported before but now it is supported, so we need
+      // to check that the metric could be visible.
+      if (metrics_->TableSupportsOnDiskSize()) {
+        DCHECK(new_stats.has_on_disk_size());
+        uint64_t on_disk_size = new_stats.on_disk_size();
+        {
+          std::lock_guard<rw_spinlock> l(lock_);
+          for (const auto& e : tablet_map_) {
+            if (e.first != tablet_id) {
+              on_disk_size += e.second->GetStats().on_disk_size();
+            }
+          }
+        }
+        // Set the metric value and it will be visible again.
+        metrics_->on_disk_size->set_value(static_cast<int64_t>(on_disk_size));
       }
-    } else if (!old_stats.has_on_disk_size()) {
-      // For an existing tablet, either it supports 'live_row_count' or not. Obviously,
-      // it doesn't support this feature in this branch. So we gather the tablet uuid to
-      // make sure later that the table doesn't support this either. But the new_stats
-      // will keep coming, so it's necessary to limit the operation to one time only.
-      // Thus, we use the 'on_disk_size' metric of the old_stats as a switch when it is
-      // transitioned from "uninitialized stats" to "has_on_disk_size()".
-      metrics_->AddTabletNoLiveRowCount(tablet_id);
+    }
+  }
 
-      // Make the metric invisible by invalidating the epoch.
+  if (PREDICT_TRUE(!metrics_->live_row_count->IsInvisible())) {
+    if (new_stats.has_live_row_count()) {
+      metrics_->live_row_count->IncrementBy(
+          static_cast<int64_t>(new_stats.live_row_count()) -
+          static_cast<int64_t>(old_stats.live_row_count()));
+    } else {
+      // The legacy tablet makes the metric invisible by invalidating the epoch.
+      metrics_->AddTabletNoLiveRowCount(tablet_id);
       metrics_->live_row_count->InvalidateEpoch();
     }
+  } else {
+    // When is the 'live row count' invisible?
+    // 1. there is a legacy tablet under the new tserver version;
+    // 2. there is a newly created tablet which has 'live_row_count',
+    //    but the tserver rolls back to the old version;
+    if (metrics_->ContainsTabletNoLiveRowCount(tablet_id) && new_stats.has_live_row_count()) {
+      // It is case 2 and the tserver version has been updated.
+      metrics_->DeleteTabletNoLiveRowCount(tablet_id);
+      if (metrics_->TableSupportsLiveRowCount()) {
+        uint64_t live_row_count = new_stats.live_row_count();
+        {
+          std::lock_guard<rw_spinlock> l(lock_);
+          for (const auto& e : tablet_map_) {
+            if (e.first != tablet_id) {
+              live_row_count += e.second->GetStats().live_row_count();
+            }
+          }
+        }
+        metrics_->live_row_count->set_value(static_cast<int64_t>(live_row_count));
+      }
+    }
+  }
+}
+
+void TableInfo::InvalidateMetrics(const std::string& tablet_id) {
+  if (!metrics_) return;
+  if (!metrics_->ContainsTabletNoOnDiskSize(tablet_id)) {
+    metrics_->AddTabletNoOnDiskSize(tablet_id);
+    metrics_->on_disk_size->InvalidateEpoch();
+  }
+  if (!metrics_->ContainsTabletNoLiveRowCount(tablet_id)) {
+    metrics_->AddTabletNoLiveRowCount(tablet_id);
+    metrics_->live_row_count->InvalidateEpoch();
   }
 }
 
 void TableInfo::RemoveMetrics(const string& tablet_id,
                               const tablet::ReportedTabletStatsPB& old_stats) {
-  if (metrics_) {
-    metrics_->on_disk_size->IncrementBy(-static_cast<int64_t>(old_stats.on_disk_size()));
-    if (old_stats.has_live_row_count()) {
-      DCHECK(!metrics_->ContainsTabletNoLiveRowCount(tablet_id));
-      metrics_->live_row_count->IncrementBy(-static_cast<int64_t>(old_stats.live_row_count()));
-    } else {
-      metrics_->DeleteTabletNoLiveRowCount(tablet_id);
+  DCHECK(lock_.is_locked());
+  if (!metrics_) return;
 
-      // Make the metric visible again after all of the legacy tablets are deleted.
+  if (PREDICT_TRUE(!metrics_->on_disk_size->IsInvisible())) {
+    metrics_->on_disk_size->IncrementBy(-static_cast<int64_t>(old_stats.on_disk_size()));
+  } else {
+    if (metrics_->ContainsTabletNoOnDiskSize(tablet_id)) {
+      metrics_->DeleteTabletNoOnDiskSize(tablet_id);
+      if (metrics_->TableSupportsOnDiskSize()) {
+        uint64_t on_disk_size = 0;
+        for (const auto& e : tablet_map_) {
+          on_disk_size += e.second->GetStats().on_disk_size();
+        }
+        metrics_->on_disk_size->set_value(static_cast<int64_t>(on_disk_size));
+      }
+    }
+  }
+
+  if (PREDICT_TRUE(!metrics_->live_row_count->IsInvisible())) {
+    metrics_->live_row_count->IncrementBy(-static_cast<int64_t>(old_stats.live_row_count()));
+  } else {
+    if (metrics_->ContainsTabletNoLiveRowCount(tablet_id)) {
+      metrics_->DeleteTabletNoLiveRowCount(tablet_id);
       if (metrics_->TableSupportsLiveRowCount()) {
         uint64_t live_row_count = 0;
         for (const auto& e : tablet_map_) {
           live_row_count += e.second->GetStats().live_row_count();
         }
-        metrics_->live_row_count->IncrementBy(static_cast<int64_t>(live_row_count));
+        metrics_->live_row_count->set_value(static_cast<int64_t>(live_row_count));
       }
     }
   }

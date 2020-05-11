@@ -16,6 +16,20 @@
 # under the License.
 
 #######################################
+# block_bloom_filter_proto
+#######################################
+
+PROTOBUF_GENERATE_CPP(
+  BLOCK_BLOOM_FILTER_PROTO_SRCS BLOCK_BLOOM_FILTER_PROTO_HDRS BLOCK_BLOOM_FILTER_PROTO_TGTS
+  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+  PROTO_FILES block_bloom_filter.proto)
+ADD_EXPORTABLE_LIBRARY(block_bloom_filter_proto
+  SRCS ${BLOCK_BLOOM_FILTER_PROTO_SRCS}
+  DEPS hash_proto pb_util_proto protobuf
+  NONLINK_DEPS ${BLOCK_BLOOM_FILTER_PROTO_TGTS})
+
+#######################################
 # util_compression_proto
 #######################################
 
@@ -148,6 +162,7 @@ set(UTIL_SRCS
   atomic.cc
   bitmap.cc
   block_cache_metrics.cc
+  block_bloom_filter.cc
   bloom_filter.cc
   cache.cc
   char_util.cc
@@ -226,7 +241,6 @@ set(UTIL_SRCS
   throttler.cc
   trace.cc
   trace_metrics.cc
-  ttl_cache_test_metrics.cc
   user.cc
   url-coding.cc
   version_info.cc
@@ -242,7 +256,30 @@ set(UTIL_SRCS
 # optimized regardless of the default optimization options.
 set_source_files_properties(memory/overwrite.cc PROPERTIES COMPILE_FLAGS "-O3")
 
+# Detect AVX2 support
+set(AVX2_CMD "echo | ${CMAKE_CXX_COMPILER} -mavx2 -dM -E - | awk '$2 == \"__AVX2__\" { print $3 }'")
+execute_process(
+  COMMAND bash -c ${AVX2_CMD}
+  OUTPUT_VARIABLE AVX2_SUPPORT
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# block_bloom_filter_avx2.cc uses AVX2 operations.
+if (AVX2_SUPPORT)
+  list(APPEND UTIL_SRCS block_bloom_filter_avx2.cc)
+  set_source_files_properties(block_bloom_filter_avx2.cc PROPERTIES COMPILE_FLAGS "-mavx2")
+  # block_bloom_filter.cc is not compiled explicitly with AVX2 instructions(-mavx2) but it needs
+  # to know at compile time whether AVX2 support is available, hence the custom definition
+  # instead of relying on __AVX2__ defined by compiler with -mavx2.
+  set_source_files_properties(block_bloom_filter_avx2.cc block_bloom_filter.cc
+                              PROPERTIES COMPILE_DEFINITIONS "USE_AVX2=1")
+  message("Compiler supports AVX2")
+else()
+  message("Compiler does not support AVX2")
+endif()
+
 set(UTIL_LIBS
+  block_bloom_filter_proto
   crcutil
   gflags
   glog
@@ -300,6 +337,26 @@ ADD_EXPORTABLE_LIBRARY(kudu_util_compression
 target_compile_definitions(kudu_util_compression PUBLIC LZ4_DISABLE_DEPRECATE_WARNINGS)
 target_compile_definitions(kudu_util_compression_exported PUBLIC LZ4_DISABLE_DEPRECATE_WARNINGS)
 
+#######################################
+# kudu_curl_util
+#######################################
+add_library(kudu_curl_util
+  curl_util.cc)
+target_link_libraries(kudu_curl_util
+  security
+  curl
+  glog
+  gutil)
+
+#######################################
+# kudu_cloud_util
+#######################################
+add_library(kudu_cloud_util
+  cloud/instance_detector.cc
+  cloud/instance_metadata.cc)
+target_link_libraries(kudu_cloud_util
+  kudu_curl_util)
+
 # See the comment in sanitizer_options.cc for details on this library's usage.
 # The top-level CMakeLists sets a ${SANITIZER_OPTIONS_OVERRIDE} variable which
 # should be linked first into all Kudu binaries.
@@ -335,19 +392,6 @@ target_link_libraries(kudu_test_util
   glog
   gmock
   kudu_util)
-
-#######################################
-# kudu_curl_util
-#######################################
-if(NOT NO_TESTS)
-  add_library(kudu_curl_util
-    curl_util.cc)
-  target_link_libraries(kudu_curl_util
-    security
-    ${CURL_LIBRARIES}
-    glog
-    gutil)
-endif()
 
 #######################################
 # kudu_test_main
@@ -388,10 +432,10 @@ ADD_KUDU_TEST(bit-util-test)
 ADD_KUDU_TEST(bitmap-test)
 ADD_KUDU_TEST(bitset-test)
 ADD_KUDU_TEST(blocking_queue-test)
+ADD_KUDU_TEST(block_bloom_filter-test)
 ADD_KUDU_TEST(bloom_filter-test)
 ADD_KUDU_TEST(cache-bench RUN_SERIAL true)
 ADD_KUDU_TEST(cache-test)
-ADD_KUDU_TEST(callback_bind-test)
 ADD_KUDU_TEST(char_util-test
   DATA_FILES testdata/char_truncate_utf8.txt testdata/char_truncate_ascii.txt)
 ADD_KUDU_TEST(countdown_latch-test)
@@ -402,7 +446,27 @@ ADD_KUDU_TEST(easy_json-test)
 ADD_KUDU_TEST(env-test LABELS no_tsan)
 ADD_KUDU_TEST(env_util-test)
 ADD_KUDU_TEST(errno-test)
+
+# There's a move in faststring-test.cc that looks like this:
+#
+#   f1 = std::move(f1);
+#
+# Self-moves are generally undesirable, and Clang warns about them via the
+# -Wself-move flag. In this particular case, we're explicitly testing self-move
+# behavior, so we don't want any warnings.
+#
+# Unfortunately, if we disable -Wself-move via clang diagnostic pragmas, we'll
+# wind up triggering gcc's -Wunknown-pragmas warning. And due to a long-standing
+# bug[1], we can't disable -Wunknown-pragmas via GCC diagnostic pragmas. So we
+# must disable the warning for the entirety of the compilation unit.
+#
+# 1. https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53431
+if("${COMPILER_FAMILY}" STREQUAL "clang")
+  set_source_files_properties(faststring-test.cc PROPERTIES COMPILE_FLAGS
+    "-Wno-self-move")
+endif()
 ADD_KUDU_TEST(faststring-test)
+
 ADD_KUDU_TEST(file_cache-test)
 ADD_KUDU_TEST(file_cache-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(flag_tags-test)
@@ -539,4 +603,13 @@ ADD_KUDU_TEST(curl_util-test)
 if(NOT NO_TESTS)
   target_link_libraries(curl_util-test
     kudu_curl_util)
+endif()
+
+#######################################
+# instance_detector-test
+#######################################
+ADD_KUDU_TEST(cloud/instance_detector-test)
+if(NOT NO_TESTS)
+  target_link_libraries(instance_detector-test
+    kudu_cloud_util)
 endif()

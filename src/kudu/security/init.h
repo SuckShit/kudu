@@ -86,5 +86,19 @@ Status CanonicalizeKrb5Principal(std::string* principal);
 // exist yet, and trying to avoid rebase pain).
 Status MapPrincipalToLocalName(const std::string& principal, std::string* local_name);
 
+// Get the configured principal. 'in_principal' is the user specified principal to use with
+// Kerberos. It may have a token in the string of the form '_HOST', which if present, needs
+// to be replaced with the FQDN of the current host. 'out_principal' has the final principal
+// with which one may Kinit.
+Status GetConfiguredPrincipal(const std::string& in_principal, std::string* out_principal);
+
+// Get the Kerberos config file location. It defaults to /etc/krb5.conf and it
+// can be overridden by the KRB5_CONFIG environment variable. As the Kerberos
+// libraries use the environment variable directly, this is not required
+// normally, but it can be useful if the file needs to be accessed directly
+// (e.g. when starting a Java subprocess, as Java doesn't respect the
+// environment variable).
+std::string GetKrb5ConfigFile();
+
 } // namespace security
 } // namespace kudu

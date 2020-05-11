@@ -22,7 +22,6 @@
 #include <gflags/gflags_declare.h>
 #include <gtest/gtest.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/remote_user.h"
 #include "kudu/tablet/tablet_replica.h"
@@ -87,7 +86,10 @@ TEST(ScannerTest, TestExpire) {
   mgr.NewScanner(null_replica, RemoteUser(), RowFormatFlags::NO_FLAGS, &s1);
   mgr.NewScanner(null_replica, RemoteUser(), RowFormatFlags::NO_FLAGS, &s2);
   SleepFor(MonoDelta::FromMilliseconds(200));
-  s2->UpdateAccessTime();
+  {
+    // Update the access time by locking and unlocking.
+    auto access = s2->LockForAccess();
+  }
   mgr.RemoveExpiredScanners();
   ASSERT_EQ(1, mgr.CountActiveScanners());
   ASSERT_EQ(1, mgr.metrics_->scanners_expired->value());

@@ -26,7 +26,8 @@ from kudu.compat import tobytes, frombytes
 from kudu.schema cimport *
 from kudu.errors cimport check_status
 from kudu.client cimport PartialRow
-from kudu.util import get_decimal_scale, to_unixtime_micros, to_unscaled_decimal
+from kudu.util import get_decimal_scale, to_unixtime_micros, to_unscaled_decimal, \
+    unix_epoch_days_to_date, date_to_unix_epoch_days
 from errors import KuduException
 
 import six
@@ -35,6 +36,7 @@ from . import util
 
 BOOL = KUDU_BOOL
 STRING = KUDU_STRING
+VARCHAR = KUDU_VARCHAR
 
 INT8 = KUDU_INT8
 INT16 = KUDU_INT16
@@ -45,6 +47,7 @@ FLOAT = KUDU_FLOAT
 DOUBLE = KUDU_DOUBLE
 
 UNIXTIME_MICROS = KUDU_UNIXTIME_MICROS
+DATE = KUDU_DATE
 BINARY = KUDU_BINARY
 
 DECIMAL = KUDU_DECIMAL
@@ -123,6 +126,8 @@ double_ = KuduType(KUDU_DOUBLE)
 binary = KuduType(KUDU_BINARY)
 unixtime_micros = KuduType(KUDU_UNIXTIME_MICROS)
 decimal = KuduType(KUDU_DECIMAL)
+varchar = KuduType(KUDU_VARCHAR)
+date = KuduType(KUDU_DATE)
 
 
 cdef dict _type_names = {
@@ -136,7 +141,9 @@ cdef dict _type_names = {
     DOUBLE: 'double',
     BINARY: 'binary',
     UNIXTIME_MICROS: 'unixtime_micros',
-    DECIMAL: 'decimal'
+    DECIMAL: 'decimal',
+    VARCHAR: 'varchar',
+    DATE: 'date'
 }
 
 
@@ -153,7 +160,9 @@ cdef dict _type_to_obj = {
     DOUBLE: double_,
     BINARY: binary,
     UNIXTIME_MICROS: unixtime_micros,
-    DECIMAL: decimal
+    DECIMAL: decimal,
+    VARCHAR: varchar,
+    DATE: date
 }
 
 
@@ -171,9 +180,11 @@ cdef cppclass KuduColumnTypeAttributes:
         KuduColumnTypeAttributes()
         KuduColumnTypeAttributes(const KuduColumnTypeAttributes& other)
         KuduColumnTypeAttributes(int8_t precision, int8_t scale)
+        KuduColumnTypeAttributes(uint16_t length)
 
         int8_t precision()
         int8_t scale()
+        uint16_t length()
 
         c_bool Equals(KuduColumnTypeAttributes& other)
         void CopyFrom(KuduColumnTypeAttributes& other)
@@ -197,10 +208,15 @@ cdef class ColumnTypeAttributes:
         def __get__(self):
             return self.type_attributes.scale()
 
+    property length:
+        def __get__(self):
+            return self.type_attributes.length()
+
     def __repr__(self):
-        return ('ColumnTypeAttributes(precision=%s, scale=%s)'
+        return ('ColumnTypeAttributes(precision=%s, scale=%s, length=%s)'
                 % (self.type_attributes.precision(),
-                   self.type_attributes.scale()))
+                   self.type_attributes.scale(),
+                   self.type_attributes.length()))
 
 cdef class ColumnSchema:
     """
@@ -382,6 +398,22 @@ cdef class ColumnSpec:
         self.spec.Scale(scale)
         return self
 
+    def length(self, length):
+        """
+        Set the length for the column.
+
+        Clients can specify a length for varchar columns. Length is the maximum
+        length in characters (UTF-8) of the string that the varchar can hold.
+
+        The length must be between 1 and 65,535 (inclusive).
+
+        Returns
+        -------
+        self
+        """
+        self.spec.Length(length)
+        return self
+
     def primary_key(self):
         """
         Make this column a primary key. If you use this method, it will be the
@@ -473,7 +505,7 @@ cdef class SchemaBuilder:
 
     def add_column(self, name, type_=None, nullable=None, compression=None,
                    encoding=None, primary_key=False, block_size=None,
-                   default=None, precision=None, scale=None):
+                   default=None, precision=None, scale=None, length=None):
         """
         Add a new column to the schema. Returns a ColumnSpec object for further
         configuration and use in a fluid programming style.
@@ -502,6 +534,8 @@ cdef class SchemaBuilder:
           Use this precision for the decimal column
         scale : int
           Use this scale for the decimal column
+        length : int
+          Use this length for the varchar column
 
         Examples
         --------
@@ -536,6 +570,9 @@ cdef class SchemaBuilder:
 
         if scale is not None:
             result.scale(scale)
+
+        if length is not None:
+            result.length(length)
 
         if primary_key:
             result.primary_key()
@@ -749,7 +786,7 @@ cdef class KuduValue:
 
         if (type_.name[:3] == 'int'):
             self._value = C_KuduValue.FromInt(value)
-        elif (type_.name in ['string', 'binary']):
+        elif (type_.name in ['string', 'binary', 'varchar']):
             if isinstance(value, unicode):
                 value = value.encode('utf8')
 
@@ -764,6 +801,9 @@ cdef class KuduValue:
         elif (type_.name == 'unixtime_micros'):
             value = to_unixtime_micros(value)
             self._value = C_KuduValue.FromInt(value)
+        elif (type_.name == 'date'):
+            val = date_to_unix_epoch_days(value)
+            self._value = C_KuduValue.FromInt(val)
         elif (type_.name == 'decimal'):
             IF PYKUDU_INT128_SUPPORTED == 1:
                 scale = get_decimal_scale(value)

@@ -29,14 +29,14 @@
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
 #include "kudu/common/wire_protocol.pb.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/util/bitmap.h"
 #include "kudu/util/slice.h"
 
+using kudu::client::sp::shared_ptr;
+using std::unique_ptr;
+
 namespace kudu {
 namespace client {
-
-using sp::shared_ptr;
 
 RowOperationsPB_Type ToInternalWriteType(KuduWriteOperation::Type type) {
   switch (type) {
@@ -44,6 +44,7 @@ RowOperationsPB_Type ToInternalWriteType(KuduWriteOperation::Type type) {
     case KuduWriteOperation::UPDATE: return RowOperationsPB_Type_UPDATE;
     case KuduWriteOperation::DELETE: return RowOperationsPB_Type_DELETE;
     case KuduWriteOperation::UPSERT: return RowOperationsPB_Type_UPSERT;
+    case KuduWriteOperation::INSERT_IGNORE: return RowOperationsPB_Type_INSERT_IGNORE;
     default: LOG(FATAL) << "Unexpected write operation type: " << type;
   }
 }
@@ -65,7 +66,7 @@ EncodedKey* KuduWriteOperation::CreateKey() const {
   for (int i = 0; i < row.schema()->num_key_columns(); i++) {
     kb.AddColumnKey(row.cell_ptr(i));
   }
-  gscoped_ptr<EncodedKey> key(kb.BuildEncodedKey());
+  unique_ptr<EncodedKey> key(kb.BuildEncodedKey());
   return key.release();
 }
 
@@ -81,7 +82,7 @@ int64_t KuduWriteOperation::SizeInBuffer() const {
   // Add size of isset bitmap (always present).
   size += BitmapSize(schema->num_columns());
   // Add size of null bitmap (present if the schema has nullables)
-  size += ContiguousRowHelper::null_bitmap_size(*schema);
+  size += ContiguousRowHelper::non_null_bitmap_size(*schema);
   // The column data itself:
   for (int i = 0; i < schema->num_columns(); i++) {
     if (row_.IsColumnSet(i) && !row_.IsNull(i)) {
@@ -104,6 +105,14 @@ KuduInsert::KuduInsert(const shared_ptr<KuduTable>& table)
 }
 
 KuduInsert::~KuduInsert() {}
+
+// InsertIgnore -----------------------------------------------------------------
+
+KuduInsertIgnore::KuduInsertIgnore(const shared_ptr<KuduTable>& table)
+  : KuduWriteOperation(table) {
+}
+
+KuduInsertIgnore::~KuduInsertIgnore() {}
 
 // Update -----------------------------------------------------------------------
 

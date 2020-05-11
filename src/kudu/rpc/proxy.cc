@@ -17,23 +17,22 @@
 
 #include "kudu/rpc/proxy.h"
 
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <utility>
 
-#include <boost/bind.hpp> // IWYU pragma: keep
-#include <boost/core/ref.hpp>
 #include <glog/logging.h>
 
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/util/net/sockaddr.h"
-#include "kudu/util/countdown_latch.h"
+#include "kudu/util/notification.h"
 #include "kudu/util/status.h"
 #include "kudu/util/user.h"
 
@@ -53,7 +52,7 @@ Proxy::Proxy(std::shared_ptr<Messenger> messenger,
       is_started_(false) {
   CHECK(messenger_ != nullptr);
   DCHECK(!service_name_.empty()) << "Proxy service name must not be blank";
-
+  DCHECK(remote.is_initialized());
   // By default, we set the real user to the currently logged-in user.
   // Effective user and password remain blank.
   string real_user;
@@ -94,11 +93,10 @@ Status Proxy::SyncRequest(const string& method,
                           const google::protobuf::Message& req,
                           google::protobuf::Message* resp,
                           RpcController* controller) const {
-  CountDownLatch latch(1);
+  Notification note;
   AsyncRequest(method, req, DCHECK_NOTNULL(resp), controller,
-               boost::bind(&CountDownLatch::CountDown, boost::ref(latch)));
-
-  latch.Wait();
+               [&note]() { note.Notify(); });
+  note.WaitForNotification();
   return controller->status();
 }
 

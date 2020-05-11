@@ -98,11 +98,13 @@ else
       "bison")        F_BISON=1 ;;
       "hadoop")       F_HADOOP=1 ;;
       "hive")         F_HIVE=1 ;;
-      "sentry")       F_SENTRY=1 ;;
       "yaml")         F_YAML=1 ;;
       "chrony")       F_CHRONY=1 ;;
       "gumbo-parser") F_GUMBO_PARSER=1 ;;
       "gumbo-query")  F_GUMBO_QUERY=1 ;;
+      "postgres")     F_POSTGRES=1 ;;
+      "psql-jdbc")    F_POSTGRES_JDBC=1 ;;
+      "ranger")       F_RANGER=1 ;;
       *)              echo "Unknown module: $arg"; exit 1 ;;
     esac
   done
@@ -252,7 +254,16 @@ if [ -n "$F_COMMON" -o -n "$F_CHRONY" ]; then
   build_chrony
 fi
 
-# Install Hadoop, Hive, and Sentry by symlinking their source directories (which
+if [ -n "$F_COMMON" -o -n "$F_POSTGRES" ]; then
+  build_postgres
+fi
+
+if [ -n "$F_COMMON" -o -n "$F_POSTGRES_JDBC" ]; then
+  mkdir -p $PREFIX/opt/jdbc
+  ln -nsf $POSTGRES_JDBC_SOURCE/$POSTGRES_JDBC_NAME.jar $PREFIX/opt/jdbc/postgresql.jar
+fi
+
+# Install Hadoop, Hive, and Ranger by symlinking their source directories (which
 # are pre-built) into $PREFIX/opt.
 if [ -n "$F_COMMON" -o -n "$F_HADOOP" ]; then
   mkdir -p $PREFIX/opt
@@ -264,13 +275,16 @@ if [ -n "$F_COMMON" -o -n "$F_HIVE" ]; then
   ln -nsf $HIVE_SOURCE $PREFIX/opt/hive
 fi
 
-if [ -n "$F_COMMON" -o -n "$F_SENTRY" ]; then
+if [ -n "$F_COMMON" -o -n "$F_RANGER" ]; then
   mkdir -p $PREFIX/opt
-  # Remove any hadoop jars included in the Sentry package to avoid unexpected
-  # runtime behavior, due to different versions of hadoop jars are loaded
-  # (one from Kudu's third-party dependency, the other from the Sentry package).
-  rm -rf $SENTRY_SOURCE/lib/hadoop-[a-z-]*.jar
-  ln -nsf $SENTRY_SOURCE $PREFIX/opt/sentry
+  # Remove any hadoop jars included in the Ranger package to avoid unexpected
+  # runtime behavior due to different versions of hadoop jars.
+  rm -rf $RANGER_SOURCE/lib/hadoop-[a-z-]*.jar
+  ln -nsf $RANGER_SOURCE $PREFIX/opt/ranger
+
+  # Symlink conf.dist to conf
+  ln -nsf $PREFIX/opt/ranger/ews/webapp/WEB-INF/classes/conf.dist \
+  $PREFIX/opt/ranger/ews/webapp/WEB-INF/classes/conf
 fi
 
 ### Build C dependencies without instrumentation
@@ -322,6 +336,15 @@ if [ -n "$F_COMMON" -o -n "$F_LLVM" ]; then
   build_llvm normal
 fi
 
+# From this point forward, clang is available for us to use if needed.
+if which ccache >/dev/null ; then
+  CLANG="$TP_DIR/../build-support/ccache-clang/clang"
+  CLANGXX="$TP_DIR/../build-support/ccache-clang/clang++"
+else
+  CLANG="$TP_DIR/clang-toolchain/bin/clang"
+  CLANGXX="$TP_DIR/clang-toolchain/bin/clang++"
+fi
+
 save_env
 
 # Enable debug symbols so that stacktraces and linenumbers are available at
@@ -329,6 +352,15 @@ save_env
 # 20GiB of disk space.
 EXTRA_CFLAGS="-g $EXTRA_CFLAGS"
 EXTRA_CXXFLAGS="-g $EXTRA_CXXFLAGS"
+
+# Build libc++abi first as it is a dependency for libc++.
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_LLVM" ]; then
+  build_libcxxabi
+fi
+
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_LLVM" ]; then
+  build_libcxx normal
+fi
 
 if [ -n "$F_UNINSTRUMENTED" -o -n "$F_GFLAGS" ]; then
   build_gflags
@@ -422,13 +454,6 @@ fi
 #   * -Wl,-rpath,... - Add instrumented libc++ location to the rpath so that it
 #                      can be found at runtime.
 
-if which ccache >/dev/null ; then
-  CLANG="$TP_DIR/../build-support/ccache-clang/clang"
-  CLANGXX="$TP_DIR/../build-support/ccache-clang/clang++"
-else
-  CLANG="$TP_DIR/clang-toolchain/bin/clang"
-  CLANGXX="$TP_DIR/clang-toolchain/bin/clang++"
-fi
 export CC=$CLANG
 export CXX=$CLANGXX
 

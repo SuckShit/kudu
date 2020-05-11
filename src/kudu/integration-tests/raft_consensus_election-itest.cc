@@ -16,8 +16,12 @@
 // under the License.
 
 #include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <memory>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -31,7 +35,6 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
@@ -43,6 +46,7 @@
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tserver/tablet_server-test-base.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/pb_util.h"
@@ -51,16 +55,15 @@
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-DECLARE_int64(client_inserts_per_thread);
-DECLARE_int64(client_num_batches_per_thread);
+DECLARE_int32(client_inserts_per_thread);
+DECLARE_int32(client_num_batches_per_thread);
 DECLARE_int32(consensus_rpc_timeout_ms);
 DECLARE_int32(num_client_threads);
 DECLARE_int32(num_replicas);
 DECLARE_int32(num_tablet_servers);
 
-METRIC_DECLARE_entity(tablet);
-METRIC_DECLARE_counter(transaction_memory_pressure_rejections);
-METRIC_DECLARE_gauge_int64(raft_term);
+METRIC_DECLARE_entity(server);
+METRIC_DECLARE_gauge_int32(num_raft_leaders);
 
 using kudu::cluster::ExternalTabletServer;
 using kudu::consensus::COMMITTED_OPID;
@@ -70,6 +73,7 @@ using kudu::consensus::OpId;
 using kudu::consensus::RaftPeerPB;
 using kudu::itest::AddServer;
 using kudu::itest::GetConsensusState;
+using kudu::itest::GetInt64Metric;
 using kudu::itest::GetLastOpIdForReplica;
 using kudu::itest::GetReplicaStatusAndCheckIfLeader;
 using kudu::itest::LeaderStepDown;
@@ -97,7 +101,7 @@ static const int kTestRowIntVal = 5678;
 class RaftConsensusElectionITest : public RaftConsensusITestBase {
  protected:
   void CreateClusterForChurnyElectionsTests(const vector<string>& extra_ts_flags);
-  void DoTestChurnyElections(TestWorkload* workload, int max_rows_to_insert);
+  void DoTestChurnyElections(TestWorkload* workload);
 };
 
 void RaftConsensusElectionITest::CreateClusterForChurnyElectionsTests(
@@ -110,7 +114,7 @@ void RaftConsensusElectionITest::CreateClusterForChurnyElectionsTests(
   ts_flags.push_back("--raft_heartbeat_interval_ms=5");
   ts_flags.emplace_back("--inject_latency_ms_before_starting_txn=100");
 #else
-  ts_flags.emplace_back("--raft_heartbeat_interval_ms=1");
+  ts_flags.emplace_back("--raft_heartbeat_interval_ms=2");
   ts_flags.emplace_back("--inject_latency_ms_before_starting_txn=1000");
 #endif
 
@@ -119,12 +123,14 @@ void RaftConsensusElectionITest::CreateClusterForChurnyElectionsTests(
   NO_FATALS(CreateCluster("raft_consensus-itest-cluster", std::move(ts_flags)));
 }
 
-void RaftConsensusElectionITest::DoTestChurnyElections(TestWorkload* workload,
-                                                       int max_rows_to_insert) {
+void RaftConsensusElectionITest::DoTestChurnyElections(TestWorkload* workload) {
+  const int max_rows_to_insert = AllowSlowTests() ? 10000 : 1000;
+  const MonoDelta timeout = AllowSlowTests() ? MonoDelta::FromSeconds(120)
+                                             : MonoDelta::FromSeconds(60);
   workload->set_num_replicas(FLAGS_num_replicas);
   // Set a really high write timeout so that even in the presence of many failures we
   // can verify an exact number of rows in the end, thanks to exactly once semantics.
-  workload->set_write_timeout_millis(60 * 1000 /* 60 seconds */);
+  workload->set_write_timeout_millis(timeout.ToMilliseconds());
   workload->set_num_write_threads(2);
   workload->set_write_batch_size(1);
   workload->Setup();
@@ -138,7 +144,7 @@ void RaftConsensusElectionITest::DoTestChurnyElections(TestWorkload* workload,
   while (workload->rows_inserted() < max_rows_to_insert &&
       sw.elapsed().wall_seconds() < 30) {
     SleepFor(MonoDelta::FromMilliseconds(10));
-        NO_FATALS(AssertNoTabletServersCrashed());
+    NO_FATALS(AssertNoTabletServersCrashed());
   }
   workload->StopAndJoin();
   ASSERT_GT(workload->rows_inserted(), 0) << "No rows inserted";
@@ -199,39 +205,36 @@ TEST_F(RaftConsensusElectionITest, RunLeaderElection) {
 // in a lot of churn. We expect to make some progress and not diverge or
 // crash, despite the frequent re-elections and races.
 TEST_F(RaftConsensusElectionITest, ChurnyElections) {
-  const int kNumWrites = AllowSlowTests() ? 10000 : 1000;
   NO_FATALS(CreateClusterForChurnyElectionsTests({}));
   TestWorkload workload(cluster_.get());
   workload.set_write_batch_size(1);
   workload.set_num_read_threads(2);
-  NO_FATALS(DoTestChurnyElections(&workload, kNumWrites));
+  NO_FATALS(DoTestChurnyElections(&workload));
 }
 
 // The same test, except inject artificial latency when propagating notifications
 // from the queue back to consensus. This previously reproduced bugs like KUDU-1078 which
 // normally only appear under high load.
-TEST_F(RaftConsensusElectionITest, ChurnyElections_WithNotificationLatency) {
+TEST_F(RaftConsensusElectionITest, ChurnyElectionsWithNotificationLatency) {
   NO_FATALS(CreateClusterForChurnyElectionsTests(
       {"--consensus_inject_latency_ms_in_notifications=50"}));
-  const int kNumWrites = AllowSlowTests() ? 10000 : 1000;
   TestWorkload workload(cluster_.get());
   workload.set_write_batch_size(1);
   workload.set_num_read_threads(2);
-  NO_FATALS(DoTestChurnyElections(&workload, kNumWrites));
+  NO_FATALS(DoTestChurnyElections(&workload));
 }
 
 // The same as TestChurnyElections except insert many duplicated rows.
 // This emulates cases where there are many duplicate keys which, due to two phase
 // locking, may cause deadlocks and other anomalies that cannot be observed when
 // keys are unique.
-TEST_F(RaftConsensusElectionITest, ChurnyElections_WithDuplicateKeys) {
+TEST_F(RaftConsensusElectionITest, ChurnyElectionsWithDuplicateKeys) {
   NO_FATALS(CreateClusterForChurnyElectionsTests({}));
-  const int kNumWrites = AllowSlowTests() ? 10000 : 1000;
   TestWorkload workload(cluster_.get());
   workload.set_write_pattern(TestWorkload::INSERT_WITH_MANY_DUP_KEYS);
   // Increase the number of rows per batch to get a higher chance of key collision.
   workload.set_write_batch_size(3);
-  NO_FATALS(DoTestChurnyElections(&workload, kNumWrites));
+  NO_FATALS(DoTestChurnyElections(&workload));
 }
 
 // Test automatic leader election by killing leaders.
@@ -324,6 +327,8 @@ TEST_F(RaftConsensusElectionITest, LeaderStepDown) {
                               consensus::EXCLUDE_HEALTH_REPORT, &cstate_before));
 
   // Step down and test that a 2nd stepdown returns the expected result.
+  // The leader role cannot fluctuate among tablet replicas because of
+  // --enable_leader_failure_detection=false setting.
   ASSERT_OK(LeaderStepDown(ts, tablet_id_, kTimeout));
 
   // Get the Raft term from the leader that has just stepped down.
@@ -343,6 +348,90 @@ TEST_F(RaftConsensusElectionITest, LeaderStepDown) {
   ASSERT_TRUE(s.IsIllegalState()) << "TS #0 should not accept writes as follower: "
                                   << s.ToString();
 }
+
+class RaftConsensusNumLeadersMetricTest : public RaftConsensusElectionITest,
+                                          public testing::WithParamInterface<int> {};
+
+TEST_P(RaftConsensusNumLeadersMetricTest, TestNumLeadersMetric) {
+  const int kNumTablets = 10;
+  FLAGS_num_tablet_servers = GetParam();
+  // We'll trigger elections manually, so turn off leader failure detection.
+  const vector<string> kTsFlags = {
+    "--enable_leader_failure_detection=false"
+  };
+  const vector<string> kMasterFlags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"
+  };
+  NO_FATALS(BuildAndStart(kTsFlags, kMasterFlags, /*location_info*/{}, /*create_table*/false));
+
+  // Create some tablet replias.
+  TestWorkload workload(cluster_.get());
+  workload.set_num_tablets(kNumTablets);
+  workload.set_num_replicas(FLAGS_num_tablet_servers);
+  workload.Setup();
+
+  const auto kTimeout = MonoDelta::FromSeconds(10);
+  const auto* ts = tablet_servers_.begin()->second;
+  vector<string> tablet_ids;
+  ASSERT_EVENTUALLY([&] {
+    vector<string> tablets;
+    for (const auto& ts_iter : tablet_servers_) {
+      ASSERT_OK(ListRunningTabletIds(ts_iter.second, kTimeout, &tablets));
+      ASSERT_EQ(kNumTablets, tablets.size());
+    }
+    tablet_ids = std::move(tablets);
+  });
+
+  // Do a sanity check that there are no leaders yet.
+  for (const auto& id : tablet_ids) {
+    Status s = GetReplicaStatusAndCheckIfLeader(ts, id, kTimeout);
+    ASSERT_TRUE(s.IsIllegalState()) << "TS #0 should not be leader yet: " << s.ToString();
+  }
+  const auto get_num_leaders_metric = [&] (int64_t* num_leaders) {
+    return GetInt64Metric(cluster_->tablet_server_by_uuid(ts->uuid())->bound_http_hostport(),
+                          &METRIC_ENTITY_server, nullptr, &METRIC_num_raft_leaders, "value",
+                          num_leaders);
+  };
+  int64_t num_leaders_metric;
+  ASSERT_OK(get_num_leaders_metric(&num_leaders_metric));
+  ASSERT_EQ(0, num_leaders_metric);
+
+  // Begin triggering elections and ensure we get the correct values for the
+  // metric.
+  int num_leaders_expected = 0;
+  for (const auto& id : tablet_ids) {
+    ASSERT_OK(StartElection(ts, id, kTimeout));
+    ASSERT_OK(WaitUntilLeader(ts, id, kTimeout));
+    ASSERT_OK(get_num_leaders_metric(&num_leaders_metric));
+    ASSERT_EQ(++num_leaders_expected, num_leaders_metric);
+  }
+
+  // Delete half of the leaders and ensure that the metric goes down.
+  int idx = 0;
+  int halfway_idx = tablet_ids.size() / 2;
+  for (; idx < halfway_idx; idx++) {
+    ASSERT_OK(DeleteTablet(ts, tablet_ids[idx], tablet::TABLET_DATA_TOMBSTONED, kTimeout));
+    ASSERT_OK(get_num_leaders_metric(&num_leaders_metric));
+    ASSERT_EQ(--num_leaders_expected, num_leaders_metric);
+  }
+
+  // Renounce leadership on the rest.
+  for (; idx < tablet_ids.size(); idx++) {
+    // The leader role cannot fluctuate among tablet replicas because of
+    // --enable_leader_failure_detection=false setting.
+    ASSERT_OK(LeaderStepDown(ts, tablet_ids[idx], kTimeout));
+    ASSERT_OK(get_num_leaders_metric(&num_leaders_metric));
+    ASSERT_EQ(--num_leaders_expected, num_leaders_metric);
+
+    // Also delete them and ensure that they don't affect the metric, since
+    // they're already non-leaders.
+    ASSERT_OK(DeleteTablet(ts, tablet_ids[idx], tablet::TABLET_DATA_TOMBSTONED, kTimeout));
+    ASSERT_OK(get_num_leaders_metric(&num_leaders_metric));
+    ASSERT_EQ(num_leaders_expected, num_leaders_metric);
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(NumReplicas, RaftConsensusNumLeadersMetricTest, ::testing::Values(1, 3));
 
 // Test for KUDU-699: sets the consensus RPC timeout to be long,
 // and freezes both followers before asking the leader to step down.
@@ -376,6 +465,8 @@ TEST_F(RaftConsensusElectionITest, StepDownWithSlowFollower) {
   SleepFor(MonoDelta::FromSeconds(1));
 
   // Step down should respond quickly despite the hung requests.
+  // The leader role cannot fluctuate among tablet replicas because of
+  // --enable_leader_failure_detection=false setting.
   ASSERT_OK(LeaderStepDown(tservers[0], tablet_id_, MonoDelta::FromSeconds(3)));
 }
 
@@ -466,6 +557,8 @@ TEST_F(RaftConsensusElectionITest, ElectPendingVoter) {
 
   // Now that TS 4 is electable (and pending), have TS 0 step down.
   LOG(INFO) << "Forcing Peer " << initial_leader->uuid() << " to step down...";
+  // The leader role cannot fluctuate among tablet replicas because of
+  // --enable_leader_failure_detection=false setting.
   ASSERT_OK(LeaderStepDown(initial_leader, tablet_id_, MonoDelta::FromSeconds(10)));
 
   // Resume TS 1 so we have a majority of 3 to elect a new leader.

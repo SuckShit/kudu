@@ -17,12 +17,12 @@
 
 #include "kudu/hms/hms_catalog.h"
 
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -130,7 +130,7 @@ Status HmsCatalog::Start(HmsClientVerifyKuduSyncConfig verify_service_config) {
   RETURN_NOT_OK(ha_client_.Start(std::move(addresses), std::move(options)));
 
   RETURN_NOT_OK(Thread::Create("hms_catalog", "fetch_uuid",
-                               &HmsCatalog::LoopInitializeUuid, this,
+                               [this](){ this->LoopInitializeUuid(); },
                                &uuid_initializing_thread_));
   return Status::OK();
 }
@@ -333,6 +333,7 @@ string column_to_field_type(const ColumnSchema& column) {
     case VARCHAR: return Substitute("varchar($0)",
                                     column.type_attributes().length);
     case UNIXTIME_MICROS: return "timestamp";
+    case DATE: return "date";
     default: LOG(FATAL) << "unhandled column type: " << column.TypeToString();
   }
   __builtin_unreachable();

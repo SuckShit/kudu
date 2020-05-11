@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <ostream>
@@ -27,7 +28,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
@@ -38,7 +38,7 @@
 #include "kudu/client/row_result.h"
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/value.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
@@ -46,7 +46,6 @@
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/raft_consensus.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
@@ -71,7 +70,6 @@
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_int32(heartbeat_interval_ms);
@@ -108,6 +106,7 @@ using std::atomic;
 using std::map;
 using std::pair;
 using std::string;
+using std::thread;
 using std::unique_ptr;
 using std::vector;
 
@@ -146,7 +145,7 @@ class AlterTableTest : public KuduTest {
         .Build(&client_));
 
     // Add a table, make sure it reports itself.
-    gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
     CHECK_OK(table_creator->table_name(kTableName)
              .schema(&schema_)
              .set_range_partition_columns({ "c0" })
@@ -225,7 +224,7 @@ class AlterTableTest : public KuduTest {
                          const string& column_name,
                          int32_t default_value,
                          const MonoDelta& timeout) {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(table_name));
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(table_name));
     table_alterer->AddColumn(column_name)->Type(KuduColumnSchema::INT32)->
       NotNull()->Default(KuduValue::FromInt(default_value));
     return table_alterer->timeout(timeout)->Alter();
@@ -259,7 +258,7 @@ class AlterTableTest : public KuduTest {
       CHECK_OK(row->SetInt32(0, i * 100));
       split_rows.push_back(row);
     }
-    gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     return table_creator->table_name(table_name)
@@ -291,7 +290,7 @@ class AlterTableTest : public KuduTest {
 
   static const char *kTableName;
 
-  gscoped_ptr<InternalMiniCluster> cluster_;
+  unique_ptr<InternalMiniCluster> cluster_;
   shared_ptr<KuduClient> client_;
 
   KuduSchema schema_;
@@ -375,7 +374,7 @@ TEST_F(AlterTableTest, TestAddNullableColumnWithoutDefault) {
   ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AddColumn("new")->Type(KuduColumnSchema::INT32);
     ASSERT_OK(table_alterer->Alter());
   }
@@ -395,7 +394,7 @@ TEST_F(AlterTableTest, TestRenamePrimaryKeyColumn) {
   ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AlterColumn("c0")->RenameTo("primaryKeyRenamed");
     table_alterer->AlterColumn("c1")->RenameTo("secondColumn");
     ASSERT_OK(table_alterer->Alter());
@@ -410,7 +409,7 @@ TEST_F(AlterTableTest, TestRenamePrimaryKeyColumn) {
   EXPECT_EQ("(int32 primaryKeyRenamed=16777216, int32 secondColumn=1)", rows[1]);
 
   {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AlterColumn("primaryKeyRenamed")->RenameTo("pk");
     table_alterer->AlterColumn("secondColumn")->RenameTo("sc");
     ASSERT_OK(table_alterer->Alter());
@@ -622,7 +621,7 @@ void AlterTableTest::InsertRows(int start_row, int num_rows) {
 
   // Insert a bunch of rows with the current schema
   for (int i = start_row; i < start_row + num_rows; i++) {
-    gscoped_ptr<KuduInsert> insert(table->NewInsert());
+    unique_ptr<KuduInsert> insert(table->NewInsert());
     // Endian-swap the key so that we spew inserts randomly
     // instead of just a sequential write pattern. This way
     // compactions may actually be triggered.
@@ -1194,20 +1193,18 @@ TEST_F(AlterTableTest, TestAlterUnderWriteLoad) {
   // Increase chances of a race between flush and alter.
   FLAGS_flush_threshold_mb = 3;
 
-  scoped_refptr<Thread> writer;
-  CHECK_OK(Thread::Create("test", "inserter",
-                          boost::bind(&AlterTableTest::InserterThread, this),
-                          &writer));
+  vector<thread> threads;
+  threads.reserve(3);
+  threads.emplace_back([this]() { this->InserterThread(); });
+  threads.emplace_back([this]() { this->UpdaterThread(); });
+  threads.emplace_back([this]() { this->ScannerThread(); });
 
-  scoped_refptr<Thread> updater;
-  CHECK_OK(Thread::Create("test", "updater",
-                          boost::bind(&AlterTableTest::UpdaterThread, this),
-                          &updater));
-
-  scoped_refptr<Thread> scanner;
-  CHECK_OK(Thread::Create("test", "scanner",
-                          boost::bind(&AlterTableTest::ScannerThread, this),
-                          &scanner));
+  SCOPED_CLEANUP({
+    stop_threads_ = true;
+    for (auto& t : threads) {
+      t.join();
+    }
+  });
 
   // Add columns until we reach 10.
   for (int i = 2; i < 10; i++) {
@@ -1223,10 +1220,6 @@ TEST_F(AlterTableTest, TestAlterUnderWriteLoad) {
                                      i));
   }
 
-  stop_threads_ = true;
-  writer->Join();
-  updater->Join();
-  scanner->Join();
   // A sanity check: the updater should have generate at least one update
   // given the parameters the test is running with.
   CHECK_GE(update_ops_cnt_, 0U);
@@ -1783,7 +1776,7 @@ TEST_F(AlterTableTest, TestAddRangePartitionConflictExhaustive) {
                          ->wait(true)->Alter());
 
   // Turns an optional value into a row for the table.
-  auto fill_row = [&] (boost::optional<int32_t> value) -> unique_ptr<KuduPartialRow> {
+  auto fill_row = [&] (boost::optional<int32_t> value) {
     unique_ptr<KuduPartialRow> row(schema_.NewRow());
     if (value) {
       CHECK_OK(row->SetInt32("c0", *value));
@@ -1793,7 +1786,7 @@ TEST_F(AlterTableTest, TestAddRangePartitionConflictExhaustive) {
 
   // Attempts to add a range partition to the table with the specified bounds.
   auto add_range_partition = [&] (boost::optional<int32_t> lower_bound,
-                                  boost::optional<int32_t> upper_bound) -> Status {
+                                  boost::optional<int32_t> upper_bound) {
     table_alterer.reset(client_->NewTableAlterer(table_name));
     return table_alterer->AddRangePartition(fill_row(lower_bound).release(),
                                             fill_row(upper_bound).release())
@@ -1803,7 +1796,7 @@ TEST_F(AlterTableTest, TestAddRangePartitionConflictExhaustive) {
 
   // Attempts to drop a range partition to the table with the specified bounds.
   auto drop_range_partition = [&] (boost::optional<int32_t> lower_bound,
-                                   boost::optional<int32_t> upper_bound) -> Status {
+                                   boost::optional<int32_t> upper_bound) {
     table_alterer.reset(client_->NewTableAlterer(table_name));
     return table_alterer->DropRangePartition(fill_row(lower_bound).release(),
                                              fill_row(upper_bound).release())
@@ -1815,7 +1808,7 @@ TEST_F(AlterTableTest, TestAddRangePartitionConflictExhaustive) {
   auto add_range_partitions = [&] (boost::optional<int32_t> a_lower_bound,
                                    boost::optional<int32_t> a_upper_bound,
                                    boost::optional<int32_t> b_lower_bound,
-                                   boost::optional<int32_t> b_upper_bound) -> Status {
+                                   boost::optional<int32_t> b_upper_bound) {
     table_alterer.reset(client_->NewTableAlterer(table_name));
     return table_alterer->AddRangePartition(fill_row(a_lower_bound).release(),
                                             fill_row(a_upper_bound).release())
@@ -1829,7 +1822,7 @@ TEST_F(AlterTableTest, TestAddRangePartitionConflictExhaustive) {
   auto add_drop_range_partitions = [&] (boost::optional<int32_t> a_lower_bound,
                                         boost::optional<int32_t> a_upper_bound,
                                         boost::optional<int32_t> b_lower_bound,
-                                        boost::optional<int32_t> b_upper_bound) -> Status {
+                                        boost::optional<int32_t> b_upper_bound) {
     table_alterer.reset(client_->NewTableAlterer(table_name));
     return table_alterer->AddRangePartition(fill_row(a_lower_bound).release(),
                                             fill_row(a_upper_bound).release())

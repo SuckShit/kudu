@@ -39,9 +39,7 @@
 // NOTE: this code disables TSAN for the most part. This is because it uses
 // some "clever" concurrency mechanisms which are difficult to model in TSAN.
 // We instead ensure correctness by heavy stress-testing.
-
-#ifndef KUDU_TABLET_CONCURRENT_BTREE_H
-#define KUDU_TABLET_CONCURRENT_BTREE_H
+#pragma once
 
 #include <algorithm>
 #include <boost/smart_ptr/detail/yield_k.hpp>
@@ -298,6 +296,10 @@ class ValueSlice {
     memcpy(in_arena, &size, sizeof(size));
     memcpy(in_arena + sizeof(size), src.data(), src.size());
     ptr_ = const_cast<const uint8_t*>(in_arena);
+  }
+
+  void prefetch() {
+    ::prefetch(reinterpret_cast<const char*>(ptr_), PREFETCH_HINT_T0);
   }
 
  private:
@@ -751,6 +753,10 @@ class LeafNode : public NodeBase<Traits> {
     return keys_[idx].as_slice();
   }
 
+  ValueSlice GetValue(size_t idx) const {
+    return vals_[idx];
+  }
+
   // Get the slice corresponding to the nth key and value.
   //
   // If the caller does not hold the lock, then this Slice
@@ -763,8 +769,8 @@ class LeafNode : public NodeBase<Traits> {
   // The key, on the other hand, will always be a valid pointer, but
   // may be invalid data.
   void Get(size_t idx, Slice *k, ValueSlice *v) const {
-    *k = keys_[idx].as_slice();
-    *v = vals_[idx];
+    *k = GetKey(idx);
+    *v = GetValue(idx);
   }
 
   // Truncates the node, removing entries from the right to reduce
@@ -1092,7 +1098,7 @@ class CBTree {
   // Note that this requires iterating through the entire tree,
   // so it is not very efficient.
   size_t count() const {
-    gscoped_ptr<CBTreeIterator<Traits> > iter(NewIterator());
+    std::unique_ptr<CBTreeIterator<Traits>> iter(NewIterator());
     bool exact;
     iter->SeekAtOrAfter(Slice(""), &exact);
     size_t count = 0;
@@ -1652,6 +1658,14 @@ class CBTreeIterator {
     return leaf_to_scan_->GetKey(idx_in_leaf_);
   }
 
+
+  Slice GetCurrentValue() const {
+    DCHECK(seeked_);
+    ValueSlice val_slice = leaf_to_scan_->GetValue(idx_in_leaf_);
+    return val_slice.as_slice();
+  }
+
+
   ////////////////////////////////////////////////////////////
   // Advanced functions which expose some of the internal state
   // of the iterator, allowing for limited "rewind" capability
@@ -1775,7 +1789,7 @@ class CBTreeIterator {
 
       retry_in_leaf:
       {
-        memcpy(&leaf_copy_, leaf, sizeof(leaf_copy_));
+        memcpy(static_cast<void*>(&leaf_copy_), leaf, sizeof(leaf_copy_));
 
         AtomicVersion new_version = leaf->StableVersion();
         if (VersionField::HasSplit(version, new_version)) {
@@ -1802,6 +1816,9 @@ class CBTreeIterator {
     }
 #ifdef SCAN_PREFETCH
     PrefetchMemory(next->next_);
+    for (int i = 0; i < next->num_entries(); i++) {
+      next->vals_[i].prefetch();
+    }
 #endif
 
     // If the tree is frozen, we don't need to play optimistic concurrency
@@ -1814,7 +1831,7 @@ class CBTreeIterator {
 
     while (true) {
       AtomicVersion version = next->StableVersion();
-      memcpy(&leaf_copy_, next, sizeof(leaf_copy_));
+      memcpy(static_cast<void*>(&leaf_copy_), next, sizeof(leaf_copy_));
       AtomicVersion new_version = next->StableVersion();
       if (VersionField::IsDifferent(new_version, version)) {
         version = new_version;
@@ -1843,5 +1860,3 @@ class CBTreeIterator {
 } // namespace btree
 } // namespace tablet
 } // namespace kudu
-
-#endif

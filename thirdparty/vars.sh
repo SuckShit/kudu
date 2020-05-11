@@ -60,7 +60,7 @@ PROTOBUF_SOURCE=$TP_SOURCE_DIR/$PROTOBUF_NAME
 
 # Note: CMake gets patched on SLES12SP0. When changing the CMake version, please check if
 # cmake-issue-15873-dont-use-select.patch needs to be updated.
-CMAKE_VERSION=3.9.0
+CMAKE_VERSION=3.16.4
 CMAKE_NAME=cmake-$CMAKE_VERSION
 CMAKE_SOURCE=$TP_SOURCE_DIR/$CMAKE_NAME
 
@@ -97,7 +97,7 @@ RAPIDJSON_SOURCE=$TP_SOURCE_DIR/$RAPIDJSON_NAME
 #  export NAME=squeasel-$(git rev-parse HEAD)
 #  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
 #  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
-SQUEASEL_VERSION=36dc66b8723980feb32196a94b46734eb5eafbf9
+SQUEASEL_VERSION=030ccce87359d892e22fb368c5fc5b75d9a2a5f7
 SQUEASEL_NAME=squeasel-$SQUEASEL_VERSION
 SQUEASEL_SOURCE=$TP_SOURCE_DIR/$SQUEASEL_NAME
 
@@ -123,18 +123,18 @@ GCOVR_VERSION=3.0
 GCOVR_NAME=gcovr-$GCOVR_VERSION
 GCOVR_SOURCE=$TP_SOURCE_DIR/$GCOVR_NAME
 
-CURL_VERSION=7.59.0
+CURL_VERSION=7.68.0
 CURL_NAME=curl-$CURL_VERSION
 CURL_SOURCE=$TP_SOURCE_DIR/$CURL_NAME
 
 # Hash of the crcutil git revision to use.
-# (from http://github.com/adembo/crcutil)
+# (from http://github.com/cloudera/crcutil)
 #
 # To re-build this tarball use the following in the crcutil repo:
 #  export NAME=crcutil-$(git rev-parse HEAD)
 #  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
 #  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
-CRCUTIL_VERSION=42148a6df6986a257ab21c80f8eca2e54544ac4d
+CRCUTIL_VERSION=81f8a60f67190ff1e0c9f2f6e5a07f650671a646
 CRCUTIL_NAME=crcutil-$CRCUTIL_VERSION
 CRCUTIL_SOURCE=$TP_SOURCE_DIR/$CRCUTIL_NAME
 
@@ -150,8 +150,9 @@ LLVM_SOURCE=$TP_SOURCE_DIR/$LLVM_NAME
 # The include-what-you-use is built along with LLVM in its source tree.
 IWYU_VERSION=0.13
 
-# Python 2.7 is required to build LLVM 3.6+. It is only built and installed if
-# the system Python version is not 2.7.
+# Python is required to build LLVM 3.6+ because it uses
+# llvm/utils/llvm-build/llvmbuild script. It is only built and installed if
+# the system Python version is less than 2.7.
 PYTHON_VERSION=2.7.13
 PYTHON_NAME=python-$PYTHON_VERSION
 PYTHON_SOURCE=$TP_SOURCE_DIR/$PYTHON_NAME
@@ -201,28 +202,17 @@ BISON_VERSION=3.0.5
 BISON_NAME=bison-$BISON_VERSION
 BISON_SOURCE=$TP_SOURCE_DIR/$BISON_NAME
 
-# TODO(dan): bump to a release version once HIVE-17747 and HIVE-16886/HIVE-18526
-# are published. The SHA below is the current head of branch-2.
 # Note: The Hive release binary tarball is stripped of unnecessary jars before
 # being uploaded. See thirdparty/package-hive.sh for details.
-HIVE_VERSION=498021fa15186aee8b282d3c032fbd2cede6bec4
+HIVE_VERSION=3.1.1
 HIVE_NAME=hive-$HIVE_VERSION
 HIVE_SOURCE=$TP_SOURCE_DIR/$HIVE_NAME
 
 # Note: The Hadoop release tarball is stripped of unnecessary jars before being
 # uploaded. See thirdparty/package-hadoop.sh for details.
-HADOOP_VERSION=2.8.5
+HADOOP_VERSION=3.2.0
 HADOOP_NAME=hadoop-$HADOOP_VERSION
 HADOOP_SOURCE=$TP_SOURCE_DIR/$HADOOP_NAME
-
-# TODO(dan): bump to a release version once SENTRY-2371, SENTRY-2440, SENTRY-2471
-# and SENTRY-2522 are published. The SHA below is the current head of the master branch.
-# Note: Sentry releases source code only. To build the binary tarball, use `dist`
-# maven profile. For example, `mvn clean install -Pdist`. After a successful build,
-# the tarball will be available under sentry-dist/target.
-SENTRY_VERSION=b71a78ed960702536b35e1f048dc40dfc79992d4
-SENTRY_NAME=sentry-$SENTRY_VERSION
-SENTRY_SOURCE=$TP_SOURCE_DIR/$SENTRY_NAME
 
 YAML_VERSION=0.6.2
 YAML_NAME=yaml-cpp-yaml-cpp-$YAML_VERSION
@@ -253,3 +243,20 @@ GUMBO_PARSER_SOURCE=$TP_SOURCE_DIR/$GUMBO_PARSER_NAME
 GUMBO_QUERY_VERSION=c9f10880b645afccf4fbcd11d2f62a7c01222d2e
 GUMBO_QUERY_NAME=gumbo-query-$GUMBO_QUERY_VERSION
 GUMBO_QUERY_SOURCE=$TP_SOURCE_DIR/$GUMBO_QUERY_NAME
+
+POSTGRES_VERSION=12.2
+POSTGRES_NAME=postgresql-$POSTGRES_VERSION
+POSTGRES_SOURCE=$TP_SOURCE_DIR/$POSTGRES_NAME
+
+POSTGRES_JDBC_VERSION=42.2.10
+POSTGRES_JDBC_NAME=postgresql-$POSTGRES_JDBC_VERSION
+POSTGRES_JDBC_SOURCE=$TP_SOURCE_DIR/$POSTGRES_JDBC_NAME
+
+# If you need to rebuild the tarball for a specific hash instead of a release,
+# run the following commands:
+# mvn versions:set -DnewVersion=$(git rev-parse HEAD)
+# mvn versions:update-child-modules
+# mvn package
+RANGER_VERSION=f37f5407eee8d2627a4306a25938b151f8e2ba31
+RANGER_NAME=ranger-$RANGER_VERSION-admin
+RANGER_SOURCE=$TP_SOURCE_DIR/$RANGER_NAME

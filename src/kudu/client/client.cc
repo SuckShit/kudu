@@ -17,25 +17,26 @@
 
 #include "kudu/client/client.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <ostream>
 #include <set>
 #include <string>
-#include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
+#include <google/protobuf/stubs/common.h>
 
 #include "kudu/client/callbacks.h"
 #include "kudu/client/client-internal.h"
 #include "kudu/client/client.pb.h"
 #include "kudu/client/client_builder-internal.h"
+#include "kudu/client/columnar_scan_batch.h"
 #include "kudu/client/error-internal.h"
 #include "kudu/client/error_collector.h"
 #include "kudu/client/master_proxy_rpc.h"
@@ -67,11 +68,7 @@
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/numbers.h"
@@ -92,6 +89,7 @@
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/async_util.h"
+#include "kudu/util/block_bloom_filter.h"
 #include "kudu/util/debug-util.h"
 #include "kudu/util/init.h"
 #include "kudu/util/logging.h"
@@ -156,6 +154,7 @@ MAKE_ENUM_LIMITS(kudu::client::KuduScanner::OrderMode,
 struct tm;
 
 namespace kudu {
+
 class simple_spinlock;
 
 namespace client {
@@ -231,7 +230,11 @@ static void LoggingAdapterCB(KuduLoggingCallback* user_cb,
 }
 
 void InstallLoggingCallback(KuduLoggingCallback* cb) {
-  RegisterLoggingCallback(Bind(&LoggingAdapterCB, Unretained(cb)));
+  RegisterLoggingCallback(
+      [=](LogSeverity severity, const char* filename, int line_number,
+          const struct ::tm* time, const char* message, size_t message_len) {
+        LoggingAdapterCB(cb, severity, filename, line_number, time, message, message_len);
+      });
 }
 
 void UninstallLoggingCallback() {
@@ -454,8 +457,7 @@ Status KuduClient::ListTabletServers(vector<KuduTabletServer*>* tablet_servers) 
   RETURN_NOT_OK(data_->ListTabletServers(this, deadline, req, &resp));
   for (int i = 0; i < resp.servers_size(); i++) {
     const ListTabletServersResponsePB_Entry& e = resp.servers(i);
-    HostPort hp;
-    RETURN_NOT_OK(HostPortFromPB(e.registration().rpc_addresses(0), &hp));
+    HostPort hp = HostPortFromPB(e.registration().rpc_addresses(0));
     unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
     ts->data_ = new KuduTabletServer::Data(e.instance_id().permanent_uuid(), hp, e.location());
     tablet_servers->push_back(ts.release());
@@ -546,14 +548,13 @@ Status KuduClient::GetTablet(const string& tablet_id, KuduTablet** tablet) {
 
   auto add_replica_func = [](const TSInfoPB& ts_info,
                              const RaftPeerPB::Role role,
-                             vector<const KuduReplica*>* replicas) -> Status {
+                             vector<const KuduReplica*>* replicas) {
     if (ts_info.rpc_addresses_size() == 0) {
       return Status::IllegalState(Substitute(
           "No RPC addresses found for tserver $0",
           ts_info.permanent_uuid()));
     }
-    HostPort hp;
-    RETURN_NOT_OK(HostPortFromPB(ts_info.rpc_addresses(0), &hp));
+    HostPort hp = HostPortFromPB(ts_info.rpc_addresses(0));
     unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
     ts->data_ = new KuduTabletServer::Data(ts_info.permanent_uuid(), hp, ts_info.location());
 
@@ -602,7 +603,8 @@ Status KuduClient::GetTableStatistics(const string& table_name,
     return StatusFromPB(resp.error().status());
   }
   unique_ptr<KuduTableStatistics> table_statistics(new KuduTableStatistics);
-  table_statistics->data_ = new KuduTableStatistics::Data(resp.on_disk_size(),
+  table_statistics->data_ = new KuduTableStatistics::Data(
+      resp.has_on_disk_size() ? boost::optional<int64_t>(resp.on_disk_size()) : boost::none,
       resp.has_live_row_count() ? boost::optional<int64_t>(resp.live_row_count()) : boost::none);
 
   *statistics = table_statistics.release();
@@ -877,7 +879,7 @@ KuduTableStatistics::~KuduTableStatistics() {
 }
 
 int64_t KuduTableStatistics::on_disk_size() const {
-  return data_->on_disk_size_;
+  return data_->on_disk_size_ ? *data_->on_disk_size_ : -1;
 }
 
 int64_t KuduTableStatistics::live_row_count() const {
@@ -927,6 +929,10 @@ KuduInsert* KuduTable::NewInsert() {
   return new KuduInsert(shared_from_this());
 }
 
+KuduInsertIgnore* KuduTable::NewInsertIgnore() {
+  return new KuduInsertIgnore(shared_from_this());
+}
+
 KuduUpsert* KuduTable::NewUpsert() {
   return new KuduUpsert(shared_from_this());
 }
@@ -962,6 +968,81 @@ KuduPredicate* KuduTable::NewComparisonPredicate(const Slice& col_name,
     // Ownership of value is passed to the valid returned predicate.
     cleanup.cancel();
     return new KuduPredicate(new ComparisonPredicateData(col_schema, op, value));
+  });
+}
+
+KuduPredicate* KuduTable::NewInBloomFilterPredicate(const Slice& col_name,
+                                                    vector<KuduBloomFilter*>* bloom_filters) {
+  // We always take ownership of values; this ensures cleanup if the predicate is invalid.
+  auto cleanup = MakeScopedCleanup([&]() {
+    STLDeleteElements(bloom_filters);
+  });
+
+  // Empty vector of bloom filters will select all rows. Hence disallowed.
+  if (bloom_filters->empty()) {
+    return new KuduPredicate(
+        new ErrorPredicateData(Status::InvalidArgument("No Bloom filters supplied")));
+  }
+
+  // Transfer the Bloom filter raw ptrs over to vector of unique ptrs.
+  // There is a possibility of emplace_back() throwing exception, so in such a case the
+  // transferred Bloom filters in unique_ptrs will be cleaned-up on exiting scope
+  // automatically and the non-nullptr Bloom filters in input "bloom_filters" vector
+  // will be cleaned up by the explicit scoped "cleanup".
+  vector<unique_ptr<KuduBloomFilter>> bloom_filters_owned;
+  bloom_filters_owned.reserve(bloom_filters->size());
+  for (auto& bf : *bloom_filters) {
+    bloom_filters_owned.emplace_back(bf);
+    bf = nullptr;
+  }
+
+  return data_->MakePredicate(col_name, [&](const ColumnSchema& col_schema) {
+    // At this point we could cancel the scoped "cleanup". But the scoped cleanup
+    // not only deletes pointers contained in the vector but also clears the vector
+    // and we want the vector be cleared as expected by the caller.
+    return new KuduPredicate(
+        new InBloomFilterPredicateData(col_schema, std::move(bloom_filters_owned)));
+  });
+}
+
+KuduPredicate* KuduTable::NewInBloomFilterPredicate(const Slice& col_name,
+                                                    const Slice& allocator,
+                                                    const vector<Slice>& bloom_filters) {
+  // Empty vector of bloom filters will select all rows. Hence disallowed.
+  if (bloom_filters.empty()) {
+    return new KuduPredicate(
+        new ErrorPredicateData(Status::InvalidArgument("No Bloom filters supplied")));
+  }
+
+  // In this case, the Block Bloom filters and allocator are supplied as opaque pointers
+  // and the predicate will convert them to well-defined pointer types
+  // but will NOT take ownership of those pointers. Hence a custom deleter,
+  // DirectBloomFilterDataDeleter, is used that gives control over ownership.
+
+  // Extract the allocator.
+  auto* bbf_allocator =
+      // const_cast<> can be avoided with mutable_data() on a Slice. However mutable_data() is a
+      // non-const function which can't be used with the const allocator Slice.
+      // Same for BlockBloomFilter below.
+      reinterpret_cast<BlockBloomFilterBufferAllocatorIf*>(const_cast<uint8_t*>(allocator.data()));
+  std::shared_ptr<BlockBloomFilterBufferAllocatorIf> bbf_allocator_shared(
+      bbf_allocator,
+      DirectBloomFilterDataDeleter<BlockBloomFilterBufferAllocatorIf>(false /*owned*/));
+
+  // Extract the Block Bloom filters.
+  vector<DirectBlockBloomFilterUniqPtr> bbf_vec;
+  for (const auto& bf_slice : bloom_filters) {
+    auto* bbf =
+        reinterpret_cast<BlockBloomFilter*>(const_cast<uint8_t*>(bf_slice.data()));
+    DirectBlockBloomFilterUniqPtr bf_uniq_ptr(
+        bbf, DirectBloomFilterDataDeleter<BlockBloomFilter>(false /*owned*/));
+    bbf_vec.emplace_back(std::move(bf_uniq_ptr));
+  }
+
+  return data_->MakePredicate(col_name, [&](const ColumnSchema& col_schema) {
+    return new KuduPredicate(
+        new InDirectBloomFilterPredicateData(col_schema, std::move(bbf_allocator_shared),
+                                             std::move(bbf_vec)));
   });
 }
 
@@ -1484,6 +1565,7 @@ Status KuduScanner::SetRowFormatFlags(uint64_t flags) {
   switch (flags) {
     case NO_FLAGS:
     case PAD_UNIXTIME_MICROS_TO_16_BYTES:
+    case COLUMNAR_LAYOUT:
       break;
     default:
       return Status::InvalidArgument(Substitute("Invalid row format flags: $0", flags));
@@ -1592,14 +1674,15 @@ void KuduScanner::Close() {
   // to clean up.
   if (!data_->next_req_.scanner_id().empty()) {
     CHECK(data_->proxy_);
-    gscoped_ptr<CloseCallback> closer(new CloseCallback);
+    unique_ptr<CloseCallback> closer(new CloseCallback);
     closer->scanner_id = data_->next_req_.scanner_id();
     data_->PrepareRequest(KuduScanner::Data::CLOSE);
     data_->next_req_.set_close_scanner(true);
     closer->controller.set_timeout(data_->configuration().timeout());
-    data_->proxy_->ScanAsync(data_->next_req_, &closer->response, &closer->controller,
-                             boost::bind(&CloseCallback::Callback, closer.get()));
-    ignore_result(closer.release());
+    // CloseCallback::Callback() deletes the closer.
+    CloseCallback* closer_raw = closer.release();
+    data_->proxy_->ScanAsync(data_->next_req_, &closer_raw->response, &closer_raw->controller,
+                             [closer_raw]() { closer_raw->Callback(); });
   }
   data_->proxy_.reset();
   data_->open_ = false;
@@ -1626,6 +1709,15 @@ Status KuduScanner::NextBatch(vector<KuduRowResult>* rows) {
 }
 
 Status KuduScanner::NextBatch(KuduScanBatch* batch) {
+  return NextBatch(batch->data_);
+}
+
+Status KuduScanner::NextBatch(KuduColumnarScanBatch* batch) {
+  return NextBatch(batch->data_);
+}
+
+Status KuduScanner::NextBatch(internal::ScanBatchDataInterface* batch_data) {
+
   // TODO: do some double-buffering here -- when we return this batch
   // we should already have fired off the RPC for the next batch, but
   // need to do some swapping of the response objects around to avoid
@@ -1633,7 +1725,7 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
   CHECK(data_->open_);
   CHECK(data_->proxy_);
 
-  batch->data_->Clear();
+  batch_data->Clear();
 
   if (data_->short_circuit_) {
     return Status::OK();
@@ -1643,12 +1735,11 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
     // We have data from a previous scan.
     VLOG(2) << "Extracting data from " << data_->DebugString();
     data_->data_in_open_ = false;
-    return batch->data_->Reset(&data_->controller_,
-                               data_->configuration().projection(),
-                               data_->configuration().client_projection(),
-                               data_->configuration().row_format_flags(),
-                               unique_ptr<RowwiseRowBlockPB>(
-                                   data_->last_response_.release_data()));
+    return batch_data->Reset(&data_->controller_,
+                             data_->configuration().projection(),
+                             data_->configuration().client_projection(),
+                             data_->configuration().row_format_flags(),
+                             &data_->last_response_);
   }
 
   if (data_->last_response_.has_more_results()) {
@@ -1668,12 +1759,11 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
           data_->last_primary_key_ = data_->last_response_.last_primary_key();
         }
         data_->scan_attempts_ = 0;
-        return batch->data_->Reset(&data_->controller_,
-                                   data_->configuration().projection(),
-                                   data_->configuration().client_projection(),
-                                   data_->configuration().row_format_flags(),
-                                   unique_ptr<RowwiseRowBlockPB>(
-                                       data_->last_response_.release_data()));
+        return batch_data->Reset(&data_->controller_,
+                                 data_->configuration().projection(),
+                                 data_->configuration().client_projection(),
+                                 data_->configuration().row_format_flags(),
+                                 &data_->last_response_);
       }
 
       data_->scan_attempts_++;
@@ -1712,7 +1802,11 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
     set<string> blacklist;
 
     RETURN_NOT_OK(data_->OpenNextTablet(deadline, &blacklist));
-    // No rows written, the next invocation will pick them up.
+    if (data_->data_in_open_) {
+      // Avoid returning an empty batch in between tablets if we have data
+      // we can return from this call.
+      return NextBatch(batch_data);
+    }
     return Status::OK();
   } else {
     // No more data anywhere.

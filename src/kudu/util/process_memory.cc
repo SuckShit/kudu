@@ -16,8 +16,8 @@
 // under the License.
 
 #include <cstddef>
+#include <memory>
 #include <ostream>
-#include <string>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -25,11 +25,12 @@
 #include <gperftools/malloc_extension.h>  // IWYU pragma: keep
 #endif
 
+#include "kudu/util/process_memory.h"
+
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/once.h"
 #include "kudu/gutil/port.h"
-#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"          // IWYU pragma: keep
 #include "kudu/util/debug/trace_event.h"  // IWYU pragma: keep
@@ -37,7 +38,6 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/mem_tracker.h"        // IWYU pragma: keep
-#include "kudu/util/process_memory.h"
 #include "kudu/util/random.h"
 #include "kudu/util/status.h"
 
@@ -117,14 +117,11 @@ static bool ValidatePercentage(const char* flagname, int value) {
   return false;
 }
 
-static bool dummy[] = {
-  google::RegisterFlagValidator(&FLAGS_memory_limit_soft_percentage, &ValidatePercentage),
-  google::RegisterFlagValidator(&FLAGS_memory_limit_warn_threshold_percentage, &ValidatePercentage)
+DEFINE_validator(memory_limit_soft_percentage, &ValidatePercentage);
+DEFINE_validator(memory_limit_warn_threshold_percentage, &ValidatePercentage);
 #ifdef TCMALLOC_ENABLED
-  ,google::RegisterFlagValidator(&FLAGS_tcmalloc_max_free_bytes_percentage, &ValidatePercentage)
+DEFINE_validator(tcmalloc_max_free_bytes_percentage, &ValidatePercentage);
 #endif
-};
-
 
 // Wrappers around tcmalloc functionality
 // ------------------------------------------------------------

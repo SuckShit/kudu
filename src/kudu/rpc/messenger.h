@@ -17,17 +17,16 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
 #include <gtest/gtest_prod.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/connection.h"
@@ -39,11 +38,6 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
-
-namespace boost {
-template <typename Signature>
-class function;
-}
 
 namespace kudu {
 
@@ -257,7 +251,7 @@ class Messenger {
   void QueueOutboundCall(const std::shared_ptr<OutboundCall> &call);
 
   // Enqueue a call for processing on the server.
-  void QueueInboundCall(gscoped_ptr<InboundCall> call);
+  void QueueInboundCall(std::unique_ptr<InboundCall> call);
 
   // Queue a cancellation for the given outbound call.
   void QueueCancellation(const std::shared_ptr<OutboundCall> &call);
@@ -273,7 +267,7 @@ class Messenger {
   //
   // The status argument conveys whether 'func' was run correctly (i.e.
   // after the elapsed time) or not.
-  void ScheduleOnReactor(const boost::function<void(const Status&)>& func,
+  void ScheduleOnReactor(std::function<void(const Status&)> func,
                          MonoDelta when);
 
   const security::TlsContext& tls_context() const { return *tls_context_; }

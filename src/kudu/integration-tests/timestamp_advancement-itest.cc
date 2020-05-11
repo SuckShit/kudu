@@ -16,6 +16,7 @@
 // under the License.
 
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <ostream>
@@ -182,8 +183,11 @@ class TimestampAdvancementITest : public MiniClusterITestBase {
     shared_ptr<LogReader> reader;
     RETURN_NOT_OK(LogReader::Open(
        ts->server()->fs_manager(),
-       scoped_refptr<log::LogIndex>(), tablet_id,
-       scoped_refptr<MetricEntity>(), &reader));
+       /*index*/nullptr,
+       tablet_id,
+       /*metric_entity*/nullptr,
+       ts->server()->file_cache(),
+       &reader));
     log::SegmentSequence segs;
     reader->GetSegmentsSnapshot(&segs);
     unique_ptr<log::LogEntryPB> entry;
@@ -243,7 +247,7 @@ class TimestampAdvancementITest : public MiniClusterITestBase {
 };
 
 // Test that bootstrapping a Raft no-op from the WAL will advance the replica's
-// MVCC safe time timestamps.
+// MVCC clean time timestamps.
 TEST_F(TimestampAdvancementITest, TestNoOpAdvancesMvccSafeTimeOnBootstrap) {
   // Set a low Raft heartbeat interval so we can inject churn elections.
   FLAGS_raft_heartbeat_interval_ms = 100;
@@ -325,7 +329,7 @@ TEST_F(TimestampAdvancementITest, Kudu2463Test) {
   ASSERT_TRUE(resp.has_error());
   const TabletServerErrorPB& error = resp.error();
   ASSERT_EQ(error.code(), TabletServerErrorPB::TABLET_NOT_RUNNING);
-  ASSERT_STR_CONTAINS(resp.error().status().message(), "safe time has not yet been initialized");
+  ASSERT_STR_CONTAINS(resp.error().status().message(), "clean time has not yet been initialized");
   ASSERT_EQ(error.status().code(), AppStatusPB::UNINITIALIZED);
 }
 

@@ -14,17 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_CLIENT_BATCHER_H
-#define KUDU_CLIENT_BATCHER_H
+#pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
+#include <sparsehash/dense_hash_set>
+
 #include "kudu/client/client.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/macros.h"
@@ -42,11 +43,10 @@ class KuduStatusCallback;
 
 namespace internal {
 
-struct InFlightOp;
-
 class ErrorCollector;
 class RemoteTablet;
 class WriteRpc;
+struct InFlightOp;
 
 // A Batcher is the class responsible for collecting row operations, routing them to the
 // correct tablet server, and possibly batching them together for better efficiency.
@@ -202,7 +202,7 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
   KuduStatusCallback* flush_callback_;
 
   // All buffered or in-flight ops.
-  std::unordered_set<InFlightOp*> ops_;
+  google::dense_hash_set<InFlightOp*> ops_;
   // Each tablet's buffered ops.
   typedef std::unordered_map<RemoteTablet*, std::vector<InFlightOp*> > OpsMap;
   OpsMap per_tablet_ops_;
@@ -236,4 +236,3 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 } // namespace internal
 } // namespace client
 } // namespace kudu
-#endif /* KUDU_CLIENT_BATCHER_H */

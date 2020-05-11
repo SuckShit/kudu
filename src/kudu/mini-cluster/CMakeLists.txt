@@ -19,6 +19,7 @@ set(MINI_CLUSTER_SRCS
   external_mini_cluster.cc
   internal_mini_cluster.cc
   mini_cluster.cc
+  webui_checker.cc
 )
 
 set(MINI_CLUSTER_LIBS
@@ -35,7 +36,7 @@ set(MINI_CLUSTER_LIBS
   master_proto
   mini_hms
   mini_kdc
-  mini_sentry
+  mini_ranger
   server_base_proto
   tablet_proto
   tserver
@@ -54,5 +55,5 @@ add_dependencies(mini_cluster
   kudu-master)
 
 # Tests
-SET_KUDU_TEST_LINK_LIBS(mini_cluster kudu_hms kudu_sentry)
+SET_KUDU_TEST_LINK_LIBS(mini_cluster kudu_hms)
 ADD_KUDU_TEST(external_mini_cluster-test PROCESSORS 3)

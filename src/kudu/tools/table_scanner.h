@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <iosfwd>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,7 +29,7 @@
 
 #include "kudu/client/client.h"
 #include "kudu/client/scan_batch.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/util/atomic.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/status.h"
@@ -83,7 +84,6 @@ class TableScanner {
                   const std::function<void(const kudu::client::KuduScanBatch& batch)>& cb);
   void ScanTask(const std::vector<kudu::client::KuduScanToken*>& tokens, Status* thread_status);
   void CopyTask(const std::vector<kudu::client::KuduScanToken*>& tokens, Status* thread_status);
-  void MonitorTask();
 
   Status AddRow(const client::sp::shared_ptr<kudu::client::KuduTable>& table,
                 const kudu::client::KuduSchema& table_schema,

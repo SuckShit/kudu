@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_TABLET_REPLICA_HARNESS_H
-#define KUDU_TABLET_TABLET_REPLICA_HARNESS_H
+#pragma once
 
 #include <memory>
 #include <string>
@@ -34,6 +33,8 @@
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/status.h"
+
+METRIC_DECLARE_entity(server);
 
 namespace kudu {
 namespace tablet {
@@ -68,13 +69,11 @@ class TabletHarness {
         : env(Env::Default()),
           tablet_id("test_tablet_id"),
           root_dir(std::move(root_dir)),
-          enable_metrics(true),
           clock_type(LOGICAL_CLOCK) {}
 
     Env* env;
     std::string tablet_id;
     std::string root_dir;
-    bool enable_metrics;
     ClockType clock_type;
   };
 
@@ -85,7 +84,7 @@ class TabletHarness {
     std::pair<PartitionSchema, Partition> partition(CreateDefaultPartition(schema_));
 
     // Build the Tablet
-    fs_manager_.reset(new FsManager(options_.env, options_.root_dir));
+    fs_manager_.reset(new FsManager(options_.env, FsManagerOpts(options_.root_dir)));
     if (first_time) {
       RETURN_NOT_OK(fs_manager_->CreateInitialFileSystemLayout());
     }
@@ -104,21 +103,25 @@ class TabletHarness {
                                                /*extra_config=*/ boost::none,
                                                /*dimension_label=*/ boost::none,
                                                &metadata));
-    if (options_.enable_metrics) {
-      metrics_registry_.reset(new MetricRegistry());
-    }
+    metrics_registry_.reset(new MetricRegistry);
+    metric_entity_ = METRIC_ENTITY_server.Instantiate(metrics_registry_.get(),
+                                                      "tablet-harness");
 
-    if (options_.clock_type == Options::LOGICAL_CLOCK) {
-      clock_.reset(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp));
-    } else {
-      clock_.reset(new clock::HybridClock());
-      RETURN_NOT_OK(clock_->Init());
+    switch (options_.clock_type) {
+      case Options::HYBRID_CLOCK:
+        clock_.reset(new clock::HybridClock(metric_entity_));
+        break;
+      case Options::LOGICAL_CLOCK:
+        clock_.reset(new clock::LogicalClock(Timestamp::kInitialTimestamp,
+                                             metric_entity_));
+        break;
     }
+    RETURN_NOT_OK(clock_->Init());
     tablet_.reset(new Tablet(metadata,
-                             clock_,
-                             std::shared_ptr<MemTracker>(),
+                             clock_.get(),
+                             {},
                              metrics_registry_.get(),
-                             make_scoped_refptr(new log::LogAnchorRegistry())));
+                             make_scoped_refptr(new log::LogAnchorRegistry)));
     return Status::OK();
   }
 
@@ -150,14 +153,14 @@ class TabletHarness {
  private:
   Options options_;
 
-  gscoped_ptr<MetricRegistry> metrics_registry_;
+  std::unique_ptr<MetricRegistry> metrics_registry_;
+  scoped_refptr<MetricEntity> metric_entity_;
 
-  scoped_refptr<clock::Clock> clock_;
+  std::unique_ptr<clock::Clock> clock_;
   Schema schema_;
-  gscoped_ptr<FsManager> fs_manager_;
+  std::unique_ptr<FsManager> fs_manager_;
   std::shared_ptr<Tablet> tablet_;
 };
 
 } // namespace tablet
 } // namespace kudu
-#endif /* KUDU_TABLET_TABLET_REPLICA_HARNESS_H */

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 #pragma once
 
 #include <limits.h>
@@ -53,7 +52,6 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/join.h"
@@ -112,7 +110,6 @@ class KuduTabletTest : public KuduTest {
   void CreateTestTablet(const std::string& root_dir = "") {
     std::string dir = root_dir.empty() ? GetTestPath("fs_root") : root_dir;
     TabletHarness::Options opts(dir);
-    opts.enable_metrics = true;
     opts.clock_type = clock_type_;
     bool first_time = harness_ == nullptr;
     harness_.reset(new TabletHarness(schema_, opts));
@@ -175,7 +172,7 @@ class KuduTabletTest : public KuduTest {
   const Schema client_schema_;
   const TabletHarness::Options::ClockType clock_type_;
 
-  gscoped_ptr<TabletHarness> harness_;
+  std::unique_ptr<TabletHarness> harness_;
 };
 
 class KuduRowSetTest : public KuduTabletTest {
@@ -333,7 +330,8 @@ static inline Status DumpTablet(const Tablet& tablet,
 template<class RowSetWriterClass>
 static Status WriteRow(const Slice &row_slice, RowSetWriterClass *writer) {
   const Schema &schema = writer->schema();
-  DCHECK_EQ(row_slice.size(), schema.byte_size() + ContiguousRowHelper::null_bitmap_size(schema));
+  DCHECK_EQ(row_slice.size(), schema.byte_size() +
+            ContiguousRowHelper::non_null_bitmap_size(schema));
 
   RowBlock block(&schema, 1, nullptr);
   ConstContiguousRow row(&schema, row_slice.data());
@@ -873,16 +871,16 @@ Status CreateRandomDeltaFile(const Schema& schema,
   BlockId block_id = wb->id();
   std::unique_ptr<DeltaFileWriter> writer(new DeltaFileWriter(std::move(wb)));
   RETURN_NOT_OK(writer->Start());
-  DeltaStats stats;
+  std::unique_ptr<DeltaStats> stats(new DeltaStats);
   for (const auto& e1 : mirror->all_deltas()) {
     for (const auto& e2 : e1.second) {
       DeltaKey k(e1.first, e2.first);
       RowChangeList changes(e2.second);
       RETURN_NOT_OK(writer->AppendDelta<T::kTag>(k, changes));
-      RETURN_NOT_OK(stats.UpdateStats(k.timestamp(), changes));
+      RETURN_NOT_OK(stats->UpdateStats(k.timestamp(), changes));
     }
   }
-  writer->WriteDeltaStats(stats);
+  writer->WriteDeltaStats(std::move(stats));
   RETURN_NOT_OK(writer->Finish());
 
   // Open a reader for this newly written delta file.

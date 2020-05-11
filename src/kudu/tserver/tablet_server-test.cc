@@ -21,7 +21,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -29,11 +31,11 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -63,9 +65,7 @@
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/callback.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
@@ -97,11 +97,13 @@
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/tserver/tserver_service.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/array_view.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/curl_util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/faststring.h"
+#include "kudu/util/hdr_histogram.h"
 #include "kudu/util/jsonwriter.h"
 #include "kudu/util/logging_test_util.h"
 #include "kudu/util/metrics.h"
@@ -115,7 +117,6 @@
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 #include "kudu/util/zlib.h"
 
 using google::protobuf::util::MessageDifferencer;
@@ -159,11 +160,13 @@ DEFINE_int32(delete_tablet_bench_num_flushes, 200,
              "Number of disk row sets to flush in the delete tablet benchmark");
 
 DECLARE_bool(crash_on_eio);
+DECLARE_bool(enable_flush_deltamemstores);
 DECLARE_bool(enable_flush_memrowset);
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_bool(enable_rowset_compaction);
 DECLARE_bool(fail_dns_resolution);
 DECLARE_bool(rowset_metadata_store_keys);
+DECLARE_bool(scanner_unregister_on_invalid_seq_id);
 DECLARE_double(cfile_inject_corruption);
 DECLARE_double(env_inject_eio);
 DECLARE_double(env_inject_full);
@@ -172,6 +175,7 @@ DECLARE_int32(flush_threshold_secs);
 DECLARE_int32(fs_data_dirs_available_space_cache_seconds);
 DECLARE_int32(fs_target_data_dirs_per_tablet);
 DECLARE_int32(maintenance_manager_num_threads);
+DECLARE_int32(maintenance_manager_polling_interval_ms);
 DECLARE_int32(memory_pressure_percentage);
 DECLARE_int32(metrics_retirement_age_ms);
 DECLARE_int32(scanner_batch_size_rows);
@@ -183,16 +187,17 @@ DECLARE_string(env_inject_full_globs);
 
 // Declare these metrics prototypes for simpler unit testing of their behavior.
 METRIC_DECLARE_counter(block_manager_total_bytes_read);
+METRIC_DECLARE_counter(log_block_manager_holes_punched);
 METRIC_DECLARE_counter(rows_inserted);
 METRIC_DECLARE_counter(rows_updated);
 METRIC_DECLARE_counter(rows_deleted);
 METRIC_DECLARE_counter(scanners_expired);
 METRIC_DECLARE_gauge_uint64(log_block_manager_blocks_under_management);
 METRIC_DECLARE_gauge_uint64(log_block_manager_containers);
-METRIC_DECLARE_counter(log_block_manager_holes_punched);
 METRIC_DECLARE_gauge_size(active_scanners);
 METRIC_DECLARE_gauge_size(tablet_active_scanners);
 METRIC_DECLARE_gauge_size(num_rowsets_on_disk);
+METRIC_DECLARE_histogram(flush_dms_duration);
 
 namespace kudu {
 
@@ -297,11 +302,11 @@ TEST_F(TabletServerTest, TestGetFlags) {
     ASSERT_OK(proxy.GetFlags(req, &resp, &controller));
     SCOPED_TRACE(SecureDebugString(resp));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-          [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+          [](const server::GetFlagsResponsePB::Flag& flag) {
             return flag.name() == "log_dir";
           }));
     EXPECT_TRUE(std::none_of(resp.flags().begin(), resp.flags().end(),
-          [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+          [](const server::GetFlagsResponsePB::Flag& flag) {
             return flag.name() == "help";
           }));
   }
@@ -313,15 +318,15 @@ TEST_F(TabletServerTest, TestGetFlags) {
     ASSERT_OK(proxy.GetFlags(req, &resp, &controller));
     SCOPED_TRACE(SecureDebugString(resp));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-          [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+          [](const server::GetFlagsResponsePB::Flag& flag) {
             return flag.name() == "log_dir";
           }));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-          [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+          [](const server::GetFlagsResponsePB::Flag& flag) {
             return flag.name() == "help";
           }));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-          [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+          [](const server::GetFlagsResponsePB::Flag& flag) {
             return flag.name() == "logemaillevel";
           }));
   }
@@ -333,15 +338,15 @@ TEST_F(TabletServerTest, TestGetFlags) {
     ASSERT_OK(proxy.GetFlags(req, &resp, &controller));
     SCOPED_TRACE(SecureDebugString(resp));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-          [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+          [](const server::GetFlagsResponsePB::Flag& flag) {
             return flag.name() == "log_dir";
           }));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-          [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+          [](const server::GetFlagsResponsePB::Flag& flag) {
             return flag.name() == "help";
           }));
     EXPECT_TRUE(std::none_of(resp.flags().begin(), resp.flags().end(),
-          [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+          [](const server::GetFlagsResponsePB::Flag& flag) {
             return flag.name() == "logemaillevel";
           }));
   }
@@ -355,15 +360,15 @@ TEST_F(TabletServerTest, TestGetFlags) {
     ASSERT_OK(proxy.GetFlags(req, &resp, &controller));
     SCOPED_TRACE(SecureDebugString(resp));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-                            [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                            [](const server::GetFlagsResponsePB::Flag& flag) {
                                 return flag.name() == "log_dir";
                             }));
     EXPECT_TRUE(std::none_of(resp.flags().begin(), resp.flags().end(),
-                             [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                             [](const server::GetFlagsResponsePB::Flag& flag) {
                                  return flag.name() == "help";
                              }));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-                            [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                            [](const server::GetFlagsResponsePB::Flag& flag) {
                                 return flag.name() == "logemaillevel";
                             }));
   }
@@ -377,15 +382,15 @@ TEST_F(TabletServerTest, TestGetFlags) {
     ASSERT_OK(proxy.GetFlags(req, &resp, &controller));
     SCOPED_TRACE(SecureDebugString(resp));
     EXPECT_TRUE(std::none_of(resp.flags().begin(), resp.flags().end(),
-                             [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                             [](const server::GetFlagsResponsePB::Flag& flag) {
                                  return flag.name() == "log_dir";
                              }));
     EXPECT_TRUE(std::none_of(resp.flags().begin(), resp.flags().end(),
-                             [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                             [](const server::GetFlagsResponsePB::Flag& flag) {
                                  return flag.name() == "help";
                              }));
     EXPECT_TRUE(std::any_of(resp.flags().begin(), resp.flags().end(),
-                            [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                            [](const server::GetFlagsResponsePB::Flag& flag) {
                                 return flag.name() == "logemaillevel";
                             }));
   }
@@ -399,15 +404,15 @@ TEST_F(TabletServerTest, TestGetFlags) {
     ASSERT_OK(proxy.GetFlags(req, &resp, &controller));
     SCOPED_TRACE(SecureDebugString(resp));
     EXPECT_TRUE(std::none_of(resp.flags().begin(), resp.flags().end(),
-                             [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                             [](const server::GetFlagsResponsePB::Flag& flag) {
                                  return flag.name() == "log_dir";
                              }));
     EXPECT_TRUE(std::none_of(resp.flags().begin(), resp.flags().end(),
-                             [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                             [](const server::GetFlagsResponsePB::Flag& flag) {
                                  return flag.name() == "help";
                              }));
     EXPECT_TRUE(std::none_of(resp.flags().begin(), resp.flags().end(),
-                             [](const server::GetFlagsResponsePB::Flag& flag) -> bool {
+                             [](const server::GetFlagsResponsePB::Flag& flag) {
                                  return flag.name() == "logemaillevel";
                              }));
   }
@@ -654,6 +659,19 @@ TEST_F(TabletServerTest, TestTombstonedTabletOnWebUI) {
   ASSERT_STR_NOT_CONTAINS(s, mini_server_->bound_rpc_addr().ToString());
 }
 
+// When tablet server merge metrics by the same attributes, the metric
+// 'merged_entities_count_of_tablet' should be visible
+TEST_F(TabletServerTest, TestMergedEntitiesCount) {
+  EasyCurl c;
+  faststring buf;
+  const string addr = mini_server_->bound_http_addr().ToString();
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics", addr), &buf));
+  ASSERT_STR_NOT_CONTAINS(buf.ToString(), "merged_entities_count_of_tablet");
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics?merge_rules=tablet|table|table_name", addr),
+                       &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), "merged_entities_count_of_tablet");
+}
+
 class TabletServerDiskSpaceTest : public TabletServerTestBase,
                                   public testing::WithParamInterface<string> {
  public:
@@ -698,7 +716,7 @@ TEST_P(TabletServerDiskSpaceTest, TestFullGroupAddsDir) {
   ASSERT_FALSE(new_dir.empty());
   string new_uuid;
   ASSERT_TRUE(dd_manager->FindUuidByRoot(DirName(new_dir), &new_uuid));
-  dd_manager->MarkDataDirFailedByUuid(new_uuid);
+  dd_manager->MarkDirFailedByUuid(new_uuid);
   ASSERT_TRUE(dd_manager->IsTabletInFailedDir(kTabletId));
 
   // The group should be the updated even after restarting the tablet server.
@@ -707,7 +725,7 @@ TEST_P(TabletServerDiskSpaceTest, TestFullGroupAddsDir) {
   ASSERT_OK(dd_manager->FindDataDirsByTabletId(kTabletId, &dir_group));
   ASSERT_EQ(kNumDirs, dir_group.size());
   ASSERT_TRUE(dd_manager->FindUuidByRoot(DirName(new_dir), &new_uuid));
-  dd_manager->MarkDataDirFailedByUuid(new_uuid);
+  dd_manager->MarkDirFailedByUuid(new_uuid);
   ASSERT_TRUE(dd_manager->IsTabletInFailedDir(kTabletId));
 }
 
@@ -903,18 +921,69 @@ class TabletServerMaintenanceMemoryPressureTest : public TabletServerTestBase {
     FLAGS_enable_maintenance_manager = true;
     FLAGS_flush_threshold_secs = 1;
     FLAGS_memory_pressure_percentage = 0;
+    // For the sake of easier setup, slow down our maintenance polling interval.
+    FLAGS_maintenance_manager_polling_interval_ms = 1000;
 
     // While setting up rowsets, disable compactions and flushing. Do this
     // before doing anything so we can have tighter control over the flushing
     // of our rowsets.
     FLAGS_enable_rowset_compaction = false;
+    FLAGS_enable_flush_deltamemstores = false;
     FLAGS_enable_flush_memrowset = false;
     NO_FATALS(StartTabletServer(/*num_data_dirs=*/1));
   }
 };
 
+// Regression test for KUDU-3002. Previously, when under memory pressure, we
+// might starve older (usually small) DMS flushes in favor of (usually larger)
+// MRS flushes.
+TEST_F(TabletServerMaintenanceMemoryPressureTest, TestDontStarveDMSWhileUnderMemoryPressure) {
+  // First, set up a rowset with a delta.
+  NO_FATALS(InsertTestRowsDirect(1, 1));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  NO_FATALS(UpdateTestRowRemote(1, 2));
+
+  // Roll onto a new log segment so our DMS anchors some WAL bytes.
+  ASSERT_OK(tablet_replica_->log()->WaitUntilAllFlushed());
+  ASSERT_OK(tablet_replica_->log()->AllocateSegmentAndRollOverForTests());
+
+  // Now start inserting to the tablet so every time we pick a maintenance op,
+  // we'll have a sizeable MRS.
+  std::atomic<bool> keep_inserting(true);
+  thread insert_thread([&] {
+    int cur_row = 2;
+    while (keep_inserting) {
+      NO_FATALS(InsertTestRowsDirect(cur_row++, 1));
+    }
+  });
+  SCOPED_CLEANUP({
+    keep_inserting = false;
+    insert_thread.join();
+  });
+
+  // Wait a bit for the MRS to build up and then enable flushing.
+  SleepFor(MonoDelta::FromSeconds(1));
+  FLAGS_enable_flush_memrowset = true;
+  FLAGS_enable_flush_deltamemstores = true;
+
+  // Despite always having a large MRS, we should eventually flush the DMS,
+  // since it anchors WALs.
+  scoped_refptr<Histogram> dms_flushes =
+      METRIC_flush_dms_duration.Instantiate(tablet_replica_->tablet()->GetMetricEntity());
+  // NOTE: we don't use ASSERT_EVENTUALLY because gtest may race with the
+  // NO_FATALS call in the inserter thread.
+  constexpr int kTimeoutSecs = 30;
+  const MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(kTimeoutSecs);
+  while (dms_flushes->histogram()->TotalCount() < 1) {
+    if (MonoTime::Now() > deadline) {
+      FAIL() << Substitute("Didn't flush DMS in $0 seconds", kTimeoutSecs);
+    }
+    SleepFor(MonoDelta::FromMilliseconds(100));
+  }
+}
+
 // Regression test for KUDU-2929. Previously, when under memory pressure, we
-// would never compact, even if there were nothing else to do. We'll simulate
+// would never compact, even if there were something else to do. We'll simulate
 // this by flushing some overlapping rowsets and then making sure we compact.
 TEST_F(TabletServerMaintenanceMemoryPressureTest, TestCompactWhileUnderMemoryPressure) {
   // Insert sets of overlapping rows.
@@ -1113,7 +1182,7 @@ TEST_F(TabletServerTest, TestExternalConsistencyModes_CommitWait) {
   // get current time, with and without error
   Timestamp now_before;
   uint64_t error_before;
-  hclock->NowWithError(&now_before, &error_before);
+  ASSERT_OK(hclock->NowWithError(&now_before, &error_before));
 
   uint64_t now_before_usec = HybridClock::GetPhysicalValueMicros(now_before);
   LOG(INFO) << "Submitting write with commit wait at: " << now_before_usec << " us +- "
@@ -1141,7 +1210,7 @@ TEST_F(TabletServerTest, TestExternalConsistencyModes_CommitWait) {
 
   Timestamp now_after;
   uint64_t error_after;
-  hclock->NowWithError(&now_after, &error_after);
+  ASSERT_OK(hclock->NowWithError(&now_after, &error_after));
 
   Timestamp write_timestamp(resp.timestamp());
 
@@ -1807,7 +1876,7 @@ TEST_F(TabletServerTest, TestReadLatest) {
   ASSERT_TRUE(mini_server_->server()->metric_entity());
   // We don't care what the function is, since the metric is already instantiated.
   auto active_scanners = METRIC_active_scanners.InstantiateFunctionGauge(
-      mini_server_->server()->metric_entity(), Callback<size_t(void)>());
+      mini_server_->server()->metric_entity(), []() {return 0; });
   scoped_refptr<TabletReplica> tablet;
   ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet));
   ASSERT_TRUE(tablet->tablet()->GetMetricEntity());
@@ -2449,6 +2518,75 @@ TEST_F(TabletServerTest, TestScanYourWrites_PropagatedTimestampInTheFuture) {
   ASSERT_EQ(R"((int32 key=0, int32 int_val=0, string string_val="original0"))", results[0]);
 }
 
+// Test that, if multiple RPCs arrive concurrently for a single scanner, no state is
+// corrupted, etc. We expected errors but no crashes or TSAN issues.
+TEST_F(TabletServerTest, TestConcurrentAccessToOneScanner) {
+  constexpr int kNumRows = 1000;
+  constexpr int kNumThreads = 8;
+  // Perform a write.
+  InsertTestRowsRemote(0, kNumRows, 1, nullptr, kTabletId);
+
+  FLAGS_scanner_batch_size_rows = 10;
+  FLAGS_scanner_unregister_on_invalid_seq_id = false;
+  ScanResponsePB open_resp;
+  NO_FATALS(OpenScannerWithAllColumns(&open_resp));
+
+  std::atomic<bool> done { false };
+  vector<thread> threads;
+  // Add a thread which concurrently lists scans. The ListScans() function accesses
+  // scanners to expose diagnostic info such as stats, etc, so calling it in a loop can
+  // help uncover potential races in this code path.
+  threads.emplace_back(
+      [&]() {
+        while (!done) {
+          mini_server_->server()->scanner_manager()->ListScans();
+        }
+      });
+  std::atomic<int> next_seq_id { 1 };
+  std::atomic<int> total_rows { 0 };
+  for (int i = 0; i < kNumThreads; i++) {
+    threads.emplace_back(
+        [&]() {
+          while (!done) {
+            RpcController rpc;
+            rpc.set_timeout(MonoDelta::FromSeconds(10));
+            ScanRequestPB req;
+            ScanResponsePB resp;
+            req.set_scanner_id(open_resp.scanner_id());
+            // Try either the expected next sequence ID or the following one.
+            // We sometimes try the following one since otherwise the race of two
+            // RPCs processing concurrently is very very narrow -- we increment the
+            // call ID immediately after looking up the scanner.
+            req.set_call_seq_id(next_seq_id + (rand() % 2));
+            req.set_batch_size_bytes(100);
+            Status s = proxy_->Scan(req, &resp, &rpc);
+            CHECK_OK(s);
+            if (resp.has_error()) {
+              if (resp.error().code() == TabletServerErrorPB::SCANNER_EXPIRED) {
+                break;
+              }
+              CHECK(resp.error().code() == TabletServerErrorPB::INVALID_SCAN_CALL_SEQ_ID)
+                  << "unexpected error: " << resp.error().DebugString();
+              VLOG(1) << "Got an invalid seq id " << req.call_seq_id();
+            } else {
+              VLOG(1) << "Continued scan: " << resp.data().num_rows() << " rows";
+              total_rows += resp.data().num_rows();
+              next_seq_id++;
+              if (!resp.has_more_results()) {
+                VLOG(1) << "Finished scan";
+                done = true;
+              }
+            }
+          }
+        });
+  }
+  for (auto& t : threads) {
+    t.join();
+  }
+  ASSERT_EQ(total_rows, kNumRows);
+}
+
+
 TEST_F(TabletServerTest, TestScanWithStringPredicates) {
   InsertTestRowsDirect(0, 100);
 
@@ -2484,6 +2622,76 @@ TEST_F(TabletServerTest, TestScanWithStringPredicates) {
   ASSERT_EQ(R"((int32 key=50, int32 int_val=100, string string_val="hello 50"))", results[0]);
   ASSERT_EQ(R"((int32 key=59, int32 int_val=118, string string_val="hello 59"))", results[9]);
 }
+
+TEST_F(TabletServerTest, TestColumnarScan) {
+  const int kNumRows = 100;
+  InsertTestRowsDirect(0, kNumRows);
+
+  ScanRequestPB req;
+  ScanResponsePB resp;
+  RpcController rpc;
+
+  NewScanRequestPB* scan = req.mutable_new_scan_request();
+  scan->set_tablet_id(kTabletId);
+  ASSERT_OK(SchemaToColumnPBs(schema_, scan->mutable_projected_columns()));
+
+  scan->set_row_format_flags(RowFormatFlags::COLUMNAR_LAYOUT);
+  rpc.RequireServerFeature(TabletServerFeatures::COLUMNAR_LAYOUT_FEATURE);
+  // Send the call
+  SCOPED_TRACE(SecureDebugString(req));
+  ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+
+  // Verify the response
+  SCOPED_TRACE(SecureDebugString(resp));
+  ASSERT_FALSE(resp.has_error());
+  ASSERT_EQ(3, resp.columnar_data().columns_size());
+
+  ASSERT_EQ(kNumRows, resp.columnar_data().num_rows());
+
+  // Verify column 0 (int32 key)
+  {
+    Slice col_data;
+    ASSERT_OK(rpc.GetInboundSidecar(resp.columnar_data().columns(0).data_sidecar(), &col_data));
+    SCOPED_TRACE(col_data.ToDebugString());
+    ASSERT_EQ(col_data.size(), kNumRows * sizeof(int32_t));
+    ArrayView<const int32_t> cells(reinterpret_cast<const int32_t*>(col_data.data()), kNumRows);
+    for (int i = 0; i < kNumRows; i++) {
+      EXPECT_EQ(i, cells[i]);
+    }
+  }
+
+  // Verify column 1 (int32 val)
+  {
+    Slice col_data;
+    ASSERT_OK(rpc.GetInboundSidecar(resp.columnar_data().columns(1).data_sidecar(), &col_data));
+    SCOPED_TRACE(col_data.ToDebugString());
+    ASSERT_EQ(col_data.size(), kNumRows * sizeof(int32_t));
+    ArrayView<const int32_t> cells(reinterpret_cast<const int32_t*>(col_data.data()), kNumRows);
+    for (int i = 0; i < kNumRows; i++) {
+      EXPECT_EQ(i * 2, cells[i]);
+    }
+  }
+  // Verify column 2 (string)
+  {
+    Slice col_data;
+    ASSERT_OK(rpc.GetInboundSidecar(resp.columnar_data().columns(2).data_sidecar(), &col_data));
+
+    Slice varlen_data;
+    ASSERT_OK(rpc.GetInboundSidecar(resp.columnar_data().columns(2).varlen_data_sidecar(),
+                                    &varlen_data));
+
+    SCOPED_TRACE(col_data.ToDebugString());
+    ASSERT_EQ(col_data.size(), (kNumRows + 1) * sizeof(uint32_t));
+    ArrayView<const uint32_t> offsets(reinterpret_cast<const uint32_t*>(col_data.data()),
+                                      kNumRows + 1);
+    for (int i = 0; i < kNumRows; i++) {
+      Slice real_str(varlen_data.data() + offsets[i],
+                     offsets[i + 1] - offsets[i]);
+      ASSERT_EQ(Substitute("hello $0", i), real_str);
+    }
+  }
+}
+
 
 TEST_F(TabletServerTest, TestNonPositiveLimitsShortCircuit) {
   InsertTestRowsDirect(0, 10);
@@ -2612,11 +2820,11 @@ TEST_F(TabletServerTest, TestScanWithEncodedPredicates) {
   int32_t stop_key_int = 60;
   EncodedKeyBuilder ekb(&schema_);
   ekb.AddColumnKey(&start_key_int);
-  gscoped_ptr<EncodedKey> start_encoded(ekb.BuildEncodedKey());
+  unique_ptr<EncodedKey> start_encoded(ekb.BuildEncodedKey());
 
   ekb.Reset();
   ekb.AddColumnKey(&stop_key_int);
-  gscoped_ptr<EncodedKey> stop_encoded(ekb.BuildEncodedKey());
+  unique_ptr<EncodedKey> stop_encoded(ekb.BuildEncodedKey());
 
   scan->mutable_start_primary_key()->assign(
     reinterpret_cast<const char*>(start_encoded->encoded_key().data()),
@@ -2642,6 +2850,65 @@ TEST_F(TabletServerTest, TestScanWithEncodedPredicates) {
             results.front());
   EXPECT_EQ(R"((int32 key=59, int32 int_val=118, string string_val="hello 59"))",
             results.back());
+}
+
+TEST_F(TabletServerTest, TestScanWithSimplifiablePredicates) {
+  int num_rows = AllowSlowTests() ? 10000 : 1000;
+  InsertTestRowsDirect(0, num_rows);
+
+  ScanRequestPB req;
+  ScanResponsePB resp;
+  RpcController rpc;
+
+  NewScanRequestPB* scan = req.mutable_new_scan_request();
+  scan->set_tablet_id(kTabletId);
+  req.set_batch_size_bytes(0); // so it won't return data right away
+  // Set up a projection without the key columns or the column after the last key column
+  SchemaBuilder sb(schema_);
+  for (int i = 0; i <= schema_.num_key_columns(); i++) {
+    sb.RemoveColumn(schema_.column(i).name());
+  }
+  const Schema& projection = sb.BuildWithoutIds();
+  ASSERT_OK(SchemaToColumnPBs(projection, scan->mutable_projected_columns()));
+
+  // Set up a key range predicate: 51 <= key < 100
+  ColumnPredicatePB* key_predicate = scan->add_column_predicates();
+  key_predicate->set_column(schema_.column(0).name());
+  ColumnPredicatePB::Range* range = key_predicate->mutable_range();
+  int32_t lower_bound_inclusive = 51;
+  int32_t upper_bound_exclusive = 100;
+  range->mutable_lower()->append(
+    reinterpret_cast<char*>(&lower_bound_inclusive), sizeof(lower_bound_inclusive));
+  range->mutable_upper()->append(
+    reinterpret_cast<char*>(&upper_bound_exclusive), sizeof(upper_bound_exclusive));
+  // Set up is not null predicate for not nullable column.
+  ColumnPredicatePB* is_not_null_predicate = scan->add_column_predicates();
+  is_not_null_predicate->set_column(schema_.column(1).name());
+  is_not_null_predicate->mutable_is_not_null();
+  // Send the call
+  {
+    SCOPED_TRACE(SecureDebugString(req));
+    ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // Ensure that the scanner includes correct columns.
+  {
+    auto scan_descriptors = mini_server_->server()->scanner_manager()->ListScans();
+    ASSERT_EQ(1, projection.columns().size());
+    ASSERT_EQ(1, scan_descriptors.size());
+    ASSERT_EQ(projection.columns().size(), scan_descriptors[0].projected_columns.size());
+    ASSERT_EQ(2, scan_descriptors[0].predicates.size());
+    ASSERT_EQ(projection.columns().size(), scan_descriptors[0].iterator_stats.size());
+    ASSERT_EQ(projection.column(0).name(), scan_descriptors[0].iterator_stats[0].first);
+  }
+
+  // Drain all the rows from the scanner.
+  vector<string> results;
+  NO_FATALS(
+    DrainScannerToStrings(resp.scanner_id(), projection, &results));
+  ASSERT_EQ(49, results.size());
 }
 
 // Test for diff scan RPC interface.
@@ -3466,7 +3733,7 @@ TEST_F(TabletServerTest, TestConcurrentDeleteTablet) {
   for (int i = 0; i < kNumDeletes; i++) {
     SCOPED_TRACE(SecureDebugString(req));
     admin_proxy_->DeleteTabletAsync(req, &responses[i], &rpcs[i],
-                                    boost::bind(&CountDownLatch::CountDown, &latch));
+                                    [&]() { latch.CountDown(); });
   }
   latch.Wait();
 
@@ -3717,10 +3984,6 @@ class DelayFsyncLogHook : public log::LogFaultHooks {
 
 namespace {
 
-void DeleteOneRowAsync(TabletServerTest* test) {
-  test->DeleteTestRowsRemote(10, 1);
-}
-
 void CompactAsync(Tablet* tablet, CountDownLatch* flush_done_latch) {
   CHECK_OK(tablet->Compact(Tablet::FORCE_COMPACT_ALL));
   flush_done_latch->CountDown();
@@ -3753,9 +4016,7 @@ TEST_F(TabletServerTest, TestKudu120PreRequisites) {
   log->SetLogFaultHooksForTests(log_hook);
 
   // Now start a transaction (delete) and stop just before commit.
-  scoped_refptr<kudu::Thread> thread1;
-  CHECK_OK(kudu::Thread::Create("DeleteThread", "DeleteThread",
-                                DeleteOneRowAsync, this, &thread1));
+  thread delete_thread([this]() { this->DeleteTestRowsRemote(10, 1); });
 
   // Wait for the replicate message to arrive and continue.
   log_hook->Continue();
@@ -3764,13 +4025,11 @@ TEST_F(TabletServerTest, TestKudu120PreRequisites) {
   usleep(100* 1000); // 100 msecs
 
   // Now start a compaction before letting the commit message go through.
-  scoped_refptr<kudu::Thread> flush_thread;
+  Tablet* tablet = tablet_replica_->tablet();
   CountDownLatch flush_done_latch(1);
-  CHECK_OK(kudu::Thread::Create("CompactThread", "CompactThread",
-                                CompactAsync,
-                                tablet_replica_->tablet(),
-                                &flush_done_latch,
-                                &flush_thread));
+  thread flush_thread([tablet, &flush_done_latch]() {
+    CompactAsync(tablet, &flush_done_latch);
+  });
 
   // At this point we have both a compaction and a transaction going on.
   // If we allow the transaction to return before the commit message is
@@ -3793,6 +4052,8 @@ TEST_F(TabletServerTest, TestKudu120PreRequisites) {
   log_hook->Continue();
   log_hook->Continue();
   flush_done_latch.Wait();
+  flush_thread.join();
+  delete_thread.join();
 }
 
 // Test DNS resolution failure in the master heartbeater.
@@ -3886,7 +4147,7 @@ TEST_F(TabletServerTest, TestTabletNumberOfDiskRowSetsMetric) {
 
   // We don't care what the function is, since the metric is already instantiated.
   auto num_diskrowsets = METRIC_num_rowsets_on_disk.InstantiateFunctionGauge(
-      tablet->tablet()->GetMetricEntity(), Callback<size_t(void)>());
+      tablet->tablet()->GetMetricEntity(), []() { return 0; });
 
   // No data, no diskrowsets.
   ASSERT_EQ(0, num_diskrowsets->value());

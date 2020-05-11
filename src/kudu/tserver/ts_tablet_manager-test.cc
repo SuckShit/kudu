@@ -18,6 +18,8 @@
 #include "kudu/tserver/ts_tablet_manager.h"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -35,7 +37,6 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/raft_consensus.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/master/master.pb.h"
@@ -63,7 +64,16 @@ DECLARE_int32(update_tablet_metrics_interval_ms);
 #define ASSERT_MONOTONIC_REPORT_SEQNO(report_seqno, tablet_report) \
   NO_FATALS(AssertMonotonicReportSeqno(report_seqno, tablet_report))
 
+using kudu::consensus::kInvalidOpIdIndex;
+using kudu::consensus::RaftConfigPB;
+using kudu::master::ReportedTabletPB;
+using kudu::master::TabletReportPB;
+using kudu::pb_util::SecureShortDebugString;
+using kudu::tablet::LocalTabletWriter;
+using kudu::tablet::Tablet;
+using kudu::tablet::TabletReplica;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -71,15 +81,6 @@ namespace kudu {
 class FsManager;
 
 namespace tserver {
-
-using consensus::kInvalidOpIdIndex;
-using consensus::RaftConfigPB;
-using master::ReportedTabletPB;
-using master::TabletReportPB;
-using pb_util::SecureShortDebugString;
-using tablet::LocalTabletWriter;
-using tablet::Tablet;
-using tablet::TabletReplica;
 
 class TsTabletManagerTest : public KuduTest {
  public:
@@ -157,7 +158,7 @@ class TsTabletManagerTest : public KuduTest {
   }
 
  protected:
-  gscoped_ptr<MiniTabletServer> mini_server_;
+  unique_ptr<MiniTabletServer> mini_server_;
   FsManager* fs_manager_;
   TSTabletManager* tablet_manager_;
   Heartbeater* heartbeater_;
@@ -334,12 +335,16 @@ TEST_F(TsTabletManagerTest, TestTabletStatsReports) {
   ASSERT_OK(CreateNewTablet("tablet-1", schema_, boost::none, boost::none, &replica1));
   ASSERT_OK(CreateNewTablet("tablet-2", schema_, boost::none, boost::none, nullptr));
 
-  // 2. Do a full report - should include these two tablets but statistics are all zero.
+  // 2. Do a full report - should include two tablets and statistics are uninitialized.
   NO_FATALS(GenerateFullTabletReport(&report));
   ASSERT_FALSE(report.is_incremental());
   ASSERT_EQ(2, report.updated_tablets().size());
-  ASSERT_FALSE(report.updated_tablets(0).has_stats());
-  ASSERT_FALSE(report.updated_tablets(1).has_stats());
+  ASSERT_TRUE(report.updated_tablets(0).has_stats());
+  ASSERT_TRUE(report.updated_tablets(1).has_stats());
+  ASSERT_FALSE(report.updated_tablets(0).stats().has_on_disk_size());
+  ASSERT_FALSE(report.updated_tablets(0).stats().has_live_row_count());
+  ASSERT_FALSE(report.updated_tablets(1).stats().has_on_disk_size());
+  ASSERT_FALSE(report.updated_tablets(1).stats().has_live_row_count());
   ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
   MarkTabletReportAcknowledged(report);
 
@@ -347,7 +352,7 @@ TEST_F(TsTabletManagerTest, TestTabletStatsReports) {
   tablet_manager_->SetNextUpdateTimeForTests();
   heartbeater_->TriggerASAP();
 
-  // Do an incremental report - should include these two tablets and tablet statistics.
+  // Do an incremental report - should include two tablets and statistics have been initialized.
   ASSERT_EVENTUALLY([&] () {
     NO_FATALS(GenerateIncrementalTabletReport(&report));
     ASSERT_TRUE(report.is_incremental());
@@ -379,13 +384,14 @@ TEST_F(TsTabletManagerTest, TestTabletStatsReports) {
   tablet_manager_->SetNextUpdateTimeForTests();
   heartbeater_->TriggerASAP();
 
-  // Do an incremental report - should include the tablet and tablet statistics.
+  // Do an incremental report - should include the tablet and check the statistics.
   ASSERT_EVENTUALLY([&] () {
     NO_FATALS(GenerateIncrementalTabletReport(&report));
     ASSERT_TRUE(report.is_incremental());
     ASSERT_EQ(1, report.updated_tablets().size());
   });
   ASSERT_MONOTONIC_REPORT_SEQNO(&seqno, report);
+  ASSERT_TRUE(report.updated_tablets(0).has_stats());
   ASSERT_GT(report.updated_tablets(0).stats().on_disk_size(), 0);
   ASSERT_EQ(kCount, report.updated_tablets(0).stats().live_row_count());
   ASSERT_REPORT_HAS_UPDATED_TABLET(report, "tablet-1");

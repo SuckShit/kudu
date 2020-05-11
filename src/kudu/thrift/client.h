@@ -31,6 +31,7 @@
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/rpc.h"
 #include "kudu/thrift/ha_client_metrics.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/metrics.h"
@@ -48,6 +49,9 @@ class TProtocol;
 } // namespace apache
 
 namespace kudu {
+
+using rpc::ComputeExponentialBackoff;
+
 namespace thrift {
 
 // Options for a Thrift client connection.
@@ -128,7 +132,7 @@ class HaClient {
   std::vector<HostPort> addresses_;
   ClientOptions options_;
 
-  // The actual client service instance (HmsClient or SentryClient).
+  // The actual client service instance (ex: HmsClient).
   Service service_client_;
 
   // Fields which track consecutive reconnection attempts and backoff.
@@ -142,9 +146,9 @@ class HaClient {
 ///////////////////////////////////////////////////////////////////////////////
 // HaClient class definitions
 //
-// HaClient is defined inline so that it can be instantiated with HmsClient and
-// SentryClient as template parameters, which live in modules which are not
-// linked to the thrift module.
+// HaClient is defined inline so that it can be instantiated with HmsClient as
+// template parameters, which live in modules which are not linked to the
+// thrift module.
 ///////////////////////////////////////////////////////////////////////////////
 
 template<typename Service>
@@ -192,7 +196,7 @@ template<typename Service>
 Status HaClient<Service>::Execute(std::function<Status(Service*)> task) {
   const MonoTime start_time(MonoTime::Now());
   Synchronizer synchronizer;
-  auto callback = synchronizer.AsStdStatusCallback();
+  auto callback = synchronizer.AsStatusCallback();
 
   // TODO(todd): wrapping this in a TRACE_EVENT scope and a LOG_IF_SLOW and such
   // would be helpful. Perhaps a TRACE message and/or a TRACE_COUNTER_INCREMENT
@@ -201,7 +205,7 @@ Status HaClient<Service>::Execute(std::function<Status(Service*)> task) {
   // object. Note that the Thrift client classes already have LOG_IF_SLOW calls
   // internally.
 
-  RETURN_NOT_OK(threadpool_->SubmitFunc([=] {
+  RETURN_NOT_OK(threadpool_->Submit([=] {
     // The main run routine of the threadpool thread. Runs the task with
     // exclusive access to the Thrift service client. If the task fails, it will
     // be retried, unless the failure type is non-retriable or the maximum
@@ -251,14 +255,10 @@ Status HaClient<Service>::Execute(std::function<Status(Service*)> task) {
           if (PREDICT_TRUE(metrics_)) {
             metrics_->reconnections_failed->Increment();
           }
-          // Reconnect failed; retry with exponential backoff capped at 10s and
-          // fail the task. We don't bother with jitter here because only the
-          // leader master should be attempting this in any given period per
-          // cluster.
+          // Reconnect failed; retry with exponential backoff and fail the task.
           consecutive_reconnect_failures_++;
           reconnect_after_ = MonoTime::Now() +
-              std::min(MonoDelta::FromMilliseconds(100 << consecutive_reconnect_failures_),
-                       MonoDelta::FromSeconds(10));
+              ComputeExponentialBackoff(consecutive_reconnect_failures_);
           reconnect_failure_ = std::move(reconnect_status);
           return callback(reconnect_failure_);
         }

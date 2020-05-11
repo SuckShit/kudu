@@ -19,7 +19,9 @@
 
 #include <cstdint>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,7 +34,7 @@
 #include "kudu/client/replica-internal.h"
 #include "kudu/client/scanner-internal.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/tablet-internal.h"
 #include "kudu/client/tablet_server-internal.h"
 #include "kudu/common/column_predicate.h"

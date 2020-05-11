@@ -17,12 +17,12 @@
 
 #include "kudu/server/server_base.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <sstream>
 #include <string>
-#include <type_traits>
-#include <utility>
 #include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
@@ -34,12 +34,15 @@
 #include "kudu/clock/hybrid_clock.h"
 #include "kudu/clock/logical_clock.h"
 #include "kudu/codegen/compilation_manager.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/fs_report.h"
+#include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
@@ -64,6 +67,8 @@
 #include "kudu/server/webserver.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/file_cache.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/flag_validators.h"
 #include "kudu/util/flags.h"
@@ -122,22 +127,6 @@ DEFINE_string(user_acl, "*",
 TAG_FLAG(user_acl, stable);
 TAG_FLAG(user_acl, sensitive);
 
-DEFINE_string(principal, "kudu/_HOST",
-              "Kerberos principal that this daemon will log in as. The special token "
-              "_HOST will be replaced with the FQDN of the local host.");
-TAG_FLAG(principal, experimental);
-// This is currently tagged as unsafe because there is no way for users to configure
-// clients to expect a non-default principal. As such, configuring a server to login
-// as a different one would end up with a cluster that can't be connected to.
-// See KUDU-1884.
-TAG_FLAG(principal, unsafe);
-
-DEFINE_string(keytab_file, "",
-              "Path to the Kerberos Keytab file for this server. Specifying a "
-              "keytab file will cause the server to kinit, and enable Kerberos "
-              "to be used to authenticate RPC connections.");
-TAG_FLAG(keytab_file, stable);
-
 DEFINE_bool(allow_world_readable_credentials, false,
             "Enable the use of keytab files and TLS private keys with "
             "world-readable permissions.");
@@ -161,6 +150,12 @@ DEFINE_string(rpc_encryption, "optional",
               "Secure clusters should use 'required'.");
 TAG_FLAG(rpc_authentication, evolving);
 TAG_FLAG(rpc_encryption, evolving);
+
+DEFINE_bool(rpc_listen_on_unix_domain_socket, false,
+            "Whether the RPC server should listen on a Unix domain socket. If enabled, "
+            "the RPC server will bind to a socket in the \"abstract namespace\" using "
+            "a name which uniquely identifies the server instance.");
+TAG_FLAG(rpc_listen_on_unix_domain_socket, experimental);
 
 DEFINE_string(rpc_tls_ciphers,
               kudu::security::SecurityDefaults::kDefaultTlsCiphers,
@@ -212,10 +207,18 @@ DEFINE_uint64(gc_tcmalloc_memory_interval_seconds, 30,
 TAG_FLAG(gc_tcmalloc_memory_interval_seconds, advanced);
 TAG_FLAG(gc_tcmalloc_memory_interval_seconds, runtime);
 
+DEFINE_uint64(server_max_open_files, 0,
+              "Maximum number of open file descriptors. If 0, Kudu will "
+              "automatically calculate this value. This is a soft limit");
+TAG_FLAG(server_max_open_files, advanced);
+
 DECLARE_bool(use_hybrid_clock);
 DECLARE_int32(dns_resolver_max_threads_num);
 DECLARE_uint32(dns_resolver_cache_capacity_mb);
 DECLARE_uint32(dns_resolver_cache_ttl_sec);
+DECLARE_string(log_filename);
+DECLARE_string(keytab_file);
+DECLARE_string(principal);
 
 METRIC_DECLARE_gauge_size(merged_entities_count_of_server);
 
@@ -229,9 +232,6 @@ using std::vector;
 using strings::Substitute;
 
 namespace kudu {
-
-class HostPortPB;
-
 namespace server {
 
 namespace {
@@ -353,6 +353,41 @@ shared_ptr<MemTracker> CreateMemTrackerForServer() {
   return shared_ptr<MemTracker>(MemTracker::CreateTracker(-1, id_str));
 }
 
+int64_t GetFileCacheCapacity(Env* env) {
+  // Maximize this process' open file limit first, if possible.
+  static std::once_flag once;
+  std::call_once(once, [&]() {
+    env->IncreaseResourceLimit(Env::ResourceLimitType::OPEN_FILES_PER_PROCESS);
+  });
+
+  uint64_t rlimit =
+      env->GetResourceLimit(Env::ResourceLimitType::OPEN_FILES_PER_PROCESS);
+  // See server_max_open_files.
+  if (FLAGS_server_max_open_files == 0) {
+    // Use file-max as a possible upper bound.
+    faststring buf;
+    uint64_t buf_val;
+    if (ReadFileToString(env, "/proc/sys/fs/file-max", &buf).ok() &&
+        safe_strtou64(buf.ToString(), &buf_val)) {
+      rlimit = std::min(rlimit, buf_val);
+    }
+
+    // Callers of this function expect a signed 64-bit integer, and rlimit
+    // is an uint64_t type, so we need to avoid overflow.
+    // The percentage we currently use is 40% by default, and although in fact
+    // 40% of any value of the `uint64_t` type must be less than `kint64max`,
+    // but the percentage may be adjusted in the future, such as to 60%, so to
+    // prevent accidental overflow, we cap rlimit here.
+    return std::min((rlimit / 5) * 2, static_cast<uint64_t>(kint64max));
+  }
+  LOG_IF(FATAL, FLAGS_server_max_open_files > rlimit) <<
+      Substitute(
+          "Configured open file limit (server_max_open_files) $0 "
+          "exceeds process open file limit (ulimit) $1",
+          FLAGS_server_max_open_files, rlimit);
+  return FLAGS_server_max_open_files;
+}
+
 } // anonymous namespace
 
 ServerBase::ServerBase(string name, const ServerBaseOptions& options,
@@ -363,6 +398,8 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
       metric_registry_(new MetricRegistry()),
       metric_entity_(METRIC_ENTITY_server.Instantiate(metric_registry_.get(),
                                                       metric_namespace)),
+      file_cache_(new FileCache("file cache", options.env,
+                                GetFileCacheCapacity(options.env), metric_entity_)),
       rpc_server_(new RpcServer(options.rpc_opts)),
       result_tracker_(new rpc::ResultTracker(shared_ptr<MemTracker>(
           MemTracker::CreateTracker(-1, "result-tracker", mem_tracker_)))),
@@ -373,7 +410,8 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
           MonoDelta::FromSeconds(FLAGS_dns_resolver_cache_ttl_sec))),
       options_(options),
       stop_background_threads_latch_(1) {
-  METRIC_merged_entities_count_of_server.InstantiateHidden(metric_entity_, 1);
+  metric_entity_->NeverRetire(
+      METRIC_merged_entities_count_of_server.InstantiateHidden(metric_entity_, 1));
 
   FsManagerOpts fs_opts;
   fs_opts.metric_entity = metric_entity_;
@@ -381,12 +419,14 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
   fs_opts.block_manager_type = options.fs_opts.block_manager_type;
   fs_opts.wal_root = options.fs_opts.wal_root;
   fs_opts.data_roots = options.fs_opts.data_roots;
+  fs_opts.file_cache = file_cache_.get();
   fs_manager_.reset(new FsManager(options.env, std::move(fs_opts)));
 
   if (FLAGS_use_hybrid_clock) {
-    clock_ = new clock::HybridClock();
+    clock_.reset(new clock::HybridClock(metric_entity_));
   } else {
-    clock_ = clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp);
+    clock_.reset(new clock::LogicalClock(Timestamp::kInitialTimestamp,
+                                         metric_entity_));
   }
 
   if (FLAGS_webserver_enabled) {
@@ -399,7 +439,7 @@ ServerBase::ServerBase(string name, const ServerBaseOptions& options,
 }
 
 ServerBase::~ServerBase() {
-  Shutdown();
+  ShutdownImpl();
 }
 
 Sockaddr ServerBase::first_rpc_address() const {
@@ -442,15 +482,14 @@ Status ServerBase::Init() {
   // so we're less likely to get into a partially initialized state on disk during startup
   // if we're having clock problems.
   RETURN_NOT_OK_PREPEND(clock_->Init(), "Cannot initialize clock");
-
   RETURN_NOT_OK(security::InitKerberosForServer(FLAGS_principal, FLAGS_keytab_file));
+  RETURN_NOT_OK(file_cache_->Init());
 
   fs::FsReport report;
   Status s = fs_manager_->Open(&report);
   // No instance files existed. Try creating a new FS layout.
   if (s.IsNotFound()) {
-    LOG(INFO) << "Could not load existing FS layout: " << s.ToString();
-    LOG(INFO) << "Attempting to create new FS layout instead";
+    LOG(INFO) << "This appears to be a new deployment of Kudu; creating new FS layout";
     is_first_run_ = true;
     s = fs_manager_->CreateInitialFileSystemLayout();
     if (s.IsAlreadyPresent()) {
@@ -488,12 +527,23 @@ Status ServerBase::Init() {
   }
 
   RETURN_NOT_OK(builder.Build(&messenger_));
-  rpc_server_->set_too_busy_hook(std::bind(
-      &ServerBase::ServiceQueueOverflowed, this, std::placeholders::_1));
+  rpc_server_->set_too_busy_hook([this](rpc::ServicePool* pool) {
+    this->ServiceQueueOverflowed(pool);
+  });
 
   RETURN_NOT_OK(rpc_server_->Init(messenger_));
+
+  if (FLAGS_rpc_listen_on_unix_domain_socket) {
+    VLOG(1) << "Enabling listening on unix domain socket.";
+    Sockaddr addr;
+    RETURN_NOT_OK_PREPEND(addr.ParseUnixDomainPath(Substitute("@kudu-$0", fs_manager_->uuid())),
+                          "unable to parse provided UNIX socket path");
+    RETURN_NOT_OK_PREPEND(rpc_server_->AddBindAddress(addr),
+                          "unable to add configured UNIX socket path to list of bind addresses "
+                          "for RPC server");
+  }
+
   RETURN_NOT_OK(rpc_server_->Bind());
-  clock_->RegisterMetrics(metric_entity_);
 
   RETURN_NOT_OK_PREPEND(StartMetricsLogging(), "Could not enable metrics logging");
 
@@ -554,9 +604,7 @@ Status ServerBase::GetStatusPB(ServerStatusPB* status) const {
       HostPort hp;
       RETURN_NOT_OK_PREPEND(HostPortFromSockaddrReplaceWildcard(addr, &hp),
                             "could not get RPC hostport");
-      HostPortPB* pb = status->add_bound_rpc_addresses();
-      RETURN_NOT_OK_PREPEND(HostPortToPB(hp, pb),
-                            "could not convert RPC hostport");
+      *status->add_bound_rpc_addresses() = HostPortToPB(hp);
     }
   }
 
@@ -569,9 +617,7 @@ Status ServerBase::GetStatusPB(ServerStatusPB* status) const {
       HostPort hp;
       RETURN_NOT_OK_PREPEND(HostPortFromSockaddrReplaceWildcard(addr, &hp),
                             "could not get web hostport");
-      HostPortPB* pb = status->add_bound_http_addresses();
-      RETURN_NOT_OK_PREPEND(HostPortToPB(hp, pb),
-                            "could not convert web hostport");
+      *status->add_bound_http_addresses() = HostPortToPB(hp);
     }
   }
 
@@ -630,7 +676,7 @@ Status ServerBase::DumpServerInfo(const string& path,
   return Status::OK();
 }
 
-Status ServerBase::RegisterService(gscoped_ptr<rpc::ServiceIf> rpc_impl) {
+Status ServerBase::RegisterService(unique_ptr<rpc::ServiceIf> rpc_impl) {
   return rpc_server_->RegisterService(std::move(rpc_impl));
 }
 
@@ -642,7 +688,8 @@ Status ServerBase::StartMetricsLogging() {
     LOG(INFO) << "Not starting metrics log since no log directory was specified.";
     return Status::OK();
   }
-  unique_ptr<DiagnosticsLog> l(new DiagnosticsLog(FLAGS_log_dir, metric_registry_.get()));
+  unique_ptr<DiagnosticsLog> l(new DiagnosticsLog(FLAGS_log_dir, FLAGS_log_filename,
+      metric_registry_.get()));
   l->SetMetricsLogInterval(MonoDelta::FromMilliseconds(options_.metrics_log_interval_ms));
   RETURN_NOT_OK(l->Start());
   diag_log_ = std::move(l);
@@ -659,8 +706,9 @@ Status ServerBase::StartExcessLogFileDeleterThread() {
   }
   RETURN_NOT_OK_PREPEND(minidump_handler_->DeleteExcessMinidumpFiles(options_.env),
                         "Unable to delete excess minidump files");
-  return Thread::Create("server", "excess-log-deleter", &ServerBase::ExcessLogFileDeleterThread,
-                        this, &excess_log_deleter_thread_);
+  return Thread::Create("server", "excess-log-deleter",
+                        [this]() { this->ExcessLogFileDeleterThread(); },
+                        &excess_log_deleter_thread_);
 }
 
 void ServerBase::ExcessLogFileDeleterThread() {
@@ -673,58 +721,7 @@ void ServerBase::ExcessLogFileDeleterThread() {
   }
 }
 
-#ifdef TCMALLOC_ENABLED
-Status ServerBase::StartTcmallocMemoryGcThread() {
-  return Thread::Create("server", "tcmalloc-memory-gc", &ServerBase::TcmallocMemoryGcThread,
-                        this, &tcmalloc_memory_gc_thread_);
-}
-
-void ServerBase::TcmallocMemoryGcThread() {
-  MonoDelta check_interval;
-  do {
-    // If GC is disabled, wake up every 60 seconds anyway to recheck the value of the flag.
-    check_interval = MonoDelta::FromSeconds(FLAGS_gc_tcmalloc_memory_interval_seconds > 0
-      ? FLAGS_gc_tcmalloc_memory_interval_seconds : 60);
-    if (FLAGS_gc_tcmalloc_memory_interval_seconds > 0) {
-      kudu::process_memory::GcTcmalloc();
-    }
-  } while (!stop_background_threads_latch_.WaitFor(check_interval));
-}
-#endif
-
-std::string ServerBase::FooterHtml() const {
-  return Substitute("<pre>$0\nserver uuid $1</pre>",
-                    VersionInfo::GetVersionInfo(),
-                    instance_pb_->permanent_uuid());
-}
-
-Status ServerBase::Start() {
-  GenerateInstanceID();
-
-  RETURN_NOT_OK(RegisterService(make_gscoped_ptr<rpc::ServiceIf>(
-                                  new GenericServiceImpl(this))));
-  RETURN_NOT_OK(rpc_server_->Start());
-
-  if (web_server_) {
-    AddDefaultPathHandlers(web_server_.get());
-    AddRpczPathHandlers(messenger_, web_server_.get());
-    RegisterMetricsJsonHandler(web_server_.get(), metric_registry_.get());
-    TracingPathHandlers::RegisterHandlers(web_server_.get());
-    web_server_->set_footer_html(FooterHtml());
-    RETURN_NOT_OK(web_server_->Start());
-  }
-
-  if (!options_.dump_info_path.empty()) {
-    RETURN_NOT_OK_PREPEND(DumpServerInfo(options_.dump_info_path, options_.dump_info_format),
-                          "Failed to dump server info to " + options_.dump_info_path);
-  }
-
-  start_time_ = WallTime_Now();
-
-  return Status::OK();
-}
-
-void ServerBase::Shutdown() {
+void ServerBase::ShutdownImpl() {
   // First, stop accepting incoming requests and wait for any outstanding
   // requests to finish processing.
   //
@@ -751,6 +748,58 @@ void ServerBase::Shutdown() {
     tcmalloc_memory_gc_thread_->Join();
   }
 #endif
+}
+
+#ifdef TCMALLOC_ENABLED
+Status ServerBase::StartTcmallocMemoryGcThread() {
+  return Thread::Create("server", "tcmalloc-memory-gc",
+                        [this]() { this->TcmallocMemoryGcThread(); },
+                        &tcmalloc_memory_gc_thread_);
+}
+
+void ServerBase::TcmallocMemoryGcThread() {
+  MonoDelta check_interval;
+  do {
+    // If GC is disabled, wake up every 60 seconds anyway to recheck the value of the flag.
+    check_interval = MonoDelta::FromSeconds(FLAGS_gc_tcmalloc_memory_interval_seconds > 0
+      ? FLAGS_gc_tcmalloc_memory_interval_seconds : 60);
+    if (FLAGS_gc_tcmalloc_memory_interval_seconds > 0) {
+      kudu::process_memory::GcTcmalloc();
+    }
+  } while (!stop_background_threads_latch_.WaitFor(check_interval));
+}
+#endif
+
+std::string ServerBase::FooterHtml() const {
+  return Substitute("<pre>$0\nserver uuid $1</pre>",
+                    VersionInfo::GetVersionInfo(),
+                    instance_pb_->permanent_uuid());
+}
+
+Status ServerBase::Start() {
+  GenerateInstanceID();
+
+  RETURN_NOT_OK(RegisterService(
+      unique_ptr<rpc::ServiceIf>(new GenericServiceImpl(this))));
+  RETURN_NOT_OK(rpc_server_->Start());
+
+  if (web_server_) {
+    AddDefaultPathHandlers(web_server_.get());
+    AddRpczPathHandlers(messenger_, web_server_.get());
+    RegisterMetricsJsonHandler(web_server_.get(), metric_registry_.get());
+    TracingPathHandlers::RegisterHandlers(web_server_.get());
+    web_server_->set_footer_html(FooterHtml());
+    RETURN_NOT_OK(web_server_->Start());
+  }
+
+  if (!options_.dump_info_path.empty()) {
+    RETURN_NOT_OK_PREPEND(DumpServerInfo(options_.dump_info_path, options_.dump_info_format),
+                          "Failed to dump server info to " + options_.dump_info_path);
+  }
+
+  start_time_ = WallTime_Now();
+
+  return Status::OK();
 }
 
 void ServerBase::UnregisterAllServices() {

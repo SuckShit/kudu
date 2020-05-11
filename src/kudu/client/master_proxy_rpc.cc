@@ -28,8 +28,6 @@
 #include "kudu/client/client-internal.h"
 #include "kudu/client/client.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/rpc/response_callback.h"
@@ -129,8 +127,7 @@ void AsyncLeaderMasterRpc<ReqClass, RespClass>::SendRpc() {
     controller->RequireServerFeature(required_feature_flag);
   }
   func_(client_->data_->master_proxy().get(), *req_, resp_, controller,
-      std::bind(&AsyncLeaderMasterRpc<ReqClass, RespClass>::SendRpcCb,
-          this, Status::OK()));
+        [this]() { this->SendRpcCb(Status::OK()); });
 }
 
 template <class ReqClass, class RespClass>
@@ -148,7 +145,7 @@ void AsyncLeaderMasterRpc<ReqClass, RespClass>::SendRpcCb(const Status& status) 
   if (s.ok() && resp_->has_error()) {
     s = StatusFromPB(resp_->error().status());
   }
-  user_cb_.Run(s);
+  user_cb_(s);
 }
 
 template <class ReqClass, class RespClass>
@@ -178,8 +175,7 @@ void AsyncLeaderMasterRpc<ReqClass, RespClass>::ResetMasterLeaderAndRetry(
   // FATAL_INVALID_AUTHENTICATION_TOKEN error as well.
   client_->data_->ConnectToClusterAsync(
       client_, retrier().deadline(),
-      Bind(&AsyncLeaderMasterRpc<ReqClass, RespClass>::NewLeaderMasterDeterminedCb,
-           Unretained(this), creds_policy),
+      [=](const Status& s) { this->NewLeaderMasterDeterminedCb(creds_policy, s); },
       creds_policy);
 }
 

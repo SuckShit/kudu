@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <openssl/ssl.h>
+
 #include <cstdint>
 #include <memory>
 
@@ -26,6 +28,7 @@
 #include "kudu/util/status.h"
 
 struct iovec;
+
 typedef struct ssl_st SSL;
 
 namespace kudu {
@@ -54,6 +57,8 @@ class TlsSocket : public Socket {
 
   // Owned SSL handle.
   c_unique_ptr<SSL> ssl_;
+
+  bool use_cork_;
 };
 
 } // namespace security

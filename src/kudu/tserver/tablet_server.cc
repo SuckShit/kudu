@@ -17,8 +17,9 @@
 
 #include "kudu/tserver/tablet_server.h"
 
+#include <functional>
+#include <memory>
 #include <ostream>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -27,8 +28,6 @@
 #include "kudu/cfile/block_cache.h"
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/service_if.h"
 #include "kudu/server/rpc_server.h"
@@ -43,10 +42,11 @@
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/status.h"
 
-using std::string;
-using std::vector;
 using kudu::fs::ErrorHandlerType;
 using kudu::rpc::ServiceIf;
+using std::string;
+using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
 namespace tserver {
@@ -54,6 +54,7 @@ namespace tserver {
 TabletServer::TabletServer(const TabletServerOptions& opts)
   : KuduServer("TabletServer", opts, "kudu.tabletserver"),
     state_(kStopped),
+    quiescing_(false),
     fail_heartbeats_for_tests_(false),
     opts_(opts),
     tablet_manager_(new TSTabletManager(this)),
@@ -62,7 +63,7 @@ TabletServer::TabletServer(const TabletServerOptions& opts)
 }
 
 TabletServer::~TabletServer() {
-  Shutdown();
+  ShutdownImpl();
 }
 
 Status TabletServer::Init() {
@@ -120,15 +121,19 @@ Status TabletServer::WaitInited() {
 Status TabletServer::Start() {
   CHECK_EQ(kInitialized, state_);
 
-  fs_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK_ERROR,
-      Bind(&TSTabletManager::FailTabletsInDataDir, Unretained(tablet_manager_.get())));
-  fs_manager_->SetErrorNotificationCb(ErrorHandlerType::CFILE_CORRUPTION,
-      Bind(&TSTabletManager::FailTabletAndScheduleShutdown, Unretained(tablet_manager_.get())));
+  fs_manager_->SetErrorNotificationCb(
+      ErrorHandlerType::DISK_ERROR, [this](const string& uuid) {
+        this->tablet_manager_->FailTabletsInDataDir(uuid);
+      });
+  fs_manager_->SetErrorNotificationCb(
+      ErrorHandlerType::CFILE_CORRUPTION, [this](const string& uuid) {
+        this->tablet_manager_->FailTabletAndScheduleShutdown(uuid);
+      });
 
-  gscoped_ptr<ServiceIf> ts_service(new TabletServiceImpl(this));
-  gscoped_ptr<ServiceIf> admin_service(new TabletServiceAdminImpl(this));
-  gscoped_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(this, tablet_manager_.get()));
-  gscoped_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
+  unique_ptr<ServiceIf> ts_service(new TabletServiceImpl(this));
+  unique_ptr<ServiceIf> admin_service(new TabletServiceAdminImpl(this));
+  unique_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(this, tablet_manager_.get()));
+  unique_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
       this, tablet_manager_.get()));
 
   RETURN_NOT_OK(RegisterService(std::move(ts_service)));
@@ -146,7 +151,7 @@ Status TabletServer::Start() {
   return Status::OK();
 }
 
-void TabletServer::Shutdown() {
+void TabletServer::ShutdownImpl() {
   if (kInitialized == state_ || kRunning == state_) {
     const string name = rpc_server_->ToString();
     LOG(INFO) << "TabletServer@" << name << " shutting down...";

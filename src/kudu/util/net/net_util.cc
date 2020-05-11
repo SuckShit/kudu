@@ -51,6 +51,7 @@
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/subprocess.h"
@@ -195,6 +196,11 @@ Status HostPort::ResolveAddresses(vector<Sockaddr>* addresses) const {
   LOG_SLOW_EXECUTION(WARNING, 200, op_description) {
     RETURN_NOT_OK(GetAddrInfo(host_, hints, op_description, &result));
   }
+
+  // DNS may return the same host multiple times. We want to return only the unique
+  // addresses, but in the same order as DNS returned them. To do so, we keep track
+  // of the already-inserted elements in a set.
+  unordered_set<Sockaddr> inserted;
   vector<Sockaddr> result_addresses;
   for (const addrinfo* ai = result.get(); ai != nullptr; ai = ai->ai_next) {
     CHECK_EQ(AF_INET, ai->ai_family);
@@ -203,7 +209,9 @@ Status HostPort::ResolveAddresses(vector<Sockaddr>* addresses) const {
     Sockaddr sockaddr(*addr);
     VLOG(2) << Substitute("resolved address $0 for host/port $1",
                           sockaddr.ToString(), ToString());
-    result_addresses.emplace_back(sockaddr);
+    if (InsertIfNotPresent(&inserted, sockaddr)) {
+      result_addresses.emplace_back(sockaddr);
+    }
   }
   if (PREDICT_FALSE(FLAGS_fail_dns_resolution)) {
     return Status::NetworkError("injected DNS resolution failure");
@@ -275,7 +283,7 @@ Network::Network(uint32_t addr, uint32_t netmask)
   : addr_(addr), netmask_(netmask) {}
 
 bool Network::WithinNetwork(const Sockaddr& addr) const {
-  return ((addr.addr().sin_addr.s_addr & netmask_) ==
+  return ((addr.ipv4_addr().sin_addr.s_addr & netmask_) ==
           (addr_ & netmask_));
 }
 
@@ -294,7 +302,7 @@ Status Network::ParseCIDRString(const string& addr) {
 
   // Netmask in network byte order
   uint32_t netmask = NetworkByteOrder::FromHost32(~(0xffffffff >> bits));
-  addr_ = sockaddr.addr().sin_addr.s_addr;
+  addr_ = sockaddr.ipv4_addr().sin_addr.s_addr;
   netmask_ = netmask;
   return Status::OK();
 }
@@ -381,7 +389,7 @@ Status GetLocalNetworks(std::vector<Network>* net) {
     if (ifa->ifa_addr->sa_family == AF_INET) {
       Sockaddr addr(*reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr));
       Sockaddr netmask(*reinterpret_cast<struct sockaddr_in*>(ifa->ifa_netmask));
-      Network network(addr.addr().sin_addr.s_addr, netmask.addr().sin_addr.s_addr);
+      Network network(addr.ipv4_addr().sin_addr.s_addr, netmask.ipv4_addr().sin_addr.s_addr);
       net->push_back(network);
     }
   }
@@ -436,6 +444,18 @@ Status HostPortFromSockaddrReplaceWildcard(const Sockaddr& addr, HostPort* hp) {
   return Status::OK();
 }
 
+Status GetRandomPort(const string& address, uint16_t* port) {
+  Sockaddr sockaddr;
+  sockaddr.ParseString(address, 0);
+  Socket listener;
+  RETURN_NOT_OK(listener.Init(sockaddr.family(), 0));
+  RETURN_NOT_OK(listener.Bind(sockaddr));
+  Sockaddr listen_address;
+  RETURN_NOT_OK(listener.GetSocketAddress(&listen_address));
+  *port = listen_address.port();
+  return Status::OK();
+}
+
 void TryRunLsof(const Sockaddr& addr, vector<string>* log) {
 #if defined(__APPLE__)
   string cmd = strings::Substitute(
@@ -479,11 +499,16 @@ string GetBindIpForDaemon(int index, BindMode bind_mode) {
   CHECK(0 < index && index <= kServersMaxNum) << Substitute(
       "server index $0 is not in range ($1, $2]", index, 0, kServersMaxNum);
 
+  static constexpr uint32_t kMaxPid = 1 << kPidBits;
   switch (bind_mode) {
     case BindMode::UNIQUE_LOOPBACK: {
       uint32_t pid = getpid();
-      CHECK_LT(pid, 1 << kPidBits) << Substitute(
-          "PID $0 is more than $1 bits wide", pid, kPidBits);
+      if (pid >= kMaxPid) {
+        LOG(INFO) << Substitute(
+            "PID $0 is more than $1 bits wide, substituted with $2",
+            pid, kPidBits, pid % kMaxPid);
+        pid %= kMaxPid;
+      }
       uint32_t ip = (pid << kServerIdxBits) | static_cast<uint32_t>(index);
       uint8_t octets[] = {
           static_cast<uint8_t>((ip >> 16) & 0xff),

@@ -13,13 +13,18 @@
 #ifndef KUDU_UTIL_STATUS_H_
 #define KUDU_UTIL_STATUS_H_
 
-// NOTE: using stdint.h instead of cstdint and errno.h instead of errno because
+// NOTE: using stdint.h instead of cstdint and errno.h instead of cerrno because
 // this file is supposed to be processed by a compiler lacking C++11 support.
 #include <errno.h>
 #include <stdint.h>
 
 #include <cstddef>
 #include <string>
+
+// This macro is not defined when status.h is consumed by third party applications.
+#ifdef KUDU_HEADERS_USE_SHORT_STATUS_MACROS
+#include <glog/logging.h>
+#endif
 
 #ifdef KUDU_HEADERS_NO_STUBS
 #include "kudu/gutil/macros.h"
@@ -107,6 +112,20 @@
 ///   logged 'Bad status' message.
 #define KUDU_DCHECK_OK(s) KUDU_DCHECK_OK_PREPEND(s, "Bad status")
 
+/// @brief A macro to use at the main() function level if it's necessary to
+///   return a non-zero status from the main() based on the non-OK status 's'
+///   and extra message 'msg' prepended. The desired return code is passed as
+///   'ret_code' parameter.
+#define KUDU_RETURN_MAIN_NOT_OK(to_call, msg, ret_code) do { \
+    DCHECK_NE(0, (ret_code)) << "non-OK return code should not be 0"; \
+    const ::kudu::Status& _s = (to_call); \
+    if (!_s.ok()) { \
+      const ::kudu::Status& _ss = _s.CloneAndPrepend((msg)); \
+      LOG(ERROR) << _ss.ToString(); \
+      return (ret_code); \
+    } \
+  } while (0)
+
 /// @file status.h
 ///
 /// This header is used in both the Kudu build as well as in builds of
@@ -132,6 +151,7 @@
 #define CHECK_OK              KUDU_CHECK_OK
 #define DCHECK_OK_PREPEND     KUDU_DCHECK_OK_PREPEND
 #define DCHECK_OK             KUDU_DCHECK_OK
+#define RETURN_MAIN_NOT_OK    KUDU_RETURN_MAIN_NOT_OK
 
 // These are standard glog macros.
 #define KUDU_LOG              LOG

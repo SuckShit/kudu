@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_LOCAL_TABLET_WRITER_H
-#define KUDU_TABLET_LOCAL_TABLET_WRITER_H
+#pragma once
 
+#include <memory>
 #include <vector>
 
 #include "kudu/common/partial_row.h"
@@ -65,6 +65,10 @@ class LocalTabletWriter {
     return Write(RowOperationsPB::INSERT, row);
   }
 
+  Status InsertIgnore(const KuduPartialRow& row) {
+    return Write(RowOperationsPB::INSERT_IGNORE, row);
+  }
+
   Status Upsert(const KuduPartialRow& row) {
     return Write(RowOperationsPB::UPSERT, row);
   }
@@ -105,7 +109,7 @@ class LocalTabletWriter {
     RETURN_NOT_OK(tablet_->ApplyRowOperations(tx_state_.get()));
 
     tx_state_->ReleaseTxResultPB(&result_);
-    tablet_->mvcc_manager()->AdjustSafeTime(tx_state_->timestamp());
+    tablet_->mvcc_manager()->AdjustNewTransactionLowerBound(tx_state_->timestamp());
     tx_state_->CommitOrAbort(Transaction::COMMITTED);
 
     // Return the status of first failed op.
@@ -140,7 +144,7 @@ class LocalTabletWriter {
 
   TxResultPB result_;
   tserver::WriteRequestPB req_;
-  gscoped_ptr<WriteTransactionState> tx_state_;
+  std::unique_ptr<WriteTransactionState> tx_state_;
 
   DISALLOW_COPY_AND_ASSIGN(LocalTabletWriter);
 };
@@ -148,4 +152,3 @@ class LocalTabletWriter {
 
 } // namespace tablet
 } // namespace kudu
-#endif /* KUDU_TABLET_LOCAL_TABLET_WRITER_H */

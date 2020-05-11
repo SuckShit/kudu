@@ -17,10 +17,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -30,9 +32,8 @@
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
-#include "kudu/clock/clock.h"
 #include "kudu/clock/hybrid_clock.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/schema.h"
@@ -52,7 +53,6 @@
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/basictypes.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
@@ -76,41 +76,39 @@
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 METRIC_DECLARE_gauge_uint64(tablets_num_failed);
 
+using kudu::client::KuduClient;
+using kudu::client::KuduInsert;
+using kudu::client::KuduSession;
+using kudu::client::KuduTable;
+using kudu::client::KuduUpdate;
+using kudu::client::sp::shared_ptr;
+using kudu::cluster::ExternalTabletServer;
+using kudu::cluster::ExternalMiniClusterOptions;
+using kudu::clock::HybridClock;
+using kudu::consensus::ConsensusMetadata;
+using kudu::consensus::ConsensusMetadataManager;
+using kudu::consensus::ConsensusStatePB;
+using kudu::consensus::EXCLUDE_HEALTH_REPORT;
+using kudu::consensus::OpId;
+using kudu::consensus::RECEIVED_OPID;
+using kudu::fs::BlockManager;
+using kudu::itest::MiniClusterFsInspector;
+using kudu::itest::TServerDetails;
+using kudu::log::AppendNoOpsToLogSync;
+using kudu::log::Log;
+using kudu::log::LogOptions;
+using kudu::tablet::TabletMetadata;
+using kudu::tablet::TabletSuperBlockPB;
 using std::string;
+using std::thread;
 using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
-
-using client::KuduClient;
-using client::KuduInsert;
-using client::KuduSession;
-using client::KuduTable;
-using client::KuduUpdate;
-using client::sp::shared_ptr;
-using cluster::ExternalTabletServer;
-using cluster::ExternalMiniClusterOptions;
-using clock::Clock;
-using clock::HybridClock;
-using consensus::ConsensusMetadata;
-using consensus::ConsensusMetadataManager;
-using consensus::ConsensusStatePB;
-using consensus::EXCLUDE_HEALTH_REPORT;
-using consensus::OpId;
-using consensus::RECEIVED_OPID;
-using fs::BlockManager;
-using itest::MiniClusterFsInspector;
-using kudu::itest::TServerDetails;
-using log::AppendNoOpsToLogSync;
-using log::Log;
-using log::LogOptions;
-using strings::Substitute;
-using tablet::TabletMetadata;
-using tablet::TabletSuperBlockPB;
 
 namespace {
 // Generate a row key such that an increasing sequence (0...N) ends up spreading writes
@@ -154,7 +152,7 @@ TEST_F(TsRecoveryITest, TestTabletRecoveryAfterSegmentDelete) {
   vector<string> flags;
   flags.emplace_back("--log_segment_size_mb=1");
   flags.emplace_back("--log_min_segments_to_retain=3");
-  flags.emplace_back("--log_compression_codec=''");
+  flags.emplace_back("--log_compression_codec=no_compression");
   NO_FATALS(StartCluster(flags));
 
   const int kNumTablets = 1;
@@ -203,7 +201,7 @@ TEST_F(TsRecoveryITest, TestTabletRecoveryAfterSegmentDelete) {
     opts.wal_root = ets->wal_dir();
     opts.data_roots = ets->data_dirs();
 
-    gscoped_ptr<FsManager> fs_manager(new FsManager(env_, opts));
+    unique_ptr<FsManager> fs_manager(new FsManager(env_, opts));
 
     ASSERT_OK(fs_manager->Open());
 
@@ -587,12 +585,15 @@ TEST_P(TsRecoveryITestDeathTest, TestRecoverFromOpIdOverflow) {
     FsManagerOpts opts;
     opts.wal_root = ets->wal_dir();
     opts.data_roots = ets->data_dirs();
-    gscoped_ptr<FsManager> fs_manager(new FsManager(env_, opts));
+    unique_ptr<FsManager> fs_manager(new FsManager(env_, opts));
     ASSERT_OK(fs_manager->Open());
     scoped_refptr<ConsensusMetadataManager> cmeta_manager(
         new ConsensusMetadataManager(fs_manager.get()));
-    scoped_refptr<Clock> clock(new HybridClock());
-    ASSERT_OK(clock->Init());
+    MetricRegistry metric_registry;
+    auto metric_entity(METRIC_ENTITY_server.Instantiate(&metric_registry,
+                                                        "ts-recoverty-itest"));
+    HybridClock clock(metric_entity);
+    ASSERT_OK(clock.Init());
 
     OpId opid;
     opid.set_term(kOverflowedIndexValue);
@@ -602,15 +603,16 @@ TEST_P(TsRecoveryITestDeathTest, TestRecoverFromOpIdOverflow) {
       scoped_refptr<Log> log;
       ASSERT_OK(Log::Open(LogOptions(),
                           fs_manager.get(),
+                          /*file_cache*/nullptr,
                           tablet_id,
                           SchemaBuilder(GetSimpleTestSchema()).Build(),
                           0, // schema_version
-                          nullptr,
+                          /*metric_entity*/nullptr,
                           &log));
 
       // Write a series of negative OpIds.
       // This will cause a crash, but only after they have been written to disk.
-      ASSERT_OK(AppendNoOpsToLogSync(clock, log.get(), &opid, kNumOverflowedEntriesToWrite));
+      ASSERT_OK(AppendNoOpsToLogSync(&clock, log.get(), &opid, kNumOverflowedEntriesToWrite));
     }, "Check failed: log_index > 0");
 
     // Before restarting the tablet server, delete the initial log segment from
@@ -716,11 +718,9 @@ class UpdaterThreads {
   void Start() {
     CHECK(!should_run_.Load());
     should_run_.Store(true);
-    threads_.resize(kNumThreads);
-    for (int i = 0; i < threads_.size(); i++) {
-      CHECK_OK(kudu::Thread::Create("test", "updater",
-                                    &UpdaterThreads::Run, this,
-                                    &threads_[i]));
+    threads_.reserve(kNumThreads);
+    for (int i = 0; i < kNumThreads; i++) {
+      threads_.emplace_back([this]() { this->Run(); });
     }
   }
 
@@ -729,10 +729,9 @@ class UpdaterThreads {
     CHECK(should_run_.Load());
     should_run_.Store(false);
 
-    for (const auto& t : threads_) {
-      t->Join();
+    for (auto& t : threads_) {
+      t.join();
     }
-    threads_.clear();
   }
 
  protected:
@@ -745,7 +744,7 @@ class UpdaterThreads {
       int i = inserted_->Load();
       if (i == 0) continue;
 
-      gscoped_ptr<KuduUpdate> up(table_->NewUpdate());
+      unique_ptr<KuduUpdate> up(table_->NewUpdate());
       CHECK_OK(up->mutable_row()->SetInt32("key", IntToKey(rng.Uniform(i) + 1)));
       CHECK_OK(up->mutable_row()->SetInt32("int_val", rng.Next32()));
       CHECK_OK(session->Apply(up.release()));
@@ -759,7 +758,7 @@ class UpdaterThreads {
   AtomicInt<int32_t>* inserted_;
   shared_ptr<KuduClient> client_;
   shared_ptr<KuduTable> table_;
-  vector<scoped_refptr<Thread> > threads_;
+  vector<thread> threads_;
 };
 
 // Parameterized test which acts as a regression test for KUDU-969.
@@ -831,7 +830,7 @@ TEST_P(Kudu969Test, Test) {
   session->SetTimeoutMillis(1000);
   CHECK_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
   for (int i = 1; ts->IsProcessAlive(); i++) {
-    gscoped_ptr<KuduInsert> ins(table->NewInsert());
+    unique_ptr<KuduInsert> ins(table->NewInsert());
     ASSERT_OK(ins->mutable_row()->SetInt32("key", IntToKey(i)));
     ASSERT_OK(ins->mutable_row()->SetInt32("int_val", i));
     ASSERT_OK(ins->mutable_row()->SetNull("string_val"));

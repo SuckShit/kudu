@@ -21,7 +21,6 @@
 #include <memory>
 #include <mutex>
 #include <ostream>
-#include <type_traits>
 #include <utility>
 
 #include <glog/logging.h>
@@ -29,13 +28,11 @@
 #include <google/protobuf/message.h>
 
 #include "kudu/clock/clock.h"
-#include "kudu/consensus/raft_consensus.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/consensus/log.h"
+#include "kudu/consensus/raft_consensus.h"
 #include "kudu/consensus/time_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -53,19 +50,20 @@
 #include "kudu/util/threadpool.h"
 #include "kudu/util/trace.h"
 
+using kudu::consensus::CommitMsg;
+using kudu::consensus::DriverType;
+using kudu::consensus::RaftConsensus;
+using kudu::consensus::ReplicateMsg;
+using kudu::log::Log;
+using kudu::pb_util::SecureShortDebugString;
+using kudu::rpc::RequestIdPB;
+using kudu::rpc::ResultTracker;
+using std::string;
+using std::unique_ptr;
+using strings::Substitute;
+
 namespace kudu {
 namespace tablet {
-
-using consensus::CommitMsg;
-using consensus::DriverType;
-using consensus::RaftConsensus;
-using consensus::ReplicateMsg;
-using log::Log;
-using pb_util::SecureShortDebugString;
-using rpc::RequestIdPB;
-using rpc::ResultTracker;
-using std::string;
-using strings::Substitute;
 
 static const char* kTimestampFieldName = "timestamp";
 
@@ -124,7 +122,7 @@ TransactionDriver::TransactionDriver(TransactionTracker *txn_tracker,
   }
 }
 
-Status TransactionDriver::Init(gscoped_ptr<Transaction> transaction,
+Status TransactionDriver::Init(unique_ptr<Transaction> transaction,
                                DriverType type) {
   // If the tablet has been stopped, the replica is likely shutting down soon.
   // Prevent further transacions from starting.
@@ -156,23 +154,21 @@ Status TransactionDriver::Init(gscoped_ptr<Transaction> transaction,
       // before the transaction has a chance to fail.
       const rpc::RequestIdPB& request_id = state()->request_id();
       const google::protobuf::Message* response = state()->response();
-      gscoped_ptr<TransactionCompletionCallback> callback(
+      unique_ptr<TransactionCompletionCallback> callback(
           new FollowerTransactionCompletionCallback(request_id,
                                                     response,
                                                     state()->result_tracker()));
-      mutable_state()->set_completion_callback(callback.Pass());
+      mutable_state()->set_completion_callback(std::move(callback));
     }
   } else {
     DCHECK_EQ(type, consensus::LEADER);
-    gscoped_ptr<ReplicateMsg> replicate_msg;
+    unique_ptr<ReplicateMsg> replicate_msg;
     transaction_->NewReplicateMsg(&replicate_msg);
     if (consensus_) { // sometimes NULL in tests
       // A raw pointer is required to avoid a refcount cycle.
       mutable_state()->set_consensus_round(
         consensus_->NewRound(std::move(replicate_msg),
-                             std::bind(&TransactionDriver::ReplicationFinished,
-                                       this,
-                                       std::placeholders::_1)));
+                             [this](const Status& s) { this->ReplicationFinished(s); }));
     }
   }
 
@@ -226,8 +222,7 @@ Status TransactionDriver::ExecuteAsync() {
   }
 
   if (s.ok()) {
-    s = prepare_pool_token_->SubmitClosure(
-      Bind(&TransactionDriver::PrepareTask, Unretained(this)));
+    s = prepare_pool_token_->Submit([this]() { this->PrepareTask(); });
   }
 
   if (!s.ok()) {
@@ -263,7 +258,7 @@ void TransactionDriver::RegisterFollowerTransactionOnResultTracker() {
     case ResultTracker::RpcState::STALE:
     case ResultTracker::RpcState::COMPLETED: {
       mutable_state()->set_completion_callback(
-          gscoped_ptr<TransactionCompletionCallback>(new TransactionCompletionCallback()));
+          unique_ptr<TransactionCompletionCallback>(new TransactionCompletionCallback()));
       VLOG(2) << state()->result_tracker() << " Follower Rpc was already COMPLETED or STALE: "
           << rpc_state << " OpId: " << SecureShortDebugString(state()->op_id())
           << " RequestId: " << SecureShortDebugString(state()->request_id());
@@ -477,10 +472,11 @@ Status TransactionDriver::ApplyAsync() {
     if (transaction_status_.ok()) {
       DCHECK_EQ(replication_state_, REPLICATED);
       order_verifier_->CheckApply(op_id_copy_.index(), prepare_physical_timestamp_);
-      // Now that the transaction is committed in consensus advance the safe time.
+      // Now that the transaction is committed in consensus advance the lower
+      // bound on new transaction timestamps.
       if (transaction_->state()->external_consistency_mode() != COMMIT_WAIT) {
         transaction_->state()->tablet_replica()->tablet()->mvcc_manager()->
-            AdjustSafeTime(transaction_->state()->timestamp());
+            AdjustNewTransactionLowerBound(transaction_->state()->timestamp());
       }
     } else {
       DCHECK_EQ(replication_state_, REPLICATION_FAILED);
@@ -492,7 +488,7 @@ Status TransactionDriver::ApplyAsync() {
   }
 
   TRACE_EVENT_FLOW_BEGIN0("txn", "ApplyTask", this);
-  return apply_pool_->SubmitClosure(Bind(&TransactionDriver::ApplyTask, Unretained(this)));
+  return apply_pool_->Submit([this]() { this->ApplyTask(); });
 }
 
 void TransactionDriver::ApplyTask() {
@@ -515,7 +511,7 @@ void TransactionDriver::ApplyTask() {
   scoped_refptr<TransactionDriver> ref(this);
 
   {
-    gscoped_ptr<CommitMsg> commit_msg;
+    unique_ptr<CommitMsg> commit_msg;
     Status s = transaction_->Apply(&commit_msg);
     if (PREDICT_FALSE(!s.ok())) {
       LOG(WARNING) << Substitute("Did not Apply transaction $0: $1",
@@ -528,9 +524,10 @@ void TransactionDriver::ApplyTask() {
 
     {
       TRACE_EVENT1("txn", "AsyncAppendCommit", "txn", this);
-      CHECK_OK(log_->AsyncAppendCommit(std::move(commit_msg),
-                                       Bind(CrashIfNotOkStatusCB,
-                                       "Enqueued commit operation failed to write to WAL")));
+      CHECK_OK(log_->AsyncAppendCommit(
+          std::move(commit_msg), [](const Status& s) {
+            CrashIfNotOkStatusCB("Enqueued commit operation failed to write to WAL", s);
+          }));
     }
 
     // If the client requested COMMIT_WAIT as the external consistency mode

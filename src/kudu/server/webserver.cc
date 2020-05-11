@@ -17,6 +17,9 @@
 
 #include "kudu/server/webserver.h"
 
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <csignal>
 #include <cstdint>
@@ -24,16 +27,15 @@
 #include <cstring>
 #include <functional>
 #include <map>
-#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <boost/algorithm/string.hpp> // IWYU pragma: keep
-#include <boost/optional.hpp>
+#include <boost/algorithm/string/case_conv.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <mustache.h>
@@ -62,8 +64,6 @@
 #include "kudu/util/url-coding.h"
 #include "kudu/util/version_info.h"
 #include "kudu/util/zlib.h"
-
-struct sockaddr_in;
 
 #if defined(__APPLE__)
 typedef sig_t sighandler_t;
@@ -184,8 +184,8 @@ Webserver::~Webserver() {
   STLDeleteValues(&path_handlers_);
 }
 
-void Webserver::RootHandler(const Webserver::WebRequest& /* args */,
-                            Webserver::WebResponse* resp) {
+void Webserver::RootHandler(const WebRequest& /* args */,
+                            WebResponse* resp) {
   EasyJson path_handlers = resp->output.Set("path_handlers", EasyJson::kArray);
   for (const PathHandlerMap::value_type& handler : path_handlers_) {
     if (handler.second->is_on_nav_bar()) {
@@ -350,7 +350,7 @@ Status Webserver::Start() {
   signal(SIGCHLD, sig_chld);
 
   if (context_ == nullptr) {
-    Sockaddr addr;
+    Sockaddr addr = Sockaddr::Wildcard();
     addr.set_port(opts_.port);
     TryRunLsof(addr);
     string err_msg = Substitute("Webserver: could not start on address $0", http_address_);
@@ -360,11 +360,10 @@ Status Webserver::Start() {
     return Status::RuntimeError(err_msg);
   }
 
-  PathHandlerCallback default_callback =
-      std::bind<void>(std::mem_fn(&Webserver::RootHandler),
-                      this, std::placeholders::_1, std::placeholders::_2);
-
-  RegisterPathHandler("/", "Home", default_callback,
+  RegisterPathHandler("/", "Home",
+                      [this](const WebRequest& req, WebResponse* resp) {
+                        this->RootHandler(req, resp);
+                      },
                       /*is_styled=*/true, /*is_on_nav_bar=*/true);
 
   vector<Sockaddr> addrs;
@@ -626,7 +625,7 @@ void Webserver::SendResponse(struct sq_connection* connection,
       }
 
       ostringstream oss;
-      Status s = zlib::Compress(uncompressed, &oss);
+      Status s = zlib::CompressLevel(uncompressed, 1, &oss);
       if (s.ok()) {
         resp->output.str(oss.str());
         is_compressed = true;

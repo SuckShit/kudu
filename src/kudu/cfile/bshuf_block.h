@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cstdint>
 #include <ostream>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -151,9 +152,9 @@ class BShufBlockBuilder final : public BlockBuilder {
     return Status::OK();
   }
 
-  Slice Finish(rowid_t ordinal_pos) OVERRIDE {
+  void Finish(rowid_t ordinal_pos, std::vector<Slice>* slices) OVERRIDE {
     RememberFirstAndLastKey();
-    return Finish(ordinal_pos, size_of_type);
+    *slices = { Finish(ordinal_pos, size_of_type) };
   }
 
  private:
@@ -174,7 +175,7 @@ class BShufBlockBuilder final : public BlockBuilder {
   }
 
   Slice Finish(rowid_t ordinal_pos, int final_size_of_type) {
-    data_.resize(kHeaderSize + final_size_of_type * count_);
+    data_.resize(final_size_of_type * count_);
 
     // Do padding so that the input num of element is multiple of 8.
     int num_elems_after_padding = KUDU_ALIGN_UP(count_, 8);
@@ -183,6 +184,7 @@ class BShufBlockBuilder final : public BlockBuilder {
     for (int i = 0; i < padding_bytes; i++) {
       data_.push_back(0);
     }
+    DCHECK_EQ(0, data_.length() % 8);
 
     buffer_.resize(kHeaderSize +
                    bitshuffle::compress_lz4_bound(num_elems_after_padding, final_size_of_type, 0));
@@ -223,7 +225,7 @@ class BShufBlockBuilder final : public BlockBuilder {
 };
 
 template<>
-Slice BShufBlockBuilder<UINT32>::Finish(rowid_t ordinal_pos);
+void BShufBlockBuilder<UINT32>::Finish(rowid_t ordinal_pos, std::vector<Slice>* slices);
 
 template<DataType Type>
 class BShufBlockDecoder final : public BlockDecoder {
@@ -235,6 +237,7 @@ class BShufBlockDecoder final : public BlockDecoder {
         num_elems_(0),
         compressed_size_(0),
         num_elems_after_padding_(0),
+        size_of_elem_(0),
         cur_idx_(0) {
   }
 

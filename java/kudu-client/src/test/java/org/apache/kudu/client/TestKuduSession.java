@@ -220,7 +220,7 @@ public class TestKuduSession {
    * can end up giving ConvertBatchToListOfResponsesCB a list with nulls if a tablet was already
    * flushed. Only happens with multiple tablets.
    */
-  @Test(timeout = 10000)
+  @Test(timeout = 100000)
   public void testConcurrentFlushes() throws Exception {
     CreateTableOptions builder = getBasicCreateTableOptions();
     int numTablets = 4;
@@ -308,6 +308,70 @@ public class TestKuduSession {
         "INT32 key=1, INT32 column1_i=2, INT32 column2_i=3, " +
             "STRING column3_s=a string, BOOL column4_b=true",
         rowStrings.get(0));
+  }
+
+  @Test(timeout = 10000)
+  public void testInsertIgnoreAfterInsertHasNoRowError() throws Exception {
+    KuduTable table = client.createTable(tableName, basicSchema, getBasicCreateTableOptions());
+    KuduSession session = client.newSession();
+    session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
+
+    session.apply(createInsert(table, 1));
+    session.apply(createUpsert(table, 1, 1, false));
+    session.apply(createInsertIgnore(table, 1));
+    List<OperationResponse> results = session.flush();
+    for (OperationResponse result : results) {
+      assertFalse(result.toString(), result.hasRowError());
+    }
+    List<String> rowStrings = scanTableToStrings(table);
+    assertEquals(1, rowStrings.size());
+    assertEquals(
+            "INT32 key=1, INT32 column1_i=1, INT32 column2_i=3, " +
+                    "STRING column3_s=a string, BOOL column4_b=true",
+            rowStrings.get(0));
+  }
+
+  @Test(timeout = 10000)
+  public void testInsertAfterInsertIgnoreHasRowError() throws Exception {
+    KuduTable table = client.createTable(tableName, basicSchema, getBasicCreateTableOptions());
+    KuduSession session = client.newSession();
+    session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
+
+    session.apply(createInsertIgnore(table, 1));
+    session.apply(createInsert(table, 1));
+    List<OperationResponse> results = session.flush();
+    assertFalse(results.get(0).toString(), results.get(0).hasRowError());
+    assertTrue(results.get(1).toString(), results.get(1).hasRowError());
+    assertTrue(results.get(1).getRowError().getErrorStatus().isAlreadyPresent());
+    List<String> rowStrings = scanTableToStrings(table);
+    assertEquals(1, rowStrings.size());
+    assertEquals(
+            "INT32 key=1, INT32 column1_i=2, INT32 column2_i=3, " +
+                    "STRING column3_s=a string, BOOL column4_b=true",
+            rowStrings.get(0));
+  }
+
+  @Test(timeout = 10000)
+  public void testInsertIgnore() throws Exception {
+    KuduTable table = client.createTable(tableName, basicSchema, getBasicCreateTableOptions());
+    KuduSession session = client.newSession();
+
+    // Test insert ignore implements normal insert.
+    assertFalse(session.apply(createInsertIgnore(table, 1)).hasRowError());
+    List<String> rowStrings = scanTableToStrings(table);
+    assertEquals(
+            "INT32 key=1, INT32 column1_i=2, INT32 column2_i=3, " +
+                    "STRING column3_s=a string, BOOL column4_b=true",
+            rowStrings.get(0));
+
+    // Test insert ignore does not return a row error.
+    assertFalse(session.apply(createInsertIgnore(table, 1)).hasRowError());
+    rowStrings = scanTableToStrings(table);
+    assertEquals(
+            "INT32 key=1, INT32 column1_i=2, INT32 column2_i=3, " +
+                    "STRING column3_s=a string, BOOL column4_b=true",
+            rowStrings.get(0));
+
   }
 
   @Test(timeout = 10000)
@@ -457,5 +521,16 @@ public class TestKuduSession {
     PartialRow row = delete.getRow();
     row.addInt(0, key);
     return delete;
+  }
+
+  protected InsertIgnore createInsertIgnore(KuduTable table, int key) {
+    InsertIgnore insertIgnore = table.newInsertIgnore();
+    PartialRow row = insertIgnore.getRow();
+    row.addInt(0, key);
+    row.addInt(1, 2);
+    row.addInt(2, 3);
+    row.addString(3, "a string");
+    row.addBoolean(4, true);
+    return insertIgnore;
   }
 }

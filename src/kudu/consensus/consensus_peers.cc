@@ -19,15 +19,14 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <ostream>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/common/common.pb.h"
@@ -38,7 +37,6 @@
 #include "kudu/consensus/consensus_queue.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid_util.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -110,7 +108,7 @@ Status Peer::NewRemotePeer(RaftPeerPB peer_pb,
                            string leader_uuid,
                            PeerMessageQueue* queue,
                            ThreadPoolToken* raft_pool_token,
-                           gscoped_ptr<PeerProxy> proxy,
+                           unique_ptr<PeerProxy> proxy,
                            shared_ptr<Messenger> messenger,
                            shared_ptr<Peer>* peer) {
 
@@ -131,7 +129,7 @@ Peer::Peer(RaftPeerPB peer_pb,
            string leader_uuid,
            PeerMessageQueue* queue,
            ThreadPoolToken* raft_pool_token,
-           gscoped_ptr<PeerProxy> proxy,
+           unique_ptr<PeerProxy> proxy,
            shared_ptr<Messenger> messenger)
     : tablet_id_(std::move(tablet_id)),
       leader_uuid_(std::move(leader_uuid)),
@@ -180,7 +178,7 @@ Status Peer::SignalRequest(bool even_if_queue_empty) {
   // Capture a weak_ptr reference into the submitted functor so that we can
   // safely handle the functor outliving its peer.
   weak_ptr<Peer> w_this = shared_from_this();
-  RETURN_NOT_OK(raft_pool_token_->SubmitFunc([even_if_queue_empty, w_this]() {
+  RETURN_NOT_OK(raft_pool_token_->Submit([even_if_queue_empty, w_this]() {
     if (auto p = w_this.lock()) {
       p->SendNextRequest(even_if_queue_empty);
     }
@@ -380,7 +378,7 @@ void Peer::ProcessResponse() {
   // Capture a weak_ptr reference into the submitted functor so that we can
   // safely handle the functor outliving its peer.
   weak_ptr<Peer> w_this = shared_from_this();
-  Status s = raft_pool_token_->SubmitFunc([w_this]() {
+  Status s = raft_pool_token_->Submit([w_this]() {
     if (auto p = w_this.lock()) {
       p->DoProcessResponse();
 
@@ -510,9 +508,9 @@ Peer::~Peer() {
   request_.mutable_ops()->ExtractSubrange(0, request_.ops_size(), nullptr);
 }
 
-RpcPeerProxy::RpcPeerProxy(gscoped_ptr<HostPort> hostport,
-                           gscoped_ptr<ConsensusServiceProxy> consensus_proxy)
-    : hostport_(std::move(DCHECK_NOTNULL(hostport))),
+RpcPeerProxy::RpcPeerProxy(HostPort hostport,
+                           unique_ptr<ConsensusServiceProxy> consensus_proxy)
+    : hostport_(std::move(hostport)),
       consensus_proxy_(std::move(DCHECK_NOTNULL(consensus_proxy))) {
 }
 
@@ -548,7 +546,7 @@ void RpcPeerProxy::StartTabletCopyAsync(const StartTabletCopyRequestPB& request,
 }
 
 string RpcPeerProxy::PeerName() const {
-  return hostport_->ToString();
+  return hostport_.ToString();
 }
 
 namespace {
@@ -557,7 +555,7 @@ Status CreateConsensusServiceProxyForHost(
     const HostPort& hostport,
     const shared_ptr<Messenger>& messenger,
     DnsResolver* dns_resolver,
-    gscoped_ptr<ConsensusServiceProxy>* new_proxy) {
+    unique_ptr<ConsensusServiceProxy>* new_proxy) {
   vector<Sockaddr> addrs;
   RETURN_NOT_OK(dns_resolver->ResolveAddresses(hostport, &addrs));
   if (addrs.size() > 1) {
@@ -578,12 +576,11 @@ RpcPeerProxyFactory::RpcPeerProxyFactory(shared_ptr<Messenger> messenger,
 }
 
 Status RpcPeerProxyFactory::NewProxy(const RaftPeerPB& peer_pb,
-                                     gscoped_ptr<PeerProxy>* proxy) {
-  gscoped_ptr<HostPort> hostport(new HostPort);
-  RETURN_NOT_OK(HostPortFromPB(peer_pb.last_known_addr(), hostport.get()));
-  gscoped_ptr<ConsensusServiceProxy> new_proxy;
+                                     unique_ptr<PeerProxy>* proxy) {
+  HostPort hostport = HostPortFromPB(peer_pb.last_known_addr());
+  unique_ptr<ConsensusServiceProxy> new_proxy;
   RETURN_NOT_OK(CreateConsensusServiceProxyForHost(
-      *hostport, messenger_, dns_resolver_, &new_proxy));
+      hostport, messenger_, dns_resolver_, &new_proxy));
   proxy->reset(new RpcPeerProxy(std::move(hostport), std::move(new_proxy)));
   return Status::OK();
 }
@@ -593,9 +590,8 @@ Status SetPermanentUuidForRemotePeer(
     DnsResolver* resolver,
     RaftPeerPB* remote_peer) {
   DCHECK(!remote_peer->has_permanent_uuid());
-  HostPort hostport;
-  RETURN_NOT_OK(HostPortFromPB(remote_peer->last_known_addr(), &hostport));
-  gscoped_ptr<ConsensusServiceProxy> proxy;
+  HostPort hostport = HostPortFromPB(remote_peer->last_known_addr());
+  unique_ptr<ConsensusServiceProxy> proxy;
   RETURN_NOT_OK(CreateConsensusServiceProxyForHost(
       hostport, messenger, resolver, &proxy));
   GetNodeInstanceRequestPB req;

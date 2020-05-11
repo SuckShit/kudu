@@ -20,10 +20,10 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -32,13 +32,10 @@
 #include "kudu/client/row_result.h"
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
-#include "kudu/gutil/ref_counted.h"
-#include "kudu/gutil/strings/strcat.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/tserver/mini_tablet_server.h"
@@ -52,7 +49,6 @@
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 DECLARE_int32(flush_threshold_mb);
 DECLARE_int32(log_segment_size_mb);
@@ -81,6 +77,8 @@ using kudu::client::sp::shared_ptr;
 using kudu::cluster::InternalMiniCluster;
 using kudu::cluster::InternalMiniClusterOptions;
 using std::string;
+using std::thread;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -107,7 +105,7 @@ class UpdateScanDeltaCompactionTest : public KuduTest {
 
   void CreateTable() {
     NO_FATALS(InitCluster());
-    gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(kTableName)
              .schema(&schema_)
              .set_range_partition_columns({ "key" })
@@ -210,7 +208,7 @@ void UpdateScanDeltaCompactionTest::InsertBaseData() {
 
   LOG_TIMING(INFO, "Insert") {
     for (int64_t key = 0; key < FLAGS_row_count; key++) {
-      gscoped_ptr<KuduInsert> insert(table_->NewInsert());
+      unique_ptr<KuduInsert> insert(table_->NewInsert());
       MakeRow(key, 0, insert->mutable_row());
       ASSERT_OK(session->Apply(insert.release()));
       ASSERT_OK(WaitForLastBatchAndFlush(key, &last_s, &last_s_cb, session));
@@ -221,44 +219,17 @@ void UpdateScanDeltaCompactionTest::InsertBaseData() {
 }
 
 void UpdateScanDeltaCompactionTest::RunThreads() {
-  vector<scoped_refptr<Thread> > threads;
-
+  vector<thread> threads;
   CountDownLatch stop_latch(1);
 
-  {
-    scoped_refptr<Thread> t;
-    ASSERT_OK(Thread::Create(CURRENT_TEST_NAME(),
-                             StrCat(CURRENT_TEST_CASE_NAME(), "-update"),
-                             &UpdateScanDeltaCompactionTest::UpdateRows, this,
-                             &stop_latch, &t));
-    threads.push_back(t);
-  }
-
-  {
-    scoped_refptr<Thread> t;
-    ASSERT_OK(Thread::Create(CURRENT_TEST_NAME(),
-                             StrCat(CURRENT_TEST_CASE_NAME(), "-scan"),
-                             &UpdateScanDeltaCompactionTest::ScanRows, this,
-                             &stop_latch, &t));
-    threads.push_back(t);
-  }
-
-  {
-    scoped_refptr<Thread> t;
-    ASSERT_OK(Thread::Create(CURRENT_TEST_NAME(),
-                             StrCat(CURRENT_TEST_CASE_NAME(), "-curl"),
-                             &UpdateScanDeltaCompactionTest::CurlWebPages, this,
-                             &stop_latch, &t));
-    threads.push_back(t);
-  }
+  threads.emplace_back([this, &stop_latch]() { this->UpdateRows(&stop_latch); });
+  threads.emplace_back([this, &stop_latch]() { this->ScanRows(&stop_latch); });
+  threads.emplace_back([this, &stop_latch]() { this->CurlWebPages(&stop_latch); });
 
   SleepFor(MonoDelta::FromSeconds(FLAGS_seconds_to_run * 1.0));
   stop_latch.CountDown();
-
-  for (const scoped_refptr<Thread>& thread : threads) {
-    ASSERT_OK(ThreadJoiner(thread.get())
-              .warn_every_ms(500)
-              .Join());
+  for (auto& t : threads) {
+    t.join();
   }
 }
 
@@ -272,7 +243,7 @@ void UpdateScanDeltaCompactionTest::UpdateRows(CountDownLatch* stop_latch) {
     last_s_cb.Run(Status::OK());
     LOG_TIMING(INFO, "Update") {
       for (int64_t key = 0; key < FLAGS_row_count && stop_latch->count() > 0; key++) {
-        gscoped_ptr<KuduUpdate> update(table_->NewUpdate());
+        unique_ptr<KuduUpdate> update(table_->NewUpdate());
         MakeRow(key, iteration, update->mutable_row());
         CHECK_OK(session->Apply(update.release()));
         CHECK_OK(WaitForLastBatchAndFlush(key, &last_s, &last_s_cb, session));

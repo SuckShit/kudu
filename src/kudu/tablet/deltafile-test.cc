@@ -27,7 +27,6 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -90,7 +89,7 @@ class TestDeltaFile : public KuduTest {
 
  public:
   void SetUp() OVERRIDE {
-    fs_manager_.reset(new FsManager(env_, GetTestPath("fs")));
+    fs_manager_.reset(new FsManager(env_, FsManagerOpts(GetTestPath("fs"))));
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
     ASSERT_OK(fs_manager_->Open());
   }
@@ -111,7 +110,7 @@ class TestDeltaFile : public KuduTest {
     // Update even numbered rows.
     faststring buf;
 
-    DeltaStats stats;
+    unique_ptr<DeltaStats> stats(new DeltaStats);
     for (int i = FLAGS_first_row_to_update; i <= FLAGS_last_row_to_update; i += 2) {
       for (int timestamp = min_timestamp; timestamp <= max_timestamp; timestamp++) {
         buf.clear();
@@ -121,10 +120,10 @@ class TestDeltaFile : public KuduTest {
         DeltaKey key(i, Timestamp(timestamp));
         RowChangeList rcl(buf);
         ASSERT_OK_FAST(dfw.AppendDelta<REDO>(key, rcl));
-        ASSERT_OK_FAST(stats.UpdateStats(key.timestamp(), rcl));
+        ASSERT_OK_FAST(stats->UpdateStats(key.timestamp(), rcl));
       }
     }
-    dfw.WriteDeltaStats(stats);
+    dfw.WriteDeltaStats(std::move(stats));
     ASSERT_OK(dfw.Finish());
   }
 
@@ -375,7 +374,7 @@ TEST_F(TestDeltaFile, TestLazyInit) {
   // Lazily opening the delta file should not trigger any reads.
   shared_ptr<DeltaFileReader> reader;
   ASSERT_OK(DeltaFileReader::OpenNoInit(
-      std::move(count_block), REDO, ReaderOptions(), &reader));
+      std::move(count_block), REDO, ReaderOptions(), /*delta_stats*/nullptr, &reader));
   ASSERT_EQ(0, bytes_read);
 
   // But initializing it should (only the first time).

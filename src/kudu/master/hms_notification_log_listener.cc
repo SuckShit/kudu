@@ -18,6 +18,7 @@
 #include "kudu/master/hms_notification_log_listener.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <ostream>
@@ -30,7 +31,6 @@
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
 
-#include "kudu/gutil/callback.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -92,7 +92,7 @@ HmsNotificationLogListenerTask::~HmsNotificationLogListenerTask() {
 Status HmsNotificationLogListenerTask::Init() {
   CHECK(!thread_) << "HmsNotificationLogListenerTask is already initialized";
   return kudu::Thread::Create("catalog manager", "hms-notification-log-listener",
-                              &HmsNotificationLogListenerTask::RunLoop, this, &thread_);
+                              [this]() { this->RunLoop(); }, &thread_);
 }
 
 void HmsNotificationLogListenerTask::Shutdown() {
@@ -131,8 +131,9 @@ void HmsNotificationLogListenerTask::RunLoop() {
 
     // Wakeup all threads which enqueued before beginning the poll.
     for (auto& cb : callback_batch) {
-      cb.Run(s);
+      cb(s);
     }
+    callback_batch.clear();
 
     {
       std::lock_guard<Mutex> l(lock_);
@@ -152,7 +153,7 @@ void HmsNotificationLogListenerTask::RunLoop() {
 
       // Swap the current queue of callbacks, so they can be completed after
       // polling next iteration.
-      callback_batch = std::move(catch_up_callbacks_);
+      callback_batch.swap(catch_up_callbacks_);
 
       // Check if shutdown was signaled while waiting.
       if (closing_) {
@@ -162,7 +163,7 @@ void HmsNotificationLogListenerTask::RunLoop() {
   }
 
   for (auto& cb : callback_batch) {
-    cb.Run(Status::ServiceUnavailable(kShutdownMessage));
+    cb(Status::ServiceUnavailable(kShutdownMessage));
   }
 }
 
@@ -250,9 +251,8 @@ Status HmsNotificationLogListenerTask::Poll() {
       }
     }
 
-    RETURN_NOT_OK_PREPEND(catalog_manager_->HmsCatalog()->GetNotificationEvents(processed_event_id,
-                                                                                batch_size,
-                                                                                &events),
+    RETURN_NOT_OK_PREPEND(catalog_manager_->hms_catalog()->GetNotificationEvents(
+        processed_event_id, batch_size, &events),
                           "failed to retrieve notification log events");
 
     for (const auto& event : events) {

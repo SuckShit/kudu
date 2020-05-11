@@ -29,7 +29,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <gflags/gflags.h>
 
 #include "kudu/gutil/dynamic_annotations.h"
@@ -64,17 +63,17 @@ DEFINE_int32(maintenance_manager_num_threads, 1,
 TAG_FLAG(maintenance_manager_num_threads, stable);
 
 DEFINE_int32(maintenance_manager_polling_interval_ms, 250,
-       "Polling interval for the maintenance manager scheduler, "
-       "in milliseconds.");
+             "Polling interval for the maintenance manager scheduler, "
+             "in milliseconds.");
 TAG_FLAG(maintenance_manager_polling_interval_ms, hidden);
 
 DEFINE_int32(maintenance_manager_history_size, 8,
-       "Number of completed operations the manager keeps track of.");
+             "Number of completed operations the manager keeps track of.");
 TAG_FLAG(maintenance_manager_history_size, hidden);
 
 DEFINE_bool(enable_maintenance_manager, true,
-       "Enable the maintenance manager, which runs flush, compaction, and "
-       "garbage collection operations on tablets.");
+            "Enable the maintenance manager, which runs flush, compaction, "
+            "and garbage collection operations on tablets.");
 TAG_FLAG(enable_maintenance_manager, unsafe);
 
 DEFINE_int64(log_target_replay_size_mb, 1024,
@@ -85,7 +84,7 @@ DEFINE_int64(log_target_replay_size_mb, 1024,
 TAG_FLAG(log_target_replay_size_mb, experimental);
 
 DEFINE_int64(data_gc_min_size_mb, 0,
-             "The (exclusive) minimum number of megabytes of ancient data on "
+             "The (exclusive) minimum number of mebibytes of ancient data on "
              "disk, per tablet, needed to prioritize deletion of that data.");
 TAG_FLAG(data_gc_min_size_mb, experimental);
 
@@ -193,8 +192,8 @@ MaintenanceManager::~MaintenanceManager() {
 Status MaintenanceManager::Start() {
   CHECK(!monitor_thread_);
   RETURN_NOT_OK(Thread::Create("maintenance", "maintenance_scheduler",
-      boost::bind(&MaintenanceManager::RunSchedulerThread, this),
-      &monitor_thread_));
+                               [this]() { this->RunSchedulerThread(); },
+                               &monitor_thread_));
   return Status::OK();
 }
 
@@ -327,31 +326,28 @@ bool MaintenanceManager::FindAndLaunchOp(std::unique_lock<Mutex>* guard) {
   LOG_AND_TRACE_WITH_PREFIX("maintenance", INFO)
       << Substitute("Scheduling $0: $1", op->name(), note);
   // Run the maintenance operation.
-  CHECK_OK(thread_pool_->SubmitFunc(boost::bind(&MaintenanceManager::LaunchOp, this, op)));
-
+  CHECK_OK(thread_pool_->Submit([this, op]() { this->LaunchOp(op); }));
   return true;
 }
 
-// Finding the best operation goes through four filters:
-// - If there's an Op that we can run quickly that frees log retention, we run it.
-// - If we've hit the overall process memory limit (note: this includes memory that the Ops cannot
-//   free), we run the Op with the highest RAM usage.
-// - If there are Ops that are retaining logs past our target replay size, we run the one that has
-//   the highest retention (and if many qualify, then we run the one that also frees up the
-//   most RAM).
-// - Finally, if there's nothing else that we really need to do, we run the Op that will improve
-//   performance the most.
+// Finding the best operation goes through some filters:
+// - If there's an Op that we can run quickly that frees log retention, run it
+//   (e.g. GCing WAL segments).
+// - If we've hit the overall process memory limit (note: this includes memory
+//   that the Ops cannot free), we run the Op that retains the most WAL
+//   segments, which will free memory (e.g. MRS or DMS flush).
+// - If there Ops that are retaining logs past our target replay size, we
+//   run the one that has the highest retention, and if many qualify, then we
+//   run the one that also frees up the most RAM (e.g. MRS or DMS flush).
+// - If there are Ops that we can run that free disk space, run whichever frees
+//   the most space (e.g. GCing ancient deltas).
+// - Finally, if there's nothing else that we really need to do, we run the Op
+//   that will improve performance the most.
 //
-// The reason it's done this way is that we want to prioritize limiting the amount of resources we
-// hold on to. Low IO Ops go first since we can quickly run them, then we can look at memory usage.
-// Reversing those can starve the low IO Ops when the system is under intense memory pressure.
-//
-// In the third priority we're at a point where nothing's urgent and there's nothing we can run
-// quickly.
-// TODO(wdberkeley) We currently optimize for freeing log retention but we could consider having
-// some sort of sliding priority between log retention and RAM usage. For example, is an Op that
-// frees 128MB of log retention and 12MB of RAM always better than an op that frees 12MB of log
-// retention and 128MB of RAM? Maybe a more holistic approach would be better.
+// In general, we want to prioritize limiting the amount of expensive resources
+// we hold onto. Low IO ops that free WAL disk space are preferred, followed by
+// ops that free memory, then ops that free data disk space, then ops that
+// improve performance.
 pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
   TRACE_EVENT0("maintenance", "MaintenanceManager::FindBestOp");
 
@@ -361,9 +357,6 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
 
   int64_t low_io_most_logs_retained_bytes = 0;
   MaintenanceOp* low_io_most_logs_retained_bytes_op = nullptr;
-
-  int64_t most_ram_anchored = 0;
-  MaintenanceOp* most_ram_anchored_op = nullptr;
 
   int64_t most_logs_retained_bytes = 0;
   int64_t most_logs_retained_bytes_ram_anchored = 0;
@@ -395,14 +388,9 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
                         op->name(), logs_retained_bytes);
     }
 
+    // We prioritize ops that can free more logs, but when it's the same we
+    // pick the one that also frees up the most memory.
     const auto ram_anchored = stats.ram_anchored();
-    if (ram_anchored > most_ram_anchored) {
-      most_ram_anchored_op = op;
-      most_ram_anchored = ram_anchored;
-    }
-
-    // We prioritize ops that can free more logs, but when it's the same we pick
-    // the one that also frees up the most memory.
     if (std::make_pair(logs_retained_bytes, ram_anchored) >
         std::make_pair(most_logs_retained_bytes,
                        most_logs_retained_bytes_ram_anchored)) {
@@ -435,13 +423,24 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
   }
 
   // Look at free memory. If it is dangerously low, we must select something
-  // that frees memory -- the op with the most anchored memory.
+  // that frees memory -- ignore the target replay size and flush whichever op
+  // anchors the most WALs (the op should also free memory).
+  //
+  // Why not select the op that frees the most memory? Such a heuristic could
+  // lead to starvation of ops that consume less memory, e.g. we might always
+  // choose to do MRS flushes even when there are small, long-lived DMSes that
+  // are anchoring WALs. Choosing the op that frees the most WALs ensures that
+  // all ops that anchor memory (and also anchor WALs) will eventually be
+  // performed.
   double capacity_pct;
-  if (memory_pressure_func_(&capacity_pct) && most_ram_anchored_op) {
-    string note = StringPrintf("under memory pressure (%.2f%% used, "
-                               "can flush %" PRIu64 " bytes)",
-                               capacity_pct, most_ram_anchored);
-    return {most_ram_anchored_op, std::move(note)};
+  if (memory_pressure_func_(&capacity_pct) && most_logs_retained_bytes_ram_anchored_op) {
+    DCHECK_GT(most_logs_retained_bytes_ram_anchored, 0);
+    string note = StringPrintf("under memory pressure (%.2f%% used), "
+                               "%" PRIu64 " bytes log retention, and flush "
+                               "%" PRIu64 " bytes memory", capacity_pct,
+                               most_logs_retained_bytes,
+                               most_logs_retained_bytes_ram_anchored);
+    return {most_logs_retained_bytes_ram_anchored_op, std::move(note)};
   }
 
   // Look at ops that free up more log retention, and also free up more memory.
@@ -453,7 +452,8 @@ pair<MaintenanceOp*, string> MaintenanceManager::FindBestOp() {
     return {most_logs_retained_bytes_ram_anchored_op, std::move(note)};
   }
 
-  // Look at ops that we can run quickly that free up data on disk.
+  // Look at ops that free up data on disk. To avoid starvation of
+  // performance-improving ops, we might skip freeing disk space.
   if (most_data_retained_bytes_op &&
       most_data_retained_bytes > FLAGS_data_gc_min_size_mb * 1024 * 1024) {
     if (!best_perf_improvement_op || best_perf_improvement <= 0 ||

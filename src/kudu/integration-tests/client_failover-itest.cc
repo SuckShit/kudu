@@ -27,7 +27,7 @@
 
 #include "kudu/client/client-test-util.h"
 #include "kudu/client/client.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/wire_protocol.h"
@@ -190,8 +190,7 @@ TEST_P(ClientFailoverParamITest, TestDeleteLeaderWhileScanning) {
 
   TServerDetails* to_add = ts_map_[cluster_->tablet_server(missing_replica_index)->uuid()];
   ASSERT_OK(AddServer(leader, tablet_id, to_add, consensus::RaftPeerPB::VOTER, kTimeout));
-  HostPort hp;
-  ASSERT_OK(HostPortFromPB(leader->registration.rpc_addresses(0), &hp));
+  HostPort hp = HostPortFromPB(leader->registration.rpc_addresses(0));
   ASSERT_OK(StartTabletCopy(to_add, tablet_id, leader->uuid(), hp, 1, kTimeout));
 
   const string& new_ts_uuid = cluster_->tablet_server(missing_replica_index)->uuid();

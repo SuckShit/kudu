@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#include "kudu/tserver/tablet_copy-test-base.h"
 
 #include <atomic>
 #include <cstdint>
@@ -27,6 +26,7 @@
 
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+#include <google/protobuf/stubs/port.h>
 #include <gtest/gtest.h>
 
 #include "kudu/common/wire_protocol.h"
@@ -38,7 +38,6 @@
 #include "kudu/fs/data_dirs.h"
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/rpc_controller.h"
@@ -46,6 +45,7 @@
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/mini_tablet_server.h"
+#include "kudu/tserver/tablet_copy-test-base.h"
 #include "kudu/tserver/tablet_copy.pb.h"
 #include "kudu/tserver/tablet_copy.proxy.h"
 #include "kudu/tserver/tablet_server.h"
@@ -71,6 +71,7 @@ using kudu::rpc::RpcController;
 using std::atomic;
 using std::string;
 using std::thread;
+using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
@@ -207,7 +208,7 @@ class TabletCopyServiceTest : public TabletCopyTest {
     return data_id;
   }
 
-  gscoped_ptr<TabletCopyServiceProxy> tablet_copy_proxy_;
+  unique_ptr<TabletCopyServiceProxy> tablet_copy_proxy_;
 };
 
 // Test beginning and ending a tablet copy session.
@@ -484,7 +485,7 @@ TEST_F(TabletCopyServiceTest, TestFetchLog) {
   int64_t size = segment->file_size();
   scratch.resize(size);
   Slice slice(scratch.data(), size);
-  ASSERT_OK(segment->readable_file()->Read(0, slice));
+  ASSERT_OK(segment->file()->Read(0, slice));
 
   AssertDataEqual(slice.data(), slice.size(), resp.chunk());
 }
@@ -509,7 +510,7 @@ TEST_F(TabletCopyServiceTest, TestSessionTimeout) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(1)); // 1 ms
-  } while (MonoTime::Now().GetDeltaSince(start_time).ToSeconds() < 10);
+  } while ((MonoTime::Now() - start_time).ToSeconds() < 10);
 
   ASSERT_FALSE(resp.session_is_active()) << "Tablet Copy session did not time out!";
 }
@@ -530,7 +531,7 @@ TEST_F(TabletCopyServiceTest, TestDiskFailureDuringSession) {
   // Copy over the block while one of the directories is failed.
   FetchDataResponsePB resp;
   RpcController controller;
-  ASSERT_OK(mini_server_->server()->fs_manager()->dd_manager()->MarkDataDirFailed(1));
+  ASSERT_OK(mini_server_->server()->fs_manager()->dd_manager()->MarkDirFailed(1));
   Status s = DoFetchData(session_id, AsDataTypeId(block_id), nullptr, nullptr, &resp, &controller);
   LOG(INFO) << "Fetch data request responded with: " << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "Unable to get piece of data block");

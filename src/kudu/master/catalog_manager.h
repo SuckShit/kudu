@@ -48,6 +48,7 @@
 #include "kudu/util/cow_object.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/oid_generator.h"
 #include "kudu/util/random.h"
 #include "kudu/util/rw_mutex.h"
@@ -97,7 +98,7 @@ class TokenSigningPublicKeyPB;
 
 namespace tserver {
 class TsTabletManagerITest_TestTableStats_Test;
-}
+} // namespace tserver
 
 namespace tablet {
 class TabletReplica;
@@ -106,6 +107,7 @@ class TabletReplica;
 namespace master {
 
 class AuthzProvider;
+class AutoRebalancerTask;
 class CatalogManagerBgTasks;
 class HmsNotificationLogListenerTask;
 class Master;
@@ -145,8 +147,8 @@ struct PersistentTabletInfo {
 // of data are in PersistentTabletInfo above, and typically accessed using
 // TabletMetadataLock. For example:
 //
-//   TabletInfo* table = ...;
-//   TabletMetadataLock l(tablet, TableMetadataLock::READ);
+//   TabletInfo* tablet = ...;
+//   TabletMetadataLock l(tablet, TabletMetadataLock::READ);
 //   if (l.data().is_running()) { ... }
 //
 // The non-persistent information about the tablet is protected by an internal
@@ -263,6 +265,7 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   explicit TableInfo(std::string table_id);
 
   std::string ToString() const;
+  uint32_t schema_version() const;
 
   // Return the table's ID. Does not require synchronization.
   const std::string& id() const { return table_id_; }
@@ -292,10 +295,14 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   // Returns true if an "Alter" operation is in-progress
   bool IsAlterInProgress(uint32_t version) const;
 
-  void AddTask(MonitoredTask *task);
-  void RemoveTask(MonitoredTask *task);
+  void AddTask(const std::string& tablet_id, const scoped_refptr<MonitoredTask>& task);
+  void RemoveTask(const std::string& tablet_id, MonitoredTask* task);
   void AbortTasks();
   void WaitTasksCompletion();
+
+  // Returns true if pending_tasks_ contains a task whose description
+  // is the same as task_description.
+  bool ContainsTask(const std::string& tablet_id, const std::string& task_description);
 
   // Allow for showing outstanding tasks in the master UI.
   void GetTaskList(std::vector<scoped_refptr<MonitoredTask> > *tasks);
@@ -326,6 +333,9 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   void UpdateMetrics(const std::string& tablet_id,
                      const tablet::ReportedTabletStatsPB& old_stats,
                      const tablet::ReportedTabletStatsPB& new_stats);
+
+  // Invalidate stats belonging to 'tablet_id' in the table's metrics.
+  void InvalidateMetrics(const std::string& tablet_id);
 
   // Remove stats belonging to 'tablet_id' from table metrics.
   void RemoveMetrics(const std::string& tablet_id,
@@ -365,8 +375,8 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
 
   CowObject<PersistentTableInfo> metadata_;
 
-  // List of pending tasks (e.g. create/alter tablet requests)
-  std::unordered_set<MonitoredTask*> pending_tasks_;
+  // Map of tablet_id to pending tasks (e.g. create/alter tablet requests).
+  std::unordered_multimap<std::string, scoped_refptr<MonitoredTask>> pending_tasks_;
 
   // Map of schema version to the number of tablets that reported that version.
   //
@@ -752,12 +762,16 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // must be initialized before calling this method.
   consensus::RaftPeerPB::Role Role() const;
 
-  hms::HmsCatalog* HmsCatalog() const {
+  hms::HmsCatalog* hms_catalog() const {
     return hms_catalog_.get();
   }
 
   master::AuthzProvider* authz_provider() const {
     return authz_provider_.get();
+  }
+
+  master::AutoRebalancerTask* auto_rebalancer() const {
+    return auto_rebalancer_.get();
   }
 
   // Returns the normalized form of the provided table name.
@@ -769,6 +783,10 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // If the HMS integration is not configured then a copy of the original table
   // name is returned.
   static std::string NormalizeTableName(const std::string& table_name);
+
+  const std::vector<HostPort>& master_addresses() const {
+    return master_addresses_;
+  }
 
  private:
   // These tests call ElectedAsLeaderCb() directly.
@@ -782,6 +800,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // This test exclusively acquires the leader_lock_ directly.
   FRIEND_TEST(kudu::client::ServiceUnavailableRetryClientTest, CreateTable);
 
+  friend class AutoRebalancerTest;
   friend class TableLoader;
   friend class TabletLoader;
 
@@ -907,7 +926,6 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   scoped_refptr<TabletInfo> CreateTabletInfo(const scoped_refptr<TableInfo>& table,
                                              const PartitionPB& partition,
                                              const boost::optional<std::string>& dimension_label);
-
 
   // Builds the TabletLocationsPB for a tablet based on the provided TabletInfo
   // and the replica type fiter specified. Populates locs_pb and returns
@@ -1101,6 +1119,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
 
   std::unique_ptr<master::AuthzProvider> authz_provider_;
 
+  std::unique_ptr<AutoRebalancerTask> auto_rebalancer_;
+
   enum State {
     kConstructed,
     kStarting,
@@ -1142,6 +1162,11 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   //
   // Always acquire this lock before state_lock_.
   RWMutex leader_lock_;
+
+  // Cached information on master addresses. It's populated in Init() since the
+  // membership of masters' Raft consensus is static (i.e. no new members are
+  // added or any existing removed).
+  std::vector<HostPort> master_addresses_;
 
   // Async operations are accessing some private methods
   // (TODO: this stuff should be deferred and done in the background thread)

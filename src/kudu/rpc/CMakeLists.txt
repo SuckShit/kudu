@@ -96,8 +96,7 @@ target_link_libraries(protoc-gen-krpc
     rpc_header_proto
     protoc
     protobuf
-    gutil
-    kudu_util)
+    gutil)
 
 #### RPC test
 PROTOBUF_GENERATE_CPP(
@@ -133,6 +132,6 @@ ADD_KUDU_TEST(periodic-test)
 ADD_KUDU_TEST(reactor-test)
 ADD_KUDU_TEST(request_tracker-test)
 ADD_KUDU_TEST(rpc-bench RUN_SERIAL true)
-ADD_KUDU_TEST(rpc-test)
+ADD_KUDU_TEST(rpc-test NUM_SHARDS 8)
 ADD_KUDU_TEST(rpc_stub-test)
 ADD_KUDU_TEST(service_queue-test RUN_SERIAL true)

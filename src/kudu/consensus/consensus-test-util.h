@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#pragma once
 
 #include <functional>
 #include <map>
@@ -24,7 +25,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <gmock/gmock.h>
 
 #include "kudu/clock/clock.h"
@@ -62,11 +62,11 @@
 namespace kudu {
 namespace consensus {
 
-inline gscoped_ptr<ReplicateMsg> CreateDummyReplicate(int64_t term,
-                                                      int64_t index,
-                                                      const Timestamp& timestamp,
-                                                      int64_t payload_size) {
-    gscoped_ptr<ReplicateMsg> msg(new ReplicateMsg);
+inline std::unique_ptr<ReplicateMsg> CreateDummyReplicate(int64_t term,
+                                                          int64_t index,
+                                                          const Timestamp& timestamp,
+                                                          int64_t payload_size) {
+    std::unique_ptr<ReplicateMsg> msg(new ReplicateMsg);
     OpId* id = msg->mutable_id();
     id->set_term(term);
     id->set_index(index);
@@ -74,7 +74,7 @@ inline gscoped_ptr<ReplicateMsg> CreateDummyReplicate(int64_t term,
     msg->set_op_type(NO_OP);
     msg->mutable_noop_request()->mutable_payload_for_tests()->resize(payload_size);
     msg->set_timestamp(timestamp.ToUint64());
-    return std::move(msg);
+    return msg;
 }
 
 // Returns RaftPeerPB with given UUID and obviously-fake hostname / port combo.
@@ -95,7 +95,7 @@ inline RaftPeerPB FakeRaftPeerPB(const std::string& uuid) {
 // TestOperationStatus::AckPeer().
 inline void AppendReplicateMessagesToQueue(
     PeerMessageQueue* queue,
-    const scoped_refptr<clock::Clock>& clock,
+    clock::Clock* clock,
     int64_t first,
     int64_t count,
     int64_t payload_size = 0) {
@@ -167,7 +167,7 @@ class TestPeerProxy : public PeerProxy {
     }
     // If the peer has been closed while a response was in-flight, this can
     // return a bad Status, but that's fine.
-    ignore_result(pool_->SubmitFunc(callback));
+    ignore_result(pool_->Submit(std::move(callback)));
   }
 
   void RegisterCallbackAndRespond(Method method, const rpc::ResponseCallback& callback) {
@@ -222,9 +222,9 @@ class DelayablePeerProxy : public TestPeerProxy {
                    rpc::RpcController* controller,
                    const rpc::ResponseCallback& callback) override {
     RegisterCallback(kUpdate, callback);
-    return proxy_->UpdateAsync(request, response, controller,
-                               boost::bind(&DelayablePeerProxy::RespondUnlessDelayed,
-                                           this, kUpdate));
+    return proxy_->UpdateAsync(
+        request, response, controller,
+        [this]() { this->RespondUnlessDelayed(kUpdate); });
   }
 
   void StartElectionAsync(const RunLeaderElectionRequestPB& /*request*/,
@@ -239,9 +239,9 @@ class DelayablePeerProxy : public TestPeerProxy {
                                  rpc::RpcController* controller,
                                  const rpc::ResponseCallback& callback) override {
     RegisterCallback(kRequestVote, callback);
-    return proxy_->RequestConsensusVoteAsync(request, response, controller,
-                                             boost::bind(&DelayablePeerProxy::RespondUnlessDelayed,
-                                                         this, kRequestVote));
+    return proxy_->RequestConsensusVoteAsync(
+        request, response, controller,
+        [this]() { this->RespondUnlessDelayed(kRequestVote); });
   }
 
   ProxyType* proxy() const {
@@ -249,7 +249,7 @@ class DelayablePeerProxy : public TestPeerProxy {
   }
 
  protected:
-  gscoped_ptr<ProxyType> const proxy_;
+  std::unique_ptr<ProxyType> const proxy_;
   bool delay_response_; // Protected by lock_.
   CountDownLatch latch_;
 };
@@ -391,7 +391,7 @@ class NoOpTestPeerProxyFactory : public PeerProxyFactory {
   }
 
   Status NewProxy(const consensus::RaftPeerPB& peer_pb,
-                  gscoped_ptr<PeerProxy>* proxy) override {
+                  std::unique_ptr<PeerProxy>* proxy) override {
     proxy->reset(new NoOpTestPeerProxy(pool_.get(), peer_pb));
     return Status::OK();
   }
@@ -477,8 +477,7 @@ class LocalTestPeerProxy : public TestPeerProxy {
                    rpc::RpcController* /*controller*/,
                    const rpc::ResponseCallback& callback) override {
     RegisterCallback(kUpdate, callback);
-    CHECK_OK(pool_->SubmitFunc(boost::bind(&LocalTestPeerProxy::SendUpdateRequest,
-                                           this, request, response)));
+    CHECK_OK(pool_->Submit([=]() { this->SendUpdateRequest(request, response); }));
   }
 
   void StartElectionAsync(const RunLeaderElectionRequestPB& /*request*/,
@@ -493,8 +492,7 @@ class LocalTestPeerProxy : public TestPeerProxy {
                                  rpc::RpcController* /*controller*/,
                                  const rpc::ResponseCallback& callback) override {
     RegisterCallback(kRequestVote, callback);
-    CHECK_OK(pool_->SubmitFunc(boost::bind(&LocalTestPeerProxy::SendVoteRequest,
-                                           this, request, response)));
+    CHECK_OK(pool_->Submit([=]() { this->SendVoteRequest(request, response); }));
   }
 
   template<class Response>
@@ -612,7 +610,7 @@ class LocalTestPeerProxyFactory : public PeerProxyFactory {
   }
 
   Status NewProxy(const consensus::RaftPeerPB& peer_pb,
-                  gscoped_ptr<PeerProxy>* proxy) override {
+                  std::unique_ptr<PeerProxy>* proxy) override {
     LocalTestPeerProxy* new_proxy = new LocalTestPeerProxy(peer_pb.permanent_uuid(),
                                                            pool_.get(),
                                                            peers_);
@@ -660,7 +658,7 @@ class TestDriver {
       return;
     }
     CHECK_OK(status);
-    CHECK_OK(pool_->SubmitFunc(boost::bind(&TestDriver::Apply, this)));
+    CHECK_OK(pool_->Submit([this]() { this->Apply(); }));
   }
 
   // Called in all modes to delete the transaction and, transitively, the consensus
@@ -675,11 +673,11 @@ class TestDriver {
   // The commit message has the exact same type of the replicate message, but
   // no content.
   void Apply() {
-    gscoped_ptr<CommitMsg> msg(new CommitMsg);
+    std::unique_ptr<CommitMsg> msg(new CommitMsg);
     msg->set_op_type(round_->replicate_msg()->op_type());
     msg->mutable_commited_op_id()->CopyFrom(round_->id());
-    CHECK_OK(log_->AsyncAppendCommit(std::move(msg),
-                                     Bind(&TestDriver::CommitCallback, Unretained(this))));
+    CHECK_OK(log_->AsyncAppendCommit(
+        std::move(msg), [this](const Status& s) { this->CommitCallback(s); }));
   }
 
   void CommitCallback(const Status& s) {
@@ -706,11 +704,10 @@ class TestTransactionFactory : public ConsensusRoundHandler {
   }
 
   Status StartFollowerTransaction(const scoped_refptr<ConsensusRound>& round) override {
-    auto txn = new TestDriver(pool_.get(), log_, round);
-    txn->round_->SetConsensusReplicatedCallback(std::bind(
-        &TestDriver::ReplicationFinished,
-        txn,
-        std::placeholders::_1));
+    // 'txn' is deleted when it completes.
+    auto* txn = new TestDriver(pool_.get(), log_, round);
+    txn->round_->SetConsensusReplicatedCallback(
+        [txn](const Status& s) { txn->ReplicationFinished(s); });
     return Status::OK();
   }
 
@@ -741,4 +738,3 @@ class TestTransactionFactory : public ConsensusRoundHandler {
 
 }  // namespace consensus
 }  // namespace kudu
-

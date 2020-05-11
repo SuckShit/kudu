@@ -14,11 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 #pragma once
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <mutex>
@@ -37,9 +37,6 @@
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/ref_counted_replicate.h"
-#include "kudu/consensus/time_manager.h"
-#include "kudu/gutil/callback.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
@@ -56,13 +53,11 @@
 namespace kudu {
 
 typedef std::lock_guard<simple_spinlock> Lock;
-typedef gscoped_ptr<Lock> ScopedLock;
+typedef std::unique_ptr<Lock> ScopedLock;
 
 class Status;
 class ThreadPool;
 class ThreadPoolToken;
-template <typename Sig>
-class Callback;
 
 namespace rpc {
 class PeriodicTimer;
@@ -76,8 +71,23 @@ class ConsensusRoundHandler;
 class PeerManager;
 class PeerProxyFactory;
 class PendingRounds;
+class TimeManager;
 struct ConsensusBootstrapInfo;
 struct ElectionResult;
+
+// Context containing resources shared by the Raft consensus instances on a
+// single server.
+struct ServerContext {
+  // Shared boolean that indicates whether the server is quiescing, in which
+  // case this replica should not attempt to become leader.
+  std::atomic<bool>* quiescing;
+
+  // Gauge indicating how many Raft tablet leaders are hosted on the server.
+  scoped_refptr<AtomicGauge<int32_t>> num_leaders;
+
+  // Threadpool on which to run Raft tasks.
+  ThreadPool* raft_pool;
+};
 
 struct ConsensusOptions {
   std::string tablet_id;
@@ -93,7 +103,8 @@ struct TabletVotingState {
 };
 
 typedef int64_t ConsensusTerm;
-typedef StdStatusCallback ConsensusReplicatedCallback;
+typedef StatusCallback ConsensusReplicatedCallback;
+typedef std::function<void(const std::string& reason)> MarkDirtyCallback;
 
 class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
                       public enable_make_shared<RaftConsensus>,
@@ -138,7 +149,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   static Status Create(ConsensusOptions options,
                        RaftPeerPB local_peer_pb,
                        scoped_refptr<ConsensusMetadataManager> cmeta_manager,
-                       ThreadPool* raft_pool,
+                       ServerContext server_ctx,
                        std::shared_ptr<RaftConsensus>* consensus_out);
 
   // Starts running the Raft consensus algorithm.
@@ -147,10 +158,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   Status Start(const ConsensusBootstrapInfo& info,
                std::unique_ptr<PeerProxyFactory> peer_proxy_factory,
                scoped_refptr<log::Log> log,
-               scoped_refptr<TimeManager> time_manager,
+               std::unique_ptr<TimeManager> time_manager,
                ConsensusRoundHandler* round_handler,
                const scoped_refptr<MetricEntity>& metric_entity,
-               Callback<void(const std::string& reason)> mark_dirty_clbk);
+               MarkDirtyCallback cb);
 
   // Returns true if RaftConsensus is running.
   bool IsRunning() const;
@@ -159,7 +170,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // in the configuration by sending a NO_OP to other peers.
   // This is NOT safe to use in a distributed configuration with failure detection
   // enabled, as it could result in a split-brain scenario.
-  Status EmulateElection();
+  Status EmulateElectionForTests();
 
   // Triggers a leader election.
   Status StartElection(ElectionMode mode, ElectionReason reason);
@@ -204,7 +215,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // (and later on the CommitMsg). ConsensusRound will also point to and
   // increase the reference count for the provided callbacks.
   scoped_refptr<ConsensusRound> NewRound(
-      gscoped_ptr<ReplicateMsg> replicate_msg,
+      std::unique_ptr<ReplicateMsg> replicate_msg,
       ConsensusReplicatedCallback replicated_cb);
 
   // Called by a Leader to replicate an entry to the state machine.
@@ -287,12 +298,12 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   // Implement a ChangeConfig() request.
   Status ChangeConfig(const ChangeConfigRequestPB& req,
-                      StdStatusCallback client_cb,
+                      StatusCallback client_cb,
                       boost::optional<tserver::TabletServerErrorPB::Code>* error_code);
 
   // Implement a BulkChangeConfig() request.
   Status BulkChangeConfig(const BulkChangeConfigRequestPB& req,
-                          StdStatusCallback client_cb,
+                          StatusCallback client_cb,
                           boost::optional<tserver::TabletServerErrorPB::Code>* error_code);
 
   // Implement an UnsafeChangeConfig() request.
@@ -318,7 +329,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // Thread-safe.
   const std::string& tablet_id() const;
 
-  scoped_refptr<TimeManager> time_manager() const { return time_manager_; }
+  TimeManager* time_manager() const { return time_manager_.get(); }
 
   // Returns a copy of the state of the consensus system.
   // If 'report_health' is set to 'INCLUDE_HEALTH_REPORT', and if the
@@ -389,7 +400,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   RaftConsensus(ConsensusOptions options,
                 RaftPeerPB local_peer_pb,
                 scoped_refptr<ConsensusMetadataManager> cmeta_manager,
-                ThreadPool* raft_pool);
+                ServerContext server_ctx);
 
  private:
   friend class RaftConsensusQuorumTest;
@@ -457,6 +468,13 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   using LockGuard = std::lock_guard<simple_spinlock>;
   using UniqueLock = std::unique_lock<simple_spinlock>;
 
+  // Returns string description for State enum value.
+  static const char* State_Name(State state);
+
+  // Return the minimum election timeout. Due to backoff and random
+  // jitter, election timeouts may be longer than this.
+  static MonoDelta MinimumElectionTimeout();
+
   // Initializes the RaftConsensus object, including loading the consensus
   // metadata.
   Status Init();
@@ -464,9 +482,6 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // Change the lifecycle state of RaftConsensus. The definition of the State
   // enum documents legal state transitions.
   void SetStateUnlocked(State new_state);
-
-  // Returns string description for State enum value.
-  static const char* State_Name(State state);
 
   // Set the leader UUID of the configuration and mark the tablet config dirty for
   // reporting to the master.
@@ -478,7 +493,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   Status ReplicateConfigChangeUnlocked(
       RaftConfigPB old_config,
       RaftConfigPB new_config,
-      StdStatusCallback client_cb);
+      StatusCallback client_cb);
 
   // Update the peers and queue to be consistent with a new active configuration.
   // Should only be called by the leader.
@@ -548,7 +563,11 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // Returns true if this node is the only voter in the Raft configuration.
   bool IsSingleVoterConfig() const;
 
-  // Return header string for RequestVote log messages. 'lock_' must be held.
+  // Return header string for RequestVote log messages, no 'lock_' is necessary.
+  std::string GetRequestVoteLogPrefixThreadSafe(const VoteRequestPB& request) const;
+
+  // Similar to the method above, but outputs more detailed information on the
+  // metadata of the RaftConsensus object. 'lock_' must be held.
   std::string GetRequestVoteLogPrefixUnlocked(const VoteRequestPB& request) const;
 
   // Fills the response with the current status, if an update was successful.
@@ -564,11 +583,23 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // - Set vote_granted to true.
   void FillVoteResponseVoteGranted(VoteResponsePB* response);
 
+  // Enum for the 'responder_term' parameter of the FillVoterResponseVoteDenied()
+  // method below. Controls whether to populate the 'responder_term' field
+  // in the 'response' output parameter.
+  enum class ResponderTermPolicy {
+    DO_NOT_SET,  // don't set the field
+    SET,          // populate/set the field
+  };
+
   // Fill VoteResponsePB with the following information:
-  // - Update responder_term to current local term.
   // - Set vote_granted to false.
   // - Set consensus_error.code to the given code.
-  void FillVoteResponseVoteDenied(ConsensusErrorPB::Code error_code, VoteResponsePB* response);
+  // - Set or leave the responder_term field unset as prescribed by the
+  //   'responder_term' parameter.
+  void FillVoteResponseVoteDenied(
+      ConsensusErrorPB::Code error_code,
+      VoteResponsePB* response,
+      ResponderTermPolicy responder_term_policy = ResponderTermPolicy::SET);
 
   // Respond to VoteRequest that the candidate has an old term.
   Status RequestVoteRespondInvalidTerm(const VoteRequestPB* request, VoteResponsePB* response);
@@ -605,19 +636,24 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   void ElectionCallback(ElectionReason reason, const ElectionResult& result);
   void DoElectionCallback(ElectionReason reason, const ElectionResult& result);
 
-  // Start tracking the leader for failures. This typically occurs at startup
-  // and when the local peer steps down as leader.
+  // Starts tracking the leader for failures. This occurs at startup, when a
+  // local peer transitions from LEADER to FOLLOWER or from NON_VOTER to VOTER,
+  // or after a failed election.
+  //
+  // If the failure detector is "snoozed" (see SnoozeFailureDetector()), it
+  // means some leader activity was observed and the failure detection period
+  // should be reset.
   //
   // If 'delta' is set, it is used as the initial period for leader failure
   // detection. Otherwise, the minimum election timeout is used.
   //
-  // If the failure detector is already registered, has no effect.
-  void EnableFailureDetector(boost::optional<MonoDelta> delta);
+  // If the failure detector is already enabled, this has no effect.
+  void EnableFailureDetector(boost::optional<MonoDelta> delta = boost::none);
 
-  // Stop tracking the current leader for failures. This typically occurs when
-  // the local peer becomes leader.
+  // Stops tracking the leader for failures. This occurs when a local peer
+  // transitions from FOLLOWER to LEADER or from VOTER to NON_VOTER.
   //
-  // If the failure detector is already disabled, has no effect.
+  // If the failure detector is already disabled, this has no effect.
   void DisableFailureDetector();
 
   // Enables or disables the failure detector based on the role of the local
@@ -647,11 +683,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // election timeout interval, i.e. 'FLAGS_raft_heartbeat_interval_ms' *
   // 'FLAGS_leader_failure_max_missed_heartbeat_periods' milliseconds.
   // This method is safe to call even it's a leader replica.
-  void WithholdVotesUnlocked();
-
-  // Return the minimum election timeout. Due to backoff and random
-  // jitter, election timeouts may be longer than this.
-  MonoDelta MinimumElectionTimeout() const;
+  void WithholdVotes();
 
   // Calculates a snooze delta for leader election.
   //
@@ -674,7 +706,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // Calls MarkDirty() if 'status' == OK. Then, always calls 'client_cb' with
   // 'status' as its argument.
   void MarkDirtyOnSuccess(const std::string& reason,
-                          const StdStatusCallback& client_cb,
+                          const StatusCallback& client_cb,
                           const Status& status);
 
   // Attempt to remove the follower with the specified 'uuid' from the config,
@@ -719,7 +751,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   //
   // NOTE: Must be called while holding 'lock_'.
   void NonTxRoundReplicationFinished(ConsensusRound* round,
-                                     const StdStatusCallback& client_cb,
+                                     const StatusCallback& client_cb,
                                      const Status& status);
 
   // As a leader, append a new ConsensusRound to the queue.
@@ -768,7 +800,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
                                 FlushToDisk flush) WARN_UNUSED_RESULT;
 
   // Returns the term set in the last config change round.
-  const int64_t CurrentTermUnlocked() const;
+  int64_t CurrentTermUnlocked() const;
 
   // Accessors for the leader of the current term.
   std::string GetLeaderUuidUnlocked() const;
@@ -776,7 +808,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   void ClearLeaderUnlocked();
 
   // Return whether this peer has voted in the current term.
-  const bool HasVotedCurrentTermUnlocked() const;
+  bool HasVotedCurrentTermUnlocked() const;
 
   // Record replica's vote for the current term, then flush the consensus
   // metadata to disk.
@@ -812,7 +844,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // Consensus metadata service.
   const scoped_refptr<ConsensusMetadataManager> cmeta_manager_;
 
-  ThreadPool* const raft_pool_;
+  // State shared by Raft instances on a given server.
+  const ServerContext server_ctx_;
 
   // TODO(dralves) hack to serialize updates due to repeated/out-of-order messages
   // should probably be refactored out.
@@ -833,7 +866,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   std::unique_ptr<ThreadPoolToken> raft_pool_token_;
 
   scoped_refptr<log::Log> log_;
-  scoped_refptr<TimeManager> time_manager_;
+  std::unique_ptr<TimeManager> time_manager_;
   std::unique_ptr<PeerProxyFactory> peer_proxy_factory_;
 
   // When we receive a message from a remote peer telling us to start a
@@ -859,26 +892,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   boost::optional<std::string> designated_successor_uuid_;
   std::shared_ptr<rpc::PeriodicTimer> transfer_period_timer_;
 
-  // Lock held while starting a failure-triggered election.
-  //
-  // After reporting a failure and asynchronously starting an election, the
-  // failure detector immediately rearms. If the election starts slowly (i.e.
-  // there's a lot of contention on the consensus lock, or persisting votes is
-  // really slow due to other I/O), more elections may start and "stack" on
-  // top of the first. Forcing the starting of elections to serialize on this
-  // lock prevents that from happening. See KUDU-2149 for more details.
-  //
-  // Note: the lock is only ever acquired via try_lock(); if it cannot be
-  // acquired, a StartElection() is in progress so the next one is skipped.
-  //
-  // TODO(KUDU-2155): should be replaced with explicit disabling/enabling of
-  // the failure detector during elections.
-  simple_spinlock failure_detector_election_lock_;
-
-  // If any RequestVote() RPC arrives before this timestamp,
-  // the request will be ignored. This prevents abandoned or partitioned
-  // nodes from disturbing the healthy leader.
-  MonoTime withhold_votes_until_;
+  // Any RequestVote() arriving before this timestamp is ignored (i.e. responded
+  // to with NO vote). This prevents abandoned or partitioned nodes from
+  // disturbing the healthy leader.
+  std::atomic<MonoTime> withhold_votes_until_;
 
   // The last OpId received from the current leader. This is updated whenever the follower
   // accepts operations from a leader, and passed back so that the leader knows from what
@@ -890,7 +907,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // This is used to calculate back-off of the election timeout.
   int64_t failed_elections_since_stable_leader_;
 
-  Callback<void(const std::string& reason)> mark_dirty_clbk_;
+  MarkDirtyCallback mark_dirty_clbk_;
 
   // A flag to help us avoid taking a lock on the reactor thread if the object
   // is already in kShutdown state.
@@ -900,13 +917,17 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // The number of times Update() has been called, used for some test assertions.
   AtomicInt<int32_t> update_calls_for_tests_;
 
-  FunctionGaugeDetacher metric_detacher_;
-
+  // The wrapping into std::atomic<> is to simplify the synchronization between
+  // consensus-related writers and readers of the attached metric gauge.
   std::atomic<int64_t> last_leader_communication_time_micros_;
 
   scoped_refptr<Counter> follower_memory_pressure_rejections_;
   scoped_refptr<AtomicGauge<int64_t>> term_metric_;
   scoped_refptr<AtomicGauge<int64_t>> num_failed_elections_metric_;
+
+  // NOTE: it's important that this is the first member to be destructed. This
+  // ensures we do not attempt to collect metrics while calling the destructor.
+  FunctionGaugeDetacher metric_detacher_;
 
   DISALLOW_COPY_AND_ASSIGN(RaftConsensus);
 };
@@ -981,7 +1002,7 @@ class ConsensusRound : public RefCountedThreadSafe<ConsensusRound> {
   // Ctor used for leader transactions. Leader transactions can and must specify the
   // callbacks prior to initiating the consensus round.
   ConsensusRound(RaftConsensus* consensus,
-                 gscoped_ptr<ReplicateMsg> replicate_msg,
+                 std::unique_ptr<ReplicateMsg> replicate_msg,
                  ConsensusReplicatedCallback replicated_cb);
 
   // Ctor used for follower/learner transactions. These transactions do not use the

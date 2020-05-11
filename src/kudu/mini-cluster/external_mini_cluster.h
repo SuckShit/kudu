@@ -25,12 +25,13 @@
 #include <memory>
 #include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <boost/optional/optional.hpp>
 #include <glog/logging.h>
 
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/common/common.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
@@ -71,9 +72,9 @@ namespace rpc {
 class Messenger;
 } // namespace rpc
 
-namespace sentry {
-class MiniSentry;
-} // namespace sentry
+namespace ranger {
+class MiniRanger;
+} // namespace ranger
 
 namespace server {
 class ServerStatusPB;
@@ -91,6 +92,35 @@ class ExternalTabletServer;
 
 // Location --> number of tablet servers in location.
 typedef std::map<std::string, int> LocationInfo;
+
+#if !defined(NO_CHRONY)
+// The enumeration below describes the way Kudu's built-in NTP client is
+// configured given the set of dedicated NTP servers run by the mini-cluster.
+enum class BuiltinNtpConfigMode {
+  // Each server (master/tserver) uses all available NTP servers for its
+  // built-in NTP client. For example, given 3 tservers and 2 NTP servers:
+  //
+  // tserver index | NTP server indices
+  // ----------------------------------
+  //   0           |  0 1
+  //   1           |  0 1
+  //   2           |  0 1
+  ALL_SERVERS,
+
+  // Each server (master/tserver) uses a single NTP server. The assignment runs
+  // in a round-robin manner. For example, given 5 tservers and 2 NTP servers:
+  //
+  // tserver index | NTP server indices
+  // ----------------------------------
+  //   0           |  0
+  //   1           |  1
+  //   2           |  0
+  //   3           |  1
+  //   4           |  0
+  //
+  ROUND_ROBIN_SINGLE_SERVER,
+};
+#endif
 
 struct ExternalMiniClusterOptions {
   ExternalMiniClusterOptions();
@@ -160,10 +190,10 @@ struct ExternalMiniClusterOptions {
   // Default: HmsMode::NONE.
   HmsMode hms_mode;
 
-  // If true, set up a Sentry service as part of this ExternalMiniCluster.
+  // If true, set up a Ranger service as part of this ExternalMiniCluster.
   //
   // Default: false.
-  bool enable_sentry;
+  bool enable_ranger;
 
   // If true, sends logging output to stderr instead of a log file.
   //
@@ -198,6 +228,12 @@ struct ExternalMiniClusterOptions {
   //
   // Default: 0
   int num_ntp_servers;
+
+  // Mapping of NTP servers to built-in NTP client for each Kudu server.
+  // This parameter is effective iff num_ntp_servers > 0.
+  //
+  // Default: BuiltinNtpConfigMode::ALL_SERVERS
+  BuiltinNtpConfigMode ntp_config_mode;
 #endif // #if !defined(NO_CHRONY) ...
 };
 
@@ -245,7 +281,7 @@ class ExternalMiniCluster : public MiniCluster {
   // Same as above but for a master.
   std::string GetBindIpForMaster(int index) const;
 
-  // Same as above but for a external server, e.g. Sentry service or Hive Metastore.
+  // Same as above but for a external server, e.g. Ranger service or Hive Metastore.
   std::string GetBindIpForExternalServer(int index) const;
 
   // Return a pointer to the running leader master. This may be NULL
@@ -310,8 +346,8 @@ class ExternalMiniCluster : public MiniCluster {
     return hms_.get();
   }
 
-  sentry::MiniSentry* sentry() const {
-    return sentry_.get();
+  ranger::MiniRanger* ranger() const {
+    return ranger_.get();
   }
 
   const std::string& cluster_root() const {
@@ -427,12 +463,12 @@ class ExternalMiniCluster : public MiniCluster {
  private:
   Status StartMasters();
 
-  Status StartSentry();
-  Status StopSentry();
-
   Status DeduceBinRoot(std::string* ret);
   Status HandleOptions();
-  Status AddTimeSourceFlags(std::vector<std::string>* flags);
+
+  // Add flags related to time source and clock for the daemon at index 'idx'.
+  // The time source flags are appended to the 'flags' in-out parameter.
+  Status AddTimeSourceFlags(int idx, std::vector<std::string>* flags);
 
   ExternalMiniClusterOptions opts_;
 
@@ -443,7 +479,7 @@ class ExternalMiniCluster : public MiniCluster {
 #endif
   std::unique_ptr<MiniKdc> kdc_;
   std::unique_ptr<hms::MiniHms> hms_;
-  std::unique_ptr<sentry::MiniSentry> sentry_;
+  std::unique_ptr<ranger::MiniRanger> ranger_;
 
   std::shared_ptr<rpc::Messenger> messenger_;
 
@@ -610,6 +646,11 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   HostPort bound_rpc_;
   HostPort bound_http_;
 
+  // ID of the thread that is spawning the child processes. This should not
+  // change across restarts of the daemon, as forking from different threads
+  // may yield behavior like daemons being killed when the new thread exits.
+  const std::thread::id parent_tid_;
+
   DISALLOW_COPY_AND_ASSIGN(ExternalDaemon);
 };
 
@@ -655,9 +696,8 @@ class ExternalMaster : public ExternalDaemon {
       WaitMode wait_mode = DONT_WAIT_FOR_LEADERSHIP) WARN_UNUSED_RESULT;
 
  private:
-  std::vector<std::string> GetCommonFlags() const;
-
   friend class RefCountedThreadSafe<ExternalMaster>;
+  static const std::vector<std::string>& GetCommonFlags();
   virtual ~ExternalMaster();
 };
 

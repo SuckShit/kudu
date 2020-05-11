@@ -18,26 +18,24 @@
 #include "kudu/tools/ksck_remote.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include <boost/core/ref.hpp>
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/data_gen_util.h"
@@ -60,7 +58,6 @@
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 DECLARE_bool(checksum_scan);
 DECLARE_bool(consensus);
@@ -89,6 +86,7 @@ using kudu::client::KuduTableCreator;
 using kudu::client::sp::shared_ptr;
 using kudu::cluster::InternalMiniCluster;
 using kudu::cluster::InternalMiniClusterOptions;
+using std::thread;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -126,7 +124,7 @@ class RemoteKsckTest : public KuduTest {
     ASSERT_OK(mini_cluster_->CreateClient(nullptr, &client_));
 
     // Create one table.
-    gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     ASSERT_OK(table_creator->table_name(kTableName)
@@ -159,8 +157,6 @@ class RemoteKsckTest : public KuduTest {
   }
 
   // Writes rows to the table until the continue_writing flag is set to false.
-  //
-  // Public for use with boost::bind.
   void GenerateRowWritesLoop(CountDownLatch* started_writing,
                              const AtomicBool& continue_writing,
                              Promise<Status>* promise) {
@@ -182,7 +178,7 @@ class RemoteKsckTest : public KuduTest {
     }
 
     for (uint64_t i = 0; continue_writing.Load(); i++) {
-      gscoped_ptr<KuduInsert> insert(table->NewInsert());
+      unique_ptr<KuduInsert> insert(table->NewInsert());
       GenerateDataForRow(table->schema(), i, &random_, insert->mutable_row());
       status = session->Apply(insert.release());
       if (!status.ok()) {
@@ -425,20 +421,18 @@ TEST_F(RemoteKsckTest, TestChecksumSnapshot) {
   CountDownLatch started_writing(1);
   AtomicBool continue_writing(true);
   Promise<Status> promise;
-  scoped_refptr<Thread> writer_thread;
 
   // Allow the checksum scan to wait for longer in case it takes a while for the
   // writer thread to advance safe time.
   FLAGS_scanner_max_wait_ms = 10000;
 
-  Thread::Create("RemoteKsckTest", "TestChecksumSnapshot",
-                 &RemoteKsckTest::GenerateRowWritesLoop, this,
-                 &started_writing, boost::cref(continue_writing), &promise,
-                 &writer_thread);
+  thread writer_thread([&]() {
+    this->GenerateRowWritesLoop(&started_writing, continue_writing, &promise);
+  });
   {
     SCOPED_CLEANUP({
       continue_writing.Store(false);
-      writer_thread->Join();
+      writer_thread.join();
     });
     started_writing.Wait();
 
@@ -469,20 +463,18 @@ TEST_F(RemoteKsckTest, TestChecksumSnapshotCurrentTimestamp) {
   CountDownLatch started_writing(1);
   AtomicBool continue_writing(true);
   Promise<Status> promise;
-  scoped_refptr<Thread> writer_thread;
 
   // Allow the checksum scan to wait for longer in case it takes a while for the
   // writer thread to advance safe time.
   FLAGS_scanner_max_wait_ms = 10000;
 
-  Thread::Create("RemoteKsckTest", "TestChecksumSnapshotCurrentTimestamp",
-                 &RemoteKsckTest::GenerateRowWritesLoop, this,
-                 &started_writing, boost::cref(continue_writing), &promise,
-                 &writer_thread);
+  thread writer_thread([&]() {
+    this->GenerateRowWritesLoop(&started_writing, continue_writing, &promise);
+  });
   {
     SCOPED_CLEANUP({
       continue_writing.Store(false);
-      writer_thread->Join();
+      writer_thread.join();
     });
     started_writing.Wait();
 

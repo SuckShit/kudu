@@ -25,7 +25,6 @@
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -153,9 +152,9 @@ TEST_F(PasswdWebserverTest, TestPasswdMissing) {
 }
 
 TEST_F(PasswdWebserverTest, TestPasswdPresent) {
-  string auth_url = Substitute("http://$0@$1/", security::kTestAuthString,
-                               addr_.ToString());
-  ASSERT_OK(curl_.FetchURL(auth_url, &buf_));
+  ASSERT_OK(curl_.set_auth(CurlAuthType::DIGEST, security::kTestAuthUsername,
+                           security::kTestAuthPassword));
+  ASSERT_OK(curl_.FetchURL(addr_.ToString(), &buf_));
 }
 
 
@@ -177,7 +176,7 @@ class SpnegoWebserverTest : public WebserverTest {
   }
 
   Status DoSpnegoCurl() {
-    curl_.set_use_spnego(true);
+    curl_.set_auth(CurlAuthType::SPNEGO);
     if (VLOG_IS_ON(1)) {
       curl_.set_verbose(true);
     }
@@ -239,7 +238,11 @@ TEST_F(SpnegoWebserverTest, TestInvalidHeaders) {
   EXPECT_STR_CONTAINS(buf_.ToString(), "bad Negotiate header");
   EXPECT_EQ(curl_.FetchURL(url_, &buf_, { "Authorization: Negotiate aaa" }).ToString(),
             "Remote error: HTTP 401");
-  EXPECT_STR_CONTAINS(buf_.ToString(), "Invalid token was supplied");
+  EXPECT_STR_CONTAINS(buf_.ToString(), "Not authorized");
+  // Error messages about an invalid token come from the Kerberos library, and
+  // different versions of the library have different messages.
+  ASSERT_STR_MATCHES(buf_.ToString(),
+                     "(Invalid token was supplied|A token was invalid)");
 }
 
 // Test that if no authorization header at all is provided, the response

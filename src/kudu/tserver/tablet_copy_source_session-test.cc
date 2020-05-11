@@ -14,9 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#include "kudu/tablet/tablet-test-util.h"
+
+#include "kudu/tserver/tablet_copy_source_session.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -26,7 +28,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/clock/clock.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
@@ -43,22 +44,19 @@
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/bind.h"
-#include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/fastmem.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet-test-util.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/transactions/transaction.h"
 #include "kudu/tablet/transactions/write_transaction.h"
 #include "kudu/tserver/tablet_copy.pb.h"
-#include "kudu/tserver/tablet_copy_source_session.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/crc.h"
@@ -134,7 +132,10 @@ class TabletCopyTest : public KuduTabletTest {
  protected:
   void SetUpTabletReplica() {
     scoped_refptr<Log> log;
-    ASSERT_OK(Log::Open(LogOptions(), fs_manager(), tablet()->tablet_id(),
+    ASSERT_OK(Log::Open(LogOptions(),
+                        fs_manager(),
+                        /*file_cache=*/ nullptr,
+                        tablet()->tablet_id(),
                         *tablet()->schema(),
                         /*schema_version=*/ 0,
                         /*metric_entity=*/ nullptr,
@@ -156,15 +157,18 @@ class TabletCopyTest : public KuduTabletTest {
         new ConsensusMetadataManager(fs_manager()));
     ASSERT_OK(cmeta_manager->Create(tablet()->tablet_id(), config, kMinimumTerm));
 
+    const auto& tablet_id = tablet()->tablet_id();
     tablet_replica_.reset(
         new TabletReplica(tablet()->metadata(),
                           cmeta_manager,
                           *config_peer,
                           apply_pool_.get(),
-                          Bind(&TabletCopyTest::TabletReplicaStateChangedCallback,
-                               Unretained(this),
-                               tablet()->tablet_id())));
-    ASSERT_OK(tablet_replica_->Init(raft_pool_.get()));
+                          [this, tablet_id](const string& reason) {
+                            this->TabletReplicaStateChangedCallback(tablet_id, reason);
+                          }));
+    ASSERT_OK(tablet_replica_->Init({ /*quiescing*/nullptr,
+                                      /*num_leaders*/nullptr,
+                                      raft_pool_.get() }));
 
     shared_ptr<Messenger> messenger;
     MessengerBuilder mbuilder(CURRENT_TEST_NAME());
@@ -211,7 +215,7 @@ class TabletCopyTest : public KuduTabletTest {
                                             &req,
                                             nullptr, // No RequestIdPB
                                             &resp));
-      state->set_completion_callback(gscoped_ptr<tablet::TransactionCompletionCallback>(
+      state->set_completion_callback(unique_ptr<tablet::TransactionCompletionCallback>(
           new tablet::LatchTransactionCompletionCallback<WriteResponsePB>(&latch, &resp)));
       ASSERT_OK(tablet_replica_->SubmitWrite(std::move(state)));
       latch.Wait();

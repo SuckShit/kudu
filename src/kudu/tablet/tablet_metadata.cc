@@ -18,10 +18,10 @@
 #include "kudu/tablet/tablet_metadata.h"
 
 #include <algorithm>
+#include <functional>
 #include <mutex>
 #include <ostream>
 #include <string>
-#include <type_traits>
 
 #include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
@@ -37,7 +37,6 @@
 #include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/atomicops.h"
-#include "kudu/gutil/bind.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
@@ -301,7 +300,7 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id,
       num_flush_pins_(0),
       needs_flush_(false),
       flush_count_for_tests_(0),
-      pre_flush_callback_(Bind(DoNothingStatusClosure)),
+      pre_flush_callback_(&DoNothingStatusClosure),
       supports_live_row_count_(supports_live_row_count) {
   CHECK(schema_->has_column_ids());
   CHECK_GT(schema_->num_key_columns(), 0);
@@ -321,7 +320,7 @@ TabletMetadata::TabletMetadata(FsManager* fs_manager, string tablet_id)
       num_flush_pins_(0),
       needs_flush_(false),
       flush_count_for_tests_(0),
-      pre_flush_callback_(Bind(DoNothingStatusClosure)),
+      pre_flush_callback_(&DoNothingStatusClosure),
       supports_live_row_count_(false) {}
 
 Status TabletMetadata::LoadFromDisk() {
@@ -368,7 +367,7 @@ Status TabletMetadata::LoadFromSuperBlock(const TabletSuperBlockPB& superblock) 
     table_name_ = superblock.table_name();
 
     uint32_t schema_version = superblock.schema_version();
-    gscoped_ptr<Schema> schema(new Schema());
+    unique_ptr<Schema> schema(new Schema());
     RETURN_NOT_OK_PREPEND(SchemaFromPB(superblock.schema(), schema.get()),
                           "Failed to parse Schema from superblock " +
                           SecureShortDebugString(superblock));
@@ -581,7 +580,7 @@ Status TabletMetadata::Flush() {
     // is persisted. See KUDU-701 for details.
     orphaned.assign(orphaned_blocks_.begin(), orphaned_blocks_.end());
   }
-  pre_flush_callback_.Run();
+  pre_flush_callback_();
   RETURN_NOT_OK(ReplaceSuperBlockUnlocked(pb));
   TRACE("Metadata flushed");
   l_flush.Unlock();
@@ -757,12 +756,12 @@ RowSetMetadata *TabletMetadata::GetRowSetForTests(int64_t id) {
 }
 
 void TabletMetadata::SetSchema(const Schema& schema, uint32_t version) {
-  gscoped_ptr<Schema> new_schema(new Schema(schema));
+  unique_ptr<Schema> new_schema(new Schema(schema));
   std::lock_guard<LockType> l(data_lock_);
   SetSchemaUnlocked(std::move(new_schema), version);
 }
 
-void TabletMetadata::SetSchemaUnlocked(gscoped_ptr<Schema> new_schema, uint32_t version) {
+void TabletMetadata::SetSchemaUnlocked(unique_ptr<Schema> new_schema, uint32_t version) {
   DCHECK(new_schema->has_column_ids());
 
   Schema* old_schema = schema_;

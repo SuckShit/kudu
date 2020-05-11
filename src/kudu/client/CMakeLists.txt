@@ -34,8 +34,10 @@ set(CLIENT_SRCS
   client.cc
   client_builder-internal.cc
   client-internal.cc
+  columnar_scan_batch.cc
   error_collector.cc
   error-internal.cc
+  hash.cc
   master_rpc.cc
   master_proxy_rpc.cc
   meta_cache.cc
@@ -176,6 +178,8 @@ install(TARGETS kudu_client_exported
 install(FILES
   callbacks.h
   client.h
+  columnar_scan_batch.h
+  hash.h
   row_result.h
   scan_batch.h
   scan_predicate.h

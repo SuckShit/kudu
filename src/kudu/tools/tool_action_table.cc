@@ -17,11 +17,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -41,7 +43,7 @@
 #include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_predicate.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/value.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
@@ -273,6 +275,7 @@ Status LocateRow(const RunnerContext& context) {
       case KuduColumnSchema::INT16:
       case KuduColumnSchema::INT32:
       case KuduColumnSchema::INT64:
+      case KuduColumnSchema::DATE:
       case KuduColumnSchema::UNIXTIME_MICROS: {
         int64_t value;
         RETURN_NOT_OK_PREPEND(
@@ -563,6 +566,14 @@ Status ConvertToKuduPartialRow(
         RETURN_NOT_OK(range_bound_partial_row->SetInt64(col_name, value));
         break;
       }
+      case KuduColumnSchema::DATE: {
+        int32_t value;
+        RETURN_NOT_OK_PREPEND(
+            reader.ExtractInt32(values[i], /*field=*/nullptr, &value),
+            error_msg);
+        RETURN_NOT_OK(range_bound_partial_row->SetDate(col_name, value));
+        break;
+      }
       case KuduColumnSchema::UNIXTIME_MICROS: {
         int64_t value;
         RETURN_NOT_OK_PREPEND(
@@ -619,8 +630,7 @@ Status ModifyRangePartition(const RunnerContext& context, PartitionAction action
 
   const auto convert_bounds_type = [&] (const string& range_bound,
                                         const string& flags_range_bound_type,
-                                        KuduTableCreator::RangePartitionBound* range_bound_type)
-      -> Status {
+                                        KuduTableCreator::RangePartitionBound* range_bound_type) {
     string inclusive_bound = boost::iequals(flags_range_bound_type, "INCLUSIVE_BOUND") ?
         "INCLUSIVE_BOUND" : "";
     string exclusive_bound = boost::iequals(flags_range_bound_type, "EXCLUSIVE_BOUND") ?
@@ -715,6 +725,7 @@ Status ParseValueOfType(const string& default_value,
     case KuduColumnSchema::DataType::INT16:
     case KuduColumnSchema::DataType::INT32:
     case KuduColumnSchema::DataType::INT64:
+    case KuduColumnSchema::DataType::DATE:
     case KuduColumnSchema::DataType::UNIXTIME_MICROS: {
       int64_t int_value;
       RETURN_NOT_OK_PREPEND(
@@ -996,8 +1007,12 @@ Status ParseTableSchema(const SchemaPB& schema,
         column.column_type(), &type));
     spec->Type(type);
     if (column.has_type_attributes()) {
-      spec->Precision(column.type_attributes().precision());
-      spec->Scale(column.type_attributes().scale());
+      if (type == KuduColumnSchema::DataType::DECIMAL) {
+        spec->Precision(column.type_attributes().precision());
+        spec->Scale(column.type_attributes().scale());
+      } else if (type == KuduColumnSchema::DataType::VARCHAR) {
+        spec->Length(column.type_attributes().length());
+      }
     }
     if (!column.is_nullable()) {
       spec->NotNull();

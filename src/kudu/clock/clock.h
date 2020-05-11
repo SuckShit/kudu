@@ -40,7 +40,7 @@ namespace clock {
 //     i.e. for any two calls, i.e. Now returns timestamp1 and timestamp2, it must
 //     hold that timestamp1 < timestamp2.
 // 2 - Update() must never set the clock backwards (corollary of 1)
-class Clock : public RefCountedThreadSafe<Clock> {
+class Clock {
  public:
   virtual ~Clock() = default;
 
@@ -63,7 +63,7 @@ class Clock : public RefCountedThreadSafe<Clock> {
   }
 
   // Indicates whether this clock supports the required external consistency mode.
-  virtual bool SupportsExternalConsistencyMode(ExternalConsistencyMode mode) = 0;
+  virtual bool SupportsExternalConsistencyMode(ExternalConsistencyMode mode) const = 0;
 
   // Indicates whether the clock has a physical component to its timestamps
   // (wallclock time).
@@ -102,9 +102,6 @@ class Clock : public RefCountedThreadSafe<Clock> {
   // Return true if the given time has definitely passed (i.e any future call
   // to Now() would return a higher value than t).
   virtual bool IsAfter(Timestamp t) = 0;
-
-  // Register the clock metrics in the given entity.
-  virtual void RegisterMetrics(const scoped_refptr<MetricEntity>& metric_entity) = 0;
 
   // Strigifies the provided timestamp according to this clock's internal format.
   virtual std::string Stringify(Timestamp timestamp) = 0;

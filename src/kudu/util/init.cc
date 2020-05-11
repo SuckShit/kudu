@@ -23,8 +23,6 @@
 #include <cstdlib>
 #include <string>
 
-#include <glog/logging.h>
-
 #include "kudu/gutil/cpu.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/status.h"
@@ -76,12 +74,19 @@ Status CheckCPUFlags() {
     return BadCPUStatus(cpu, "SSSE3");
   }
 
+  // POPCNT should always be present on machines with SSE4.2 support, but just in case
+  // there's some sort of weird missing support in virtualized environments, we'll check
+  // it explicitly.
+  if (!cpu.has_popcnt()) {
+    return BadCPUStatus(cpu, "POPCNT");
+  }
+
   return Status::OK();
 }
 
-void InitKuduOrDie() {
+Status InitKudu() {
   CheckStandardFds();
-  CHECK_OK(CheckCPUFlags());
+  return CheckCPUFlags();
   // NOTE: this function is called before flags are parsed.
   // Do not add anything in here which is flag-dependent.
 }

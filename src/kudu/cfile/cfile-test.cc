@@ -15,19 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <gflags/gflags.h>
-#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -55,7 +55,6 @@
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/io_context.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/singleton.h"
@@ -291,7 +290,7 @@ class TestCFile : public CFileTestBase {
       ASSERT_FALSE(reader->footer().incompatible_features() & IncompatibleFeatures::CHECKSUM);
     }
 
-    gscoped_ptr<IndexTreeIterator> iter;
+    unique_ptr<IndexTreeIterator> iter;
     iter.reset(IndexTreeIterator::Create(nullptr, reader.get(), reader->posidx_root()));
     ASSERT_OK(iter->SeekToFirst());
 
@@ -379,7 +378,7 @@ class TestCFile : public CFileTestBase {
     const fs::IOContext io_context({ "corrupted-dummy-tablet" });
     opts.io_context = &io_context;
     RETURN_NOT_OK(CFileReader::Open(std::move(corrupt_source), std::move(opts), &reader));
-    gscoped_ptr<IndexTreeIterator> iter;
+    unique_ptr<IndexTreeIterator> iter;
     iter.reset(IndexTreeIterator::Create(&io_context, reader.get(), reader->posidx_root()));
     RETURN_NOT_OK(iter->SeekToFirst());
 
@@ -603,7 +602,7 @@ TYPED_TEST(BitShuffleTest, TestFixedSizeReadWriteBitShuffle) {
 }
 
 void EncodeStringKey(const Schema &schema, const Slice& key,
-                     gscoped_ptr<EncodedKey> *encoded_key) {
+                     unique_ptr<EncodedKey> *encoded_key) {
   EncodedKeyBuilder kb(&schema);
   kb.AddColumnKey(&key);
   encoded_key->reset(kb.BuildEncodedKey());
@@ -654,7 +653,7 @@ void TestCFile::TestReadWriteStrings(EncodingType encoding,
   // Now try some seeks by the value instead of position
   /////////
 
-  gscoped_ptr<EncodedKey> encoded_key;
+  unique_ptr<EncodedKey> encoded_key;
   bool exact;
 
   // Seek in between each key.
@@ -812,7 +811,7 @@ TEST_P(TestCFileBothCacheMemoryTypes, TestDefaultColumnIter) {
   RETURN_IF_NO_NVM_CACHE(GetParam());
 
   const int kNumItems = 64;
-  uint8_t null_bitmap[BitmapSize(kNumItems)];
+  uint8_t non_null_bitmap[BitmapSize(kNumItems)];
   uint32_t data[kNumItems];
 
   // Test Int Default Value
@@ -829,7 +828,7 @@ TEST_P(TestCFileBothCacheMemoryTypes, TestDefaultColumnIter) {
   // Test Int Nullable Default Value
   int_value = 321;
   DefaultColumnValueIterator nullable_iter(GetTypeInfo(UINT32), &int_value);
-  ColumnBlock nullable_col(GetTypeInfo(UINT32), null_bitmap, data, kNumItems, nullptr);
+  ColumnBlock nullable_col(GetTypeInfo(UINT32), non_null_bitmap, data, kNumItems, nullptr);
   ColumnMaterializationContext nullable_ctx = CreateNonDecoderEvalContext(&nullable_col, &sel);
   ASSERT_OK(nullable_iter.Scan(&nullable_ctx));
   for (size_t i = 0; i < nullable_col.nrows(); ++i) {
@@ -839,7 +838,7 @@ TEST_P(TestCFileBothCacheMemoryTypes, TestDefaultColumnIter) {
 
   // Test NULL Default Value
   DefaultColumnValueIterator null_iter(GetTypeInfo(UINT32),  nullptr);
-  ColumnBlock null_col(GetTypeInfo(UINT32), null_bitmap, data, kNumItems, nullptr);
+  ColumnBlock null_col(GetTypeInfo(UINT32), non_null_bitmap, data, kNumItems, nullptr);
   ColumnMaterializationContext null_ctx = CreateNonDecoderEvalContext(&null_col, &sel);
   ASSERT_OK(null_iter.Scan(&null_ctx));
   for (size_t i = 0; i < null_col.nrows(); ++i) {
@@ -1055,7 +1054,7 @@ TEST_P(TestCFileBothCacheMemoryTypes, TestCacheKeysAreStable) {
     unique_ptr<CFileReader> reader;
     ASSERT_OK(CFileReader::Open(std::move(source), ReaderOptions(), &reader));
 
-    gscoped_ptr<IndexTreeIterator> iter;
+    unique_ptr<IndexTreeIterator> iter;
     iter.reset(IndexTreeIterator::Create(nullptr, reader.get(), reader->posidx_root()));
     ASSERT_OK(iter->SeekToFirst());
 
